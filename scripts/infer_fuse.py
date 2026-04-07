@@ -21,6 +21,8 @@ explode (the output will sound bad because the fuse layer is untrained).
 from __future__ import annotations
 
 import argparse
+import pathlib
+import platform
 import time
 from pathlib import Path
 
@@ -28,6 +30,14 @@ import soundfile as sf
 import torch
 
 from bsrnn_campplus import build_bsrnn_campplus
+
+
+# Cross-platform checkpoint compatibility shim — see infer_fuse_debug.py
+# for the same workaround. Linux-saved Phase 0a/0b checkpoints contain
+# pathlib.PosixPath objects in their args dict; aliasing PosixPath to
+# WindowsPath here lets `torch.load` succeed on Windows.
+if platform.system() == "Windows":
+    pathlib.PosixPath = pathlib.WindowsPath  # type: ignore[misc, assignment]
 
 
 def _load_mono(path: Path, sample_rate: int = 16000) -> torch.Tensor:

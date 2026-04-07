@@ -217,6 +217,12 @@ def train(args: argparse.Namespace) -> None:
 
         # Save checkpoints — we only need the trainable fuse-layer weights,
         # but we also dump the full state_dict for easy swapping at infer time.
+        # Convert any Path values in args to strings before saving so the
+        # checkpoint can be loaded on a different OS (Linux-saved PosixPath
+        # cannot be unpickled on Windows).
+        args_for_save = {
+            k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()
+        }
         ckpt = {
             "epoch": epoch,
             "step": global_step,
@@ -227,7 +233,7 @@ def train(args: argparse.Namespace) -> None:
                 k: v.detach().cpu()
                 for k, v in model.separator.separation[0].fc.linear.state_dict().items()
             },
-            "args": vars(args),
+            "args": args_for_save,
         }
         torch.save(ckpt, out_dir / f"epoch{epoch:03d}.pt")
         if val_avg < best_val:

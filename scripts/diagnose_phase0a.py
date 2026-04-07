@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import math
+import pathlib
+import platform
 from pathlib import Path
 
 import soundfile as sf
@@ -31,6 +33,11 @@ import torch
 
 from aishell_mixer import AishellMixDataset
 from bsrnn_campplus import build_bsrnn_campplus
+
+
+# Cross-platform checkpoint compatibility shim — see infer_fuse_debug.py.
+if platform.system() == "Windows":
+    pathlib.PosixPath = pathlib.WindowsPath  # type: ignore[misc, assignment]
 
 
 def si_sdr_db(estimate: torch.Tensor, target: torch.Tensor,

@@ -310,6 +310,12 @@ def train(args: argparse.Namespace) -> None:
             f"si={val_avg_si:+.3f} mag={val_avg_mag:.4f}"
         )
 
+        # Convert any Path values in args to strings before saving so the
+        # checkpoint can be loaded on a different OS (Linux-saved PosixPath
+        # cannot be unpickled on Windows).
+        args_for_save = {
+            k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()
+        }
         ckpt = {
             "epoch": epoch,
             "step": global_step,
@@ -318,7 +324,7 @@ def train(args: argparse.Namespace) -> None:
             "val_si_sdr": val_avg_si,
             "val_log_mag": val_avg_mag,
             "state_dict": model.state_dict(),
-            "args": vars(args),
+            "args": args_for_save,
         }
         torch.save(ckpt, out_dir / f"epoch{epoch:03d}.pt")
         if val_avg_total < best_val:

@@ -21,12 +21,27 @@ from __future__ import annotations
 
 import argparse
 import math
+import pathlib
+import platform
 from pathlib import Path
 
 import soundfile as sf
 import torch
 
 from bsrnn_campplus import build_bsrnn_campplus, compute_kaldi_fbank
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform checkpoint compatibility shim.
+#
+# Checkpoints saved on Linux contain `pathlib.PosixPath` objects (from the
+# argparse args dict that we pickle into the ckpt). Loading them on Windows
+# raises NotImplementedError because Windows pathlib has no PosixPath class.
+# Aliasing PosixPath -> WindowsPath at load time lets unpickling succeed.
+# ---------------------------------------------------------------------------
+
+if platform.system() == "Windows":
+    pathlib.PosixPath = pathlib.WindowsPath  # type: ignore[misc, assignment]
 
 
 def _load_mono(path: Path, sr: int = 16000) -> torch.Tensor:
