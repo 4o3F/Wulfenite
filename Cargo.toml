@@ -1,0 +1,20 @@
+[package]
+name = "wulfenite"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+burn = { version = "0.20.1", default-features = false, features = ["std", "store", "tracing", "ndarray", "wgpu"] }
+burn-store = { version = "0.20.1", default-features = false, features = [
+    "std",
+    "safetensors"
+] }
+clap = { version = "4.6.0", features = ["derive"] }
+cpal = "0.17.3"
+hound = "3.5.1"
+ringbuf = "0.4.8"
+rustfft = "6.4.1"
+tokio = { version = "1.51.0", features = ["macros", "rt-multi-thread", "sync"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

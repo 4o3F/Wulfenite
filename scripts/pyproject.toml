@@ -1,0 +1,33 @@
+[project]
+name = "wulfenite-scripts"
+version = "0.1.0"
+description = "Python tooling for Wulfenite: PyTorch reference, ONNX export, quantization."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "torch",
+    "torchaudio",
+    "soundfile",
+    "numpy",
+    "tqdm",
+    "requests",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+# Default to CUDA 12.6 wheels, pulled from Aliyun's PyTorch mirror (China).
+# These still run on CPU-only hosts (torch transparently falls back), so
+# `uv sync` works on any Linux machine whether or not a GPU is present.
+# Training requires a CUDA GPU; inference can be done on CPU if needed.
+torch = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
+
+# PyPI via Tsinghua mirror (China) — massively faster than pypi.org inside CN.
+[[tool.uv.index]]
+url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://mirrors.aliyun.com/pytorch-wheels/cu126"
+format = "flat"

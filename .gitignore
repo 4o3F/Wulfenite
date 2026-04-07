@@ -1,0 +1,34 @@
+# Rust build artifacts
+/target
+
+# Large model checkpoints — fetched on demand, not stored in git
+assets/*.pt
+assets/*.bin
+assets/*.safetensors
+assets/*.onnx
+assets/campplus/
+converted/
+
+# Phase 0a training outputs (checkpoints + logs)
+assets/campplus/train_phase0a/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Claude Code / Codex local state
+.claude/
+.codex
+.codex/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+assets/
