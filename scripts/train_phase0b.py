@@ -52,7 +52,8 @@ from bsrnn_campplus import build_bsrnn_campplus
 
 def si_sdr_loss(estimate: torch.Tensor, target: torch.Tensor,
                 eps: float = 1e-8) -> torch.Tensor:
-    """Scale-invariant SDR (shape only)."""
+    """Scale-invariant SDR (shape only). Used as a diagnostic, not the
+    main training loss in Phase 0b."""
     estimate = estimate - estimate.mean(dim=-1, keepdim=True)
     target = target - target.mean(dim=-1, keepdim=True)
     dot = (estimate * target).sum(dim=-1, keepdim=True)
@@ -66,25 +67,46 @@ def si_sdr_loss(estimate: torch.Tensor, target: torch.Tensor,
     return -10.0 * torch.log10(ratio + eps).mean()
 
 
-def log_mag_penalty(estimate: torch.Tensor, target: torch.Tensor,
-                    eps: float = 1e-6) -> torch.Tensor:
-    """Absolute difference of log-RMS between estimate and target.
+def sdr_loss(estimate: torch.Tensor, target: torch.Tensor,
+             eps: float = 1e-8) -> torch.Tensor:
+    """Direct (non-scale-invariant) SDR loss.
 
-    Forces the estimate to have the same overall level as the target,
-    counteracting SI-SDR's scale invariance. ``| log(rms_est / rms_tgt) |``
-    averaged over the batch.
+        SDR = 10 * log10( ||target||^2 / ||estimate - target||^2 )
+        loss = -SDR
+
+    Penalizes both shape and level errors. Critical property: there is
+    no degenerate "free lunch" solution.
+
+    - ``estimate = mixture`` (pass-through): error = interferer; SDR equals
+      input SNR (~0 dB on average) → loss ≈ 0.
+    - ``estimate ≈ 0`` (tiny output): error = -target; SDR = 0 dB → loss ≈ 0.
+    - Real separation (``estimate ≈ target``): error → 0; SDR → +∞ → loss
+      strongly negative.
+
+    Both degenerate solutions sit on a flat plateau at loss ≈ 0, while
+    real separation is the only direction with strong gradient. This is
+    what we need to escape Phase 0a's tiny-output and Phase 0b's
+    pass-through local minima.
     """
-    est_rms = torch.sqrt((estimate * estimate).mean(dim=-1) + eps)
-    tgt_rms = torch.sqrt((target * target).mean(dim=-1) + eps)
-    return torch.abs(torch.log(est_rms + eps) - torch.log(tgt_rms + eps)).mean()
+    estimate = estimate - estimate.mean(dim=-1, keepdim=True)
+    target = target - target.mean(dim=-1, keepdim=True)
+    error = estimate - target
+    ratio = (target * target).sum(dim=-1) / ((error * error).sum(dim=-1) + eps)
+    return -10.0 * torch.log10(ratio + eps).mean()
 
 
 def phase0b_loss(estimate: torch.Tensor, target: torch.Tensor,
-                 si_weight: float = 1.0, mag_weight: float = 0.5) -> tuple[torch.Tensor, dict]:
+                 sdr_weight: float = 1.0,
+                 si_weight: float = 0.0) -> tuple[torch.Tensor, dict]:
+    """Phase 0b training loss = direct SDR (+ optional small SI-SDR side term).
+
+    The default ``si_weight=0`` means we run pure SDR. The SI-SDR diagnostic
+    is still computed and logged so we can compare against Phase 0a numbers.
+    """
+    sdr = sdr_loss(estimate, target)
     si = si_sdr_loss(estimate, target)
-    mag = log_mag_penalty(estimate, target)
-    total = si_weight * si + mag_weight * mag
-    return total, {"si_sdr": float(si.detach()), "log_mag": float(mag.detach())}
+    total = sdr_weight * sdr + si_weight * si
+    return total, {"sdr": float(sdr.detach()), "si_sdr": float(si.detach())}
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +250,7 @@ def train(args: argparse.Namespace) -> None:
     log(f"train steps/epoch: {len(train_loader)}  val steps: {len(val_loader)}")
     log(f"augmentation: rt60={args.rt60_range} noise_snr={args.noise_snr_range_db} "
         f"p_reverb={args.p_reverb} p_noise={args.p_noise}")
-    log(f"loss weights: si_sdr={args.si_weight} log_mag={args.mag_weight}")
+    log(f"loss weights: sdr={args.sdr_weight} si_sdr={args.si_weight}")
 
     best_val = float("inf")
     global_step = 0
@@ -237,8 +259,8 @@ def train(args: argparse.Namespace) -> None:
         pin_bn_eval(model)
 
         epoch_total = 0.0
+        epoch_sdr = 0.0
         epoch_si = 0.0
-        epoch_mag = 0.0
         epoch_count = 0
         t0 = time.time()
         for step, batch in enumerate(train_loader):
@@ -249,7 +271,7 @@ def train(args: argparse.Namespace) -> None:
             estimate = model(mixture, enrollment)
             loss, parts = phase0b_loss(
                 estimate, target,
-                si_weight=args.si_weight, mag_weight=args.mag_weight,
+                sdr_weight=args.sdr_weight, si_weight=args.si_weight,
             )
 
             opt.zero_grad(set_to_none=True)
@@ -261,8 +283,8 @@ def train(args: argparse.Namespace) -> None:
             sched.step()
 
             epoch_total += float(loss.detach())
+            epoch_sdr += parts["sdr"]
             epoch_si += parts["si_sdr"]
-            epoch_mag += parts["log_mag"]
             epoch_count += 1
             global_step += 1
 
@@ -270,22 +292,22 @@ def train(args: argparse.Namespace) -> None:
                 log(
                     f"epoch {epoch} step {step + 1}/{len(train_loader)} "
                     f"loss={float(loss.detach()):.4f} "
-                    f"si={parts['si_sdr']:+.3f} mag={parts['log_mag']:.4f} "
+                    f"sdr={parts['sdr']:+.3f} si={parts['si_sdr']:+.3f} "
                     f"lr={opt.param_groups[0]['lr']:.2e}"
                 )
 
         dur = time.time() - t0
         log(
             f"epoch {epoch} train total={epoch_total / epoch_count:.4f} "
-            f"si={epoch_si / epoch_count:+.3f} "
-            f"mag={epoch_mag / epoch_count:.4f}  time={dur:.1f}s"
+            f"sdr={epoch_sdr / epoch_count:+.3f} "
+            f"si={epoch_si / epoch_count:+.3f}  time={dur:.1f}s"
         )
 
         # Validation
         model.eval()
         val_total = 0.0
+        val_sdr = 0.0
         val_si = 0.0
-        val_mag = 0.0
         val_count = 0
         with torch.no_grad():
             for batch in val_loader:
@@ -295,19 +317,19 @@ def train(args: argparse.Namespace) -> None:
                 estimate = model(mixture, enrollment)
                 loss, parts = phase0b_loss(
                     estimate, target,
-                    si_weight=args.si_weight, mag_weight=args.mag_weight,
+                    sdr_weight=args.sdr_weight, si_weight=args.si_weight,
                 )
                 val_total += float(loss)
+                val_sdr += parts["sdr"]
                 val_si += parts["si_sdr"]
-                val_mag += parts["log_mag"]
                 val_count += 1
 
         val_avg_total = val_total / max(1, val_count)
+        val_avg_sdr = val_sdr / max(1, val_count)
         val_avg_si = val_si / max(1, val_count)
-        val_avg_mag = val_mag / max(1, val_count)
         log(
             f"epoch {epoch} val   total={val_avg_total:.4f} "
-            f"si={val_avg_si:+.3f} mag={val_avg_mag:.4f}"
+            f"sdr={val_avg_sdr:+.3f} si={val_avg_si:+.3f}"
         )
 
         # Convert any Path values in args to strings before saving so the
@@ -321,8 +343,8 @@ def train(args: argparse.Namespace) -> None:
             "step": global_step,
             "train_total": epoch_total / epoch_count,
             "val_total": val_avg_total,
+            "val_sdr": val_avg_sdr,
             "val_si_sdr": val_avg_si,
-            "val_log_mag": val_avg_mag,
             "state_dict": model.state_dict(),
             "args": args_for_save,
         }
@@ -367,11 +389,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reverb-enrollment", action="store_true", default=True,
                         help="Also reverberate the enrollment signal")
 
-    # Loss knobs
-    parser.add_argument("--si-weight", type=float, default=1.0)
-    parser.add_argument("--mag-weight", type=float, default=0.5,
-                        help="Weight for the log-magnitude penalty that "
-                             "kills SI-SDR's scale invariance")
+    # Loss knobs — Phase 0b uses non-scale-invariant SDR by default.
+    # The previous (SI-SDR + log-mag) recipe converged to a pass-through
+    # degenerate solution on real audio. Direct SDR has no such free lunch.
+    parser.add_argument("--sdr-weight", type=float, default=1.0,
+                        help="Weight for direct (non-scale-invariant) SDR "
+                             "loss — the main training signal")
+    parser.add_argument("--si-weight", type=float, default=0.0,
+                        help="Optional auxiliary scale-invariant SDR weight. "
+                             "Default 0 (pure SDR). Set >0 only if you want "
+                             "to add a shape-only side term.")
 
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
