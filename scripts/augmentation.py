@@ -134,6 +134,18 @@ class AugmentationConfig:
     # a deployed streaming setup where the enrollment was recorded in-room.
     reverb_enrollment: bool = True
 
+    # Target silence augmentation (for false-extraction prevention).
+    # Periodically zero out random regions of the target signal so the
+    # model learns "when target is silent, output silence" — even when
+    # the interferer is loud. Without this, the model has only ever seen
+    # full-speech targets and will hallucinate an extraction whenever the
+    # interferer is present, regardless of whether the target is talking.
+    sample_rate: int = 16000
+    target_silence_prob: float = 0.5     # apply silence to this fraction of samples
+    target_silence_max_frac: float = 0.80  # never zero more than this fraction (keep loss numerically stable)
+    target_silence_min_region_ms: float = 200.0
+    target_silence_max_regions: int = 3
+
     def __post_init__(self) -> None:
         if self.reverb is None:
             self.reverb = ReverbConfig()
@@ -175,3 +187,45 @@ def add_mixture_noise(mixture: torch.Tensor,
         snr = rng.uniform(*cfg.noise_snr_range_db)
         mixture = add_gaussian_noise(mixture, snr, rng)
     return mixture
+
+
+def insert_target_silence(target: torch.Tensor,
+                          cfg: AugmentationConfig,
+                          rng: random.Random) -> torch.Tensor:
+    """Zero out one or more contiguous regions of the target waveform.
+
+    Returns a NEW tensor (the input is not mutated). Caps the total
+    silenced fraction at ``cfg.target_silence_max_frac`` so the loss
+    always has some non-zero target energy to compute SDR against.
+
+    Used to teach the model that "when the target speaker is silent,
+    output silence even if the interferer is loud" — a behavior that
+    full-speech-only training never exposes the model to.
+    """
+    if rng.random() >= cfg.target_silence_prob:
+        return target
+
+    n = target.shape[-1]
+    if n <= 0:
+        return target
+
+    max_total_silence = int(cfg.target_silence_max_frac * n)
+    min_region = int(cfg.target_silence_min_region_ms * cfg.sample_rate / 1000.0)
+    if max_total_silence < min_region:
+        return target
+
+    out = target.clone()
+    silenced_so_far = 0
+    n_regions = rng.randint(1, cfg.target_silence_max_regions)
+    for _ in range(n_regions):
+        remaining = max_total_silence - silenced_so_far
+        if remaining < min_region:
+            break
+        region_len = rng.randint(min_region, remaining)
+        max_start = n - region_len
+        if max_start <= 0:
+            break
+        start = rng.randint(0, max_start)
+        out[start:start + region_len] = 0.0
+        silenced_so_far += region_len
+    return out

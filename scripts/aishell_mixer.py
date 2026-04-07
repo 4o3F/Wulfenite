@@ -39,7 +39,12 @@ import soundfile as sf
 import torch
 from torch.utils.data import Dataset
 
-from augmentation import AugmentationConfig, augment_triplet, add_mixture_noise
+from augmentation import (
+    AugmentationConfig,
+    augment_triplet,
+    add_mixture_noise,
+    insert_target_silence,
+)
 
 
 @dataclass
@@ -212,8 +217,18 @@ class AishellMixDataset(Dataset):
             interf = interf / (_rms(interf) + 1e-8) * 0.1
             enrollment = enrollment / (_rms(enrollment) + 1e-8) * 0.1
 
+        # Compute SNR and scale the interferer against the FULL (non-silenced)
+        # target energy, so silencing the target later does not change the
+        # interferer gain.
         snr_db = rng.uniform(*self.snr_range_db)
         interf_scaled = _rescale_to_snr(target_clean, interf, snr_db)
+
+        # Target silence augmentation: zero out random regions of the target
+        # AFTER SNR scaling. In the silenced regions the mixture contains only
+        # the interferer, and the loss target is also zero — teaching the model
+        # to output silence when the target speaker is not talking.
+        if self.augment:
+            target_clean = insert_target_silence(target_clean, self.aug_config, rng)
 
         mixture = target_clean + interf_scaled
 
@@ -230,7 +245,7 @@ class AishellMixDataset(Dataset):
 
         return {
             "mixture": mixture,            # [T_mix]
-            "target": target_clean,        # [T_mix]  <- reverberated target
+            "target": target_clean,        # [T_mix]  <- reverberated + possibly silenced
             "enrollment": enrollment,      # [T_enr]  <- reverberated enrollment
             "snr_db": torch.tensor(snr_db, dtype=torch.float32),
         }
