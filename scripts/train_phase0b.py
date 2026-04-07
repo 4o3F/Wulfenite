@@ -182,12 +182,18 @@ def train(args: argparse.Namespace) -> None:
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, collate_fn=collate_mix_batch,
-        drop_last=True, persistent_workers=args.num_workers > 0,
+        drop_last=True,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        pin_memory=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=max(1, args.num_workers // 2), collate_fn=collate_mix_batch,
-        drop_last=False,
+        num_workers=max(1, args.num_workers // 2),
+        collate_fn=collate_mix_batch, drop_last=False,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        pin_memory=True,
     )
 
     # --- Optimizer ---
@@ -363,7 +369,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=8,
+                        help="DataLoader worker processes. Bump higher if "
+                             "the server has many cores and GPU is still idle.")
+    parser.add_argument("--prefetch-factor", type=int, default=4,
+                        help="Per-worker batches to prefetch. 4 keeps GPU "
+                             "fed even when one worker is briefly slow.")
     parser.add_argument("--log-interval", type=int, default=50)
     parser.add_argument("--seed", type=int, default=1234)
 

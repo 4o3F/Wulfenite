@@ -69,19 +69,26 @@ def _scan_split(split_dir: Path) -> list[AishellEntry]:
     return entries
 
 
-def _load_chunk(path: Path, target_len: int, rng: random.Random) -> torch.Tensor:
-    """Load a random ``target_len``-sample chunk from a wav file, padding if short."""
-    info = sf.info(str(path))
-    n = info.frames
+def _load_chunk(entry: "AishellEntry", target_len: int,
+                rng: random.Random) -> torch.Tensor:
+    """Load a random ``target_len``-sample chunk from an AISHELL entry.
+
+    Uses the cached ``entry.num_frames`` (populated at scan time) so we
+    only do ONE filesystem call per sample (``sf.read``) instead of two
+    (``sf.info`` + ``sf.read``). Halves the I/O when the dataset is the
+    bottleneck.
+    """
+    n = entry.num_frames
     if n >= target_len:
         start = rng.randint(0, n - target_len)
-        data, _ = sf.read(str(path), start=start, stop=start + target_len, dtype="float32", always_2d=False)
-    else:
-        data, _ = sf.read(str(path), dtype="float32", always_2d=False)
-        pad = target_len - data.shape[0]
-        data = torch.from_numpy(data)
-        return torch.nn.functional.pad(data, (0, pad))
-    return torch.from_numpy(data)
+        data, _ = sf.read(
+            str(entry.path), start=start, stop=start + target_len,
+            dtype="float32", always_2d=False,
+        )
+        return torch.from_numpy(data)
+    data, _ = sf.read(str(entry.path), dtype="float32", always_2d=False)
+    pad = target_len - data.shape[0]
+    return torch.nn.functional.pad(torch.from_numpy(data), (0, pad))
 
 
 def _rms(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -181,9 +188,9 @@ class AishellMixDataset(Dataset):
         target_clean_entry, target_enroll_entry = rng.sample(target_utts, 2)
         interf_entry = rng.choice(interf_utts)
 
-        target_clean = _load_chunk(target_clean_entry.path, self.segment_len, rng)
-        interf = _load_chunk(interf_entry.path, self.segment_len, rng)
-        enrollment = _load_chunk(target_enroll_entry.path, self.enrollment_len, rng)
+        target_clean = _load_chunk(target_clean_entry, self.segment_len, rng)
+        interf = _load_chunk(interf_entry, self.segment_len, rng)
+        enrollment = _load_chunk(target_enroll_entry, self.enrollment_len, rng)
 
         # Normalize each source to unit-ish RMS
         tgt_rms = _rms(target_clean)
