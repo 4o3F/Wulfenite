@@ -1,0 +1,10 @@
+[project]
+name = "wulfenite-research"
+version = "0.1.0"
+description = "Wulfenite — Python research crate (model design, training, evaluation)"
+requires-python = ">=3.11,<3.13"
+# Dependencies will be added once the new model architecture is chosen.
+dependencies = []
+
+[tool.uv]
+package = false

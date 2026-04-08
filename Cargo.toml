@@ -1,0 +1,21 @@
+[package]
+name = "wulfenite"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Real-time target speaker extraction — engineering / deployment crate"
+
+[dependencies]
+# Error handling + CLI + logging
+anyhow = "1.0.102"
+clap = { version = "4.6.0", features = ["derive"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Audio I/O + DSP utilities (used by `src/audio.rs`)
+hound = "3.5.1"
+rustfft = "6.4.1"
+
+# Model framework, audio capture, async runtime, ringbuffer:
+# all removed in the v1 -> main reset. Reintroduce them when the new
+# architecture is chosen (e.g. ort + cpal + ringbuf + tokio).

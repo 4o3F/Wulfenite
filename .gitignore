@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target
+
+# Local research artifacts (datasets, checkpoints, training outputs)
+assets/
+converted/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.python-version
+python/.venv/
+python/uv.lock
+
+# Claude Code / Codex local state
+.claude/
+.codex
+.codex/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
