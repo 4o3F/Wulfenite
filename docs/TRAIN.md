@@ -29,11 +29,19 @@ engineering runtime in `rust/` only consumes the final ONNX file
 **Minimum**:
 - 1× NVIDIA GPU with ≥ 12 GB VRAM (tested on RTX 3090 / 4090, 24 GB)
 - ≥ 64 GB RAM
-- ≥ 50 GB free disk for datasets (~15 GB AISHELL-1 + ~19 GB AISHELL-3
-  + ~3.6 GB MUSAN noise subset + ~30 MB CAM++ checkpoint)
+- ≥ 50 GB free disk under the repo's `assets/` directory
+  (~15 GB AISHELL-1 + ~19 GB AISHELL-3 + ~3.6 GB MUSAN noise subset
+  + ~30 MB CAM++ checkpoint + training checkpoints)
 - Linux (Ubuntu 22.04+ recommended) or WSL2
 - Python 3.11 or 3.12
 - [uv](https://github.com/astral-sh/uv) ≥ 0.5
+
+**Where the data lives**: every local dataset, downloaded model, and
+training output lives under the repo-root `assets/` directory. That
+directory is gitignored, so nothing under it is ever tracked. The
+training / inference CLIs expect paths relative to the `python/`
+working directory (where `uv run --directory python` puts you), so
+the canonical form is ``../assets/<dataset>/``.
 
 **Recommended**:
 - 24 GB VRAM so you can comfortably fit batch size 16 with 4 s segments
@@ -57,32 +65,26 @@ Three separate datasets, all free:
 
 Download link: `data_aishell.tgz` from openslr.org/33/resources.
 
-The tarball contains a top-level `data_aishell/` wrapper directory,
-so a plain extract gives you:
+From the repo root:
 
-```
-~/datasets/aishell1/
-└── data_aishell/
-    └── wav/
-        ├── train/S0002/BAC009S0002W0122.wav
-        ├── dev/...
-        └── test/...
+```bash
+mkdir -p assets/aishell1
+# Option A — keep the tarball's data_aishell/ wrapper directory:
+tar xzf data_aishell.tgz -C assets/aishell1/
+# Option B — strip the wrapper for a flatter layout:
+# tar xzf data_aishell.tgz --strip-components=1 -C assets/aishell1/
 ```
 
-**Both layouts work** with the scanner — you can either:
-- **Keep the wrapper** (default): `tar xzf data_aishell.tgz -C ~/datasets/aishell1/`
-- **Strip the wrapper** (cleaner path): `tar xzf data_aishell.tgz --strip-components=1 -C ~/datasets/aishell1/` → gives you `~/datasets/aishell1/wav/train/...`
-
-Pass `--aishell1-root ~/datasets/aishell1` either way. The scanner
-auto-detects the layout by looking for either `<root>/data_aishell/`
-or `<root>/wav/`.
+The scanner auto-detects both layouts by looking for either
+`<root>/data_aishell/` or `<root>/wav/`. Pass
+``--aishell1-root ../assets/aishell1`` either way.
 
 AISHELL-1 also ships with nested per-speaker tarballs inside each
 split that must be unpacked once more:
 
 ```bash
 # Adjust the first cd depending on which extraction layout you chose
-cd ~/datasets/aishell1/data_aishell/wav/train
+cd assets/aishell1/data_aishell/wav/train
 for f in *.tar.gz; do tar xzf "$f" && rm "$f"; done
 cd ../dev    && for f in *.tar.gz; do tar xzf "$f" && rm "$f"; done
 cd ../test   && for f in *.tar.gz; do tar xzf "$f" && rm "$f"; done
@@ -97,8 +99,13 @@ cd ../test   && for f in *.tar.gz; do tar xzf "$f" && rm "$f"; done
 - **Why**: doubles the speaker count, improving cross-speaker
   generalization
 
-Extract to `~/datasets/aishell3/` so you end up with
-`~/datasets/aishell3/train/wav/SSB0005/SSB00050001.wav`.
+Extract to `assets/aishell3/` so you end up with
+`assets/aishell3/train/wav/SSB0005/SSB00050001.wav`:
+
+```bash
+mkdir -p assets/aishell3
+tar xzf data_aishell3.tgz --strip-components=1 -C assets/aishell3/
+```
 
 ### MUSAN noise (~3.6 GB — recommended default)
 
@@ -112,19 +119,19 @@ Extract to `~/datasets/aishell3/` so you end up with
   smaller than DNS Challenge 4 (~80 GB) with comparable coverage
   for our use case.
 
-Download and extract just the noise subset:
+Download and extract just the noise subset from the repo root:
 
 ```bash
 wget http://www.openslr.org/resources/17/musan.tar.gz
-tar xzf musan.tar.gz -C ~/datasets/
+tar xzf musan.tar.gz -C assets/
 # Optionally delete speech/ and music/ subsets — we only use noise/
-rm -rf ~/datasets/musan/speech ~/datasets/musan/music
+rm -rf assets/musan/speech assets/musan/music
 ```
 
 You end up with:
 
 ```
-~/datasets/musan/
+assets/musan/
 └── noise/
     ├── free-sound/
     │   └── noise-free-sound-*.wav
@@ -132,37 +139,45 @@ You end up with:
         └── noise-sound-bible-*.wav
 ```
 
-Point the mixer at `~/datasets/musan/noise/`. The scanner is generic
-(`scan_noise_dir`) and works unchanged with any other 16 kHz noise
-corpus: DEMAND (~2 GB), FSD50K, ESC-50 resampled to 16 kHz, DNS
-Challenge, or a custom recording set. Just pass the root directory
-containing the `.wav` files.
+Point the mixer at `../assets/musan/noise/` (from `python/`'s working
+directory). The scanner is generic (`scan_noise_dir`) and works
+unchanged with any other 16 kHz noise corpus: DEMAND (~2 GB), FSD50K,
+ESC-50 resampled to 16 kHz, DNS Challenge, or a custom recording set.
+Just pass the root directory containing the `.wav` files.
 
 ---
 
 ## 3. Expected directory layout
 
-After all downloads are in place, the local layout should look like:
+After all downloads are in place, the repo-root `assets/` directory
+should look like this:
 
 ```
-~/datasets/
-├── aishell1/
-│   └── data_aishell/          # or skip this layer via --strip-components=1
-│       └── wav/
-│           ├── train/S0002/BAC009S0002W0122.wav
-│           └── dev/...
-├── aishell3/
-│   └── train/
-│       └── wav/SSB0005/SSB00050001.wav
-└── musan/
-    └── noise/
-        ├── free-sound/
-        └── sound-bible/
+Wulfenite/
+├── assets/                        # gitignored, local-only
+│   ├── aishell1/
+│   │   └── data_aishell/          # or skip via --strip-components=1
+│   │       └── wav/
+│   │           ├── train/S0002/BAC009S0002W0122.wav
+│   │           └── dev/...
+│   ├── aishell3/
+│   │   └── train/
+│   │       └── wav/SSB0005/SSB00050001.wav
+│   ├── musan/
+│   │   └── noise/
+│   │       ├── free-sound/
+│   │       └── sound-bible/
+│   ├── campplus/
+│   │   └── campplus_cn_common.bin
+│   └── checkpoints/               # training outputs land here
+├── python/
+└── rust/
 ```
 
-The Wulfenite scanners (`scan_aishell1`, `scan_aishell3`,
-`scan_noise_dir`) accept either the top-level roots or the nested
-`data_aishell/` / `train/wav/` subdirs — both work.
+Everything under `assets/` is gitignored. The Wulfenite scanners
+(`scan_aishell1`, `scan_aishell3`, `scan_noise_dir`) accept either
+the top-level roots or the nested `data_aishell/` / `train/wav/`
+subdirs — both work.
 
 ---
 
@@ -172,12 +187,20 @@ The speaker encoder is the frozen 200k-speaker Chinese CAM++ release
 from 3D-Speaker on ModelScope:
 [`iic/speech_campplus_sv_zh-cn_16k-common`](https://modelscope.cn/models/iic/speech_campplus_sv_zh-cn_16k-common).
 
-Download the single file `campplus_cn_common.bin` (~28 MB) and
-place it anywhere, e.g. `~/datasets/campplus/campplus_cn_common.bin`.
+Download the single file `campplus_cn_common.bin` (~28 MB) into
+`assets/campplus/`:
 
-A download script matching v1's will be added to
-`python/scripts/download_campplus.py` (TODO); for now, pull manually
-from the ModelScope web UI or via `modelscope snapshot_download`.
+```bash
+mkdir -p assets/campplus
+# Easiest: grab it from the ModelScope web UI and move it here.
+# Or use the modelscope CLI if you have it installed:
+# modelscope snapshot_download iic/speech_campplus_sv_zh-cn_16k-common \
+#     --local_dir assets/campplus --allow_patterns 'campplus_cn_common.bin'
+```
+
+A dedicated download script will likely land at
+`python/src/wulfenite/scripts/download_campplus.py` in a future
+commit; until then, manual download is the path.
 
 ---
 
@@ -208,57 +231,92 @@ uv run python -c "import wulfenite; print(wulfenite.__version__)"
 
 ## 6. Running the unit tests
 
-Unit tests are fast (< 15 seconds total) and do not require any
-datasets — they use synthetic wav fixtures. Run them before any
-training to catch install or environment issues early:
+Unit tests are fast (~40 seconds total) and do not require any
+datasets — they use synthetic wav fixtures and randomly-initialized
+CAM++ modules. Run them before any training to catch install or
+environment issues early:
 
 ```bash
 uv run --directory python pytest tests/ -v
 ```
 
-Expected output: **39 passed** across models / losses / data. Any
-failure here is a red flag and should be reported before continuing.
+Expected output: **50 passed** across models / losses / data /
+training / inference. Any failure here is a red flag and should be
+reported before continuing.
 
 ---
 
 ## 7. Training
 
-> **Status**: training loop is not yet implemented. This section
-> documents the planned workflow so the interface is clear before
-> the training script lands.
-
-Once `python/src/wulfenite/training/train.py` is written, training
-will look like:
+The training loop lives at `python/src/wulfenite/training/train.py`
+and is invoked as a module. A minimal run with the canonical
+`assets/` paths:
 
 ```bash
 uv run --directory python python -m wulfenite.training.train \
-    --aishell1-root ~/datasets/aishell1 \
-    --aishell3-root ~/datasets/aishell3 \
-    --noise-root ~/datasets/musan/noise \
-    --campplus-checkpoint ~/datasets/campplus/campplus_cn_common.bin \
-    --out-dir ./checkpoints/phase1 \
+    --aishell1-root ../assets/aishell1 \
+    --aishell3-root ../assets/aishell3 \
+    --noise-root ../assets/musan/noise \
+    --campplus-checkpoint ../assets/campplus/campplus_cn_common.bin \
+    --out-dir ../assets/checkpoints/phase1 \
     --batch-size 16 \
     --epochs 50 \
     --samples-per-epoch 20000 \
     --lr 1e-3
 ```
 
+All paths are relative to the `python/` directory because
+`uv run --directory python` puts the process there. The
+`../assets/...` form reaches back into the repo-root assets tree.
+
+Before committing to a full run, do a 100-sample smoke run first to
+validate the pipeline end-to-end:
+
+```bash
+uv run --directory python python -m wulfenite.training.train \
+    --aishell1-root ../assets/aishell1 \
+    --aishell3-root ../assets/aishell3 \
+    --noise-root ../assets/musan/noise \
+    --campplus-checkpoint ../assets/campplus/campplus_cn_common.bin \
+    --out-dir ../assets/checkpoints/smoke_test \
+    --batch-size 4 \
+    --epochs 1 \
+    --samples-per-epoch 100 \
+    --val-samples 20 \
+    --num-workers 2
+```
+
 Key design points of the training loop (from `docs/architecture.md`):
 
 - **Whole-utterance forward** — trains the S4D parallel mode,
-  exploits FFT convolution for speed, does NOT thread per-frame state
+  exploits FFT convolution for speed. The
+  ``streaming_step`` deployment path is numerically equivalent to
+  the same forward pass, verified by
+  ``tests/test_speakerbeam_ss.py::test_speakerbeam_streaming_matches_forward``.
 - **`WulfeniteLoss` combined loss** — direct SDR + MR-STFT + target-
-  absent energy penalty + presence BCE
-- **Mixture-aware silence** — `MixerConfig.target_present_prob` set
-  to 0.85, so ~15 % of batches teach the "target is not talking →
-  output silence" behavior
-- **CAM++ is frozen** — `tse.speaker_encoder.eval()`, no gradients
-  flow through the encoder
+  absent energy penalty + presence BCE.
+- **Mixture-aware silence** — `target_present_prob` defaults to
+  0.85, so ~15 % of batches teach the "target is not talking →
+  output silence" behavior.
+- **CAM++ is frozen** — `tse.speaker_encoder` is put in eval mode
+  and excluded from the optimizer, so no gradients flow through the
+  encoder.
 - **Mirror / offline-safe** — the default `pyproject.toml` uses the
-  Aliyun PyTorch mirror so `uv sync` is fast inside China
+  Aliyun PyTorch mirror so `uv sync` is fast inside China.
 
 Training should converge in 30-60 epochs at ~20 k samples per epoch
 on a 24 GB GPU, wall-clock ~24-48 hours.
+
+Checkpoints are written to `--out-dir`:
+
+```
+assets/checkpoints/phase1/
+├── train.log          # stdout mirror
+├── epoch001.pt
+├── epoch002.pt
+├── ...
+└── best.pt            # copy of whichever epoch had the lowest val_loss
+```
 
 ---
 
@@ -269,16 +327,17 @@ on a 24 GB GPU, wall-clock ~24-48 hours.
 
 ```bash
 uv run --directory python python -m wulfenite.inference.export_onnx \
-    --checkpoint ./checkpoints/phase1/best.pt \
-    --out-dir ./exported/
+    --checkpoint ../assets/checkpoints/phase1/best.pt \
+    --campplus-checkpoint ../assets/campplus/campplus_cn_common.bin \
+    --out-dir ../assets/exported/
 ```
 
 Produces two files matching `docs/onnx_contract.md`:
 
-- `exported/cam_plus_chinese.onnx` (~30 MB, exported from the frozen
-  CAM++ weights)
-- `exported/wulfenite_tse.onnx` (~8 MB, the trained separator in its
-  stateful form with opaque state tensors)
+- `assets/exported/cam_plus_chinese.onnx` (~30 MB, exported from the
+  frozen CAM++ weights)
+- `assets/exported/wulfenite_tse.onnx` (~8 MB, the trained separator
+  in its stateful form with opaque state tensors)
 
 These are the only artifacts the Rust runtime consumes.
 
@@ -286,35 +345,46 @@ These are the only artifacts the Rust runtime consumes.
 
 ## 9. Inference on real audio
 
-> **Status**: inference script is not yet implemented. Planned:
+Two CLIs ship in `python/src/wulfenite/inference/`:
 
-Whole-utterance (offline evaluation, full quality):
+**Whole-utterance** (reference path, best-quality offline evaluation):
 
 ```bash
 uv run --directory python python -m wulfenite.inference.whole \
-    --checkpoint ./checkpoints/phase1/best.pt \
-    --mixture ./samples/real_mixture.wav \
-    --enrollment ./samples/real_enrollment.wav \
-    --output ./output.wav
+    --checkpoint ../assets/checkpoints/phase1/best.pt \
+    --campplus-checkpoint ../assets/campplus/campplus_cn_common.bin \
+    --mixture ../assets/samples/real_mixture.wav \
+    --enrollment ../assets/samples/real_enrollment.wav \
+    --output ../assets/samples/output_whole.wav
 ```
 
-Streaming (simulates the Rust real-time path, validates the
-stateful mode):
+Prints audio duration, compute time, RTF, peak dBFS, and the
+presence-head probability if the model has one.
+
+**Streaming** (stateful frame-by-frame, simulates the Rust runtime,
+measures real-time latency):
 
 ```bash
 uv run --directory python python -m wulfenite.inference.streaming \
-    --checkpoint ./checkpoints/phase1/best.pt \
-    --mixture ./samples/real_mixture.wav \
-    --enrollment ./samples/real_enrollment.wav \
-    --output ./output_stream.wav \
-    --chunk-ms 20 \
-    --lookahead-ms 20
+    --checkpoint ../assets/checkpoints/phase1/best.pt \
+    --campplus-checkpoint ../assets/campplus/campplus_cn_common.bin \
+    --mixture ../assets/samples/real_mixture.wav \
+    --enrollment ../assets/samples/real_enrollment.wav \
+    --output ../assets/samples/output_stream.wav \
+    --chunk-ms 20
 ```
 
-The two outputs should sound near-identical, since SpeakerBeam-SS's
-S4D + causal conv form is exactly equivalent between the parallel
-training path and the stateful streaming path (verified by
-`tests/test_s4d.py::test_s4d_parallel_equals_step`).
+`--chunk-ms` must be a positive multiple of 10 ms (the encoder
+stride). Common values: 10, 20, 40 ms. The script prints per-chunk
+mean / p50 / p95 / max latency, aggregate RTF, and a real-time
+feasibility verdict (warns when p95 compute exceeds the hop window).
+
+**The two outputs should be bit-for-bit identical** — SpeakerBeam-SS's
+`forward` path is aligned with `streaming_step` via deterministic
+zero-padding and output cropping, verified by
+`tests/test_speakerbeam_ss.py::test_speakerbeam_streaming_matches_forward`
+at three chunk sizes and by `tests/test_inference.py::test_whole_vs_streaming_end_to_end`
+for the full TSE wrapper.
 
 ---
 
@@ -351,6 +421,15 @@ training path and the stateful streaming path (verified by
 
 **Cannot load trained checkpoint on Windows**
 : v1 hit a `PosixPath` unpickling issue on cross-OS loads. v2
-  training scripts should stringify all `Path` values in the `args`
-  dict before saving. If you see this on a future checkpoint, open
-  an issue with the full traceback.
+  `save_checkpoint` stringifies all `Path` values in the config
+  dict before saving (see `training/checkpoint.py` and the
+  `test_checkpoint_roundtrip` test), and the inference scripts
+  include a defensive Windows shim that aliases `PosixPath` to
+  `WindowsPath` before `torch.load` runs. If you still see this
+  error, open an issue with the full traceback.
+
+**`assets/` paths not found when running training**
+: The training CLI is launched via ``uv run --directory python``,
+  which changes the working directory to `python/`. From there the
+  repo-root `assets/` is reachable as ``../assets/``. If you prefer
+  absolute paths, pass them instead — either form works.
