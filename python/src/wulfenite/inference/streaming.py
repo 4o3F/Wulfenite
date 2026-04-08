@@ -34,6 +34,7 @@ from pathlib import Path
 
 import soundfile as sf
 import torch
+from tqdm.auto import tqdm
 
 from ..models import WulfeniteTSE
 from ..training.checkpoint import load_checkpoint
@@ -112,7 +113,9 @@ def run_streaming(
     latencies_ms: list[float] = []
     clean_pieces = []
 
-    with torch.no_grad():
+    with torch.no_grad(), tqdm(
+        total=n_chunks, desc="streaming", unit="chunk", dynamic_ncols=True,
+    ) as pbar:
         for i in range(n_chunks):
             start = i * chunk_size
             chunk = mix_wav[..., start:start + chunk_size]
@@ -120,8 +123,15 @@ def run_streaming(
             clean_chunk, state = separator.streaming_step(
                 chunk, speaker_embedding, state,
             )
-            latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+            latency = (time.perf_counter() - t0) * 1000.0
+            latencies_ms.append(latency)
             clean_pieces.append(clean_chunk.cpu())
+            pbar.update(1)
+            if i % 10 == 0:
+                pbar.set_postfix(
+                    ms=f"{latency:.1f}",
+                    refresh=False,
+                )
 
     clean = torch.cat(clean_pieces, dim=-1)[0].numpy()
     # Trim any tail padding so output length matches original mixture.

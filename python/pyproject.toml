@@ -9,6 +9,7 @@ dependencies = [
     "torchaudio>=2.4",
     "numpy>=1.26",
     "soundfile>=0.12",
+    "tqdm>=4.66",
 ]
 
 [build-system]

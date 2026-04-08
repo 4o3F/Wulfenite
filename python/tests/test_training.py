@@ -287,7 +287,7 @@ def test_run_training_one_epoch_writes_checkpoint(tmp_path: Path) -> None:
     # data loader a non-augmented mixer. The simplest way is to set
     # the MixerConfig defaults via the TrainingConfig fields the
     # data pipeline reads, which we already did above.
-    run_training(cfg, model=model)
+    run_training(cfg, model=model, show_progress=False)
 
     # Should have written epoch001.pt and best.pt
     assert (cfg.out_dir / "epoch001.pt").exists()
@@ -318,6 +318,6 @@ def test_validate_runs(tmp_path: Path) -> None:
     criterion = _small_loss()
     device = torch.device("cpu")
 
-    val_loss, parts = validate(model, loader, criterion, device)
+    val_loss, parts = validate(model, loader, criterion, device, show_progress=False)
     assert isinstance(val_loss, float)
     assert val_loss == val_loss  # not NaN

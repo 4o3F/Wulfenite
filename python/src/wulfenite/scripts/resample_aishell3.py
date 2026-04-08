@@ -37,6 +37,7 @@ from pathlib import Path
 import soundfile as sf
 import torch
 import torchaudio.functional as AF
+from tqdm.auto import tqdm
 
 
 TARGET_SR = 16000
@@ -139,10 +140,13 @@ def main() -> None:
         )
 
     # Pre-scan to count how many actually need work, so the progress
-    # print is useful.
+    # bar total is accurate and the user gets a sensible ETA.
     needs_work = 0
     already_ok = 0
-    for f in files:
+    scan_bar = tqdm(
+        files, desc="scan headers", unit="file", dynamic_ncols=True,
+    )
+    for f in scan_bar:
         try:
             info = sf.info(str(f))
         except Exception:
@@ -152,6 +156,7 @@ def main() -> None:
             already_ok += 1
         else:
             needs_work += 1
+    scan_bar.close()
 
     print(f"[scan] {len(files)} file(s) total")
     print(f"[scan] {already_ok} already 16 kHz mono (will skip)")
@@ -171,9 +176,15 @@ def main() -> None:
     errors: list[tuple[str, str]] = []
 
     paths_as_str = [str(f) for f in files]
-    with mp.Pool(n_workers) as pool:
-        for i, (path, status) in enumerate(
-            pool.imap_unordered(_resample_one, paths_as_str, chunksize=16), start=1,
+    with mp.Pool(n_workers) as pool, tqdm(
+        total=len(paths_as_str),
+        desc="resample",
+        unit="file",
+        dynamic_ncols=True,
+        smoothing=0.1,
+    ) as pbar:
+        for path, status in pool.imap_unordered(
+            _resample_one, paths_as_str, chunksize=16,
         ):
             if status == "done":
                 done += 1
@@ -181,12 +192,10 @@ def main() -> None:
                 skipped += 1
             else:
                 errors.append((path, status))
-            if i % 200 == 0 or i == len(paths_as_str):
-                print(
-                    f"[progress] {i}/{len(paths_as_str)}  "
-                    f"done={done} skip={skipped} errors={len(errors)}",
-                    flush=True,
-                )
+            pbar.update(1)
+            pbar.set_postfix(
+                done=done, skip=skipped, err=len(errors), refresh=False,
+            )
 
     print(f"[done] resampled={done} skipped={skipped} errors={len(errors)}")
     if errors:

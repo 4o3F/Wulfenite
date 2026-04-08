@@ -32,6 +32,7 @@ from typing import Callable
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from ..data import (
     MixerConfig,
@@ -170,8 +171,16 @@ def train_one_epoch(
     epoch: int,
     global_step: int,
     log_fn: Callable[[str], None],
+    *,
+    show_progress: bool = True,
 ) -> tuple[float, int]:
-    """Run one epoch of training. Returns ``(mean_loss, new_global_step)``."""
+    """Run one epoch of training. Returns ``(mean_loss, new_global_step)``.
+
+    When ``show_progress`` is true (the CLI default), a tqdm bar shows
+    per-step progress plus live loss values via ``set_postfix``. When
+    false (tests), the inner loop is silent — periodic log lines still
+    go to the log file at ``cfg.log_interval``.
+    """
     model.train()
     # CAM++ stays in eval mode — it is frozen and we do not want BN /
     # dropout to behave as if we were training it.
@@ -181,7 +190,15 @@ def train_one_epoch(
     n_batches = 0
     pin = device.type == "cuda"
 
-    for step, batch in enumerate(loader):
+    pbar = tqdm(
+        loader,
+        desc=f"epoch {epoch} train",
+        total=len(loader),
+        disable=not show_progress,
+        leave=False,
+        dynamic_ncols=True,
+    )
+    for step, batch in enumerate(pbar):
         batch = _move_batch(batch, device, non_blocking=pin)
 
         outputs = model(batch["mixture"], batch["enrollment"])
@@ -207,6 +224,14 @@ def train_one_epoch(
         n_batches += 1
         global_step += 1
 
+        pbar.set_postfix(
+            loss=f"{parts.total:+.3f}",
+            sdr=f"{parts.sdr:+.2f}",
+            stft=f"{parts.mr_stft:.3f}",
+            lr=f"{optimizer.param_groups[0]['lr']:.1e}",
+            refresh=False,
+        )
+
         if global_step % cfg.log_interval == 0:
             log_fn(
                 f"epoch {epoch} step {step + 1}/{len(loader)} "
@@ -217,6 +242,7 @@ def train_one_epoch(
                 f"lr={optimizer.param_groups[0]['lr']:.2e}"
             )
 
+    pbar.close()
     mean_loss = total_loss / max(1, n_batches)
     return mean_loss, global_step
 
@@ -227,6 +253,8 @@ def validate(
     loader: DataLoader,
     criterion: WulfeniteLoss,
     device: torch.device,
+    *,
+    show_progress: bool = True,
 ) -> tuple[float, dict[str, float]]:
     """Run one pass over the validation set. Returns ``(mean_loss, parts_mean)``."""
     model.eval()
@@ -238,7 +266,15 @@ def validate(
     n = 0
     pin = device.type == "cuda"
 
-    for batch in loader:
+    iterator = tqdm(
+        loader,
+        desc="validate",
+        total=len(loader),
+        disable=not show_progress,
+        leave=False,
+        dynamic_ncols=True,
+    )
+    for batch in iterator:
         batch = _move_batch(batch, device, non_blocking=pin)
         outputs = model(batch["mixture"], batch["enrollment"])
         _, parts = criterion(
@@ -273,6 +309,7 @@ def run_training(
     cfg: TrainingConfig,
     *,
     model: WulfeniteTSE | None = None,
+    show_progress: bool = True,
 ) -> None:
     """Run the full training loop described by ``cfg``.
 
@@ -330,7 +367,10 @@ def run_training(
 
     def log(msg: str) -> None:
         stamped = f"[{time.strftime('%H:%M:%S')}] {msg}"
-        print(stamped, flush=True)
+        # Use tqdm.write so the message plays nicely with active progress
+        # bars — it clears the current bar line, prints the message, then
+        # redraws the bar below.
+        tqdm.write(stamped)
         with log_path.open("a", encoding="utf-8") as f:
             f.write(stamped + "\n")
 
@@ -343,15 +383,25 @@ def run_training(
 
     best_val = float("inf")
     global_step = 0
-    for epoch in range(1, cfg.epochs + 1):
+    epoch_iter = tqdm(
+        range(1, cfg.epochs + 1),
+        desc="training",
+        total=cfg.epochs,
+        disable=not show_progress,
+        dynamic_ncols=True,
+    )
+    for epoch in epoch_iter:
         epoch_t0 = time.time()
         train_loss, global_step = train_one_epoch(
             model, train_loader, criterion, optimizer, scheduler,
             device, cfg, epoch, global_step, log,
+            show_progress=show_progress,
         )
         train_time = time.time() - epoch_t0
 
-        val_loss, val_parts = validate(model, val_loader, criterion, device)
+        val_loss, val_parts = validate(
+            model, val_loader, criterion, device, show_progress=show_progress,
+        )
         log(
             f"epoch {epoch} train_loss={train_loss:+.4f} val_loss={val_loss:+.4f} "
             f"val_sdr={val_parts['sdr']:+.3f} val_stft={val_parts['mr_stft']:.4f} "
@@ -377,6 +427,14 @@ def run_training(
                 epoch=epoch, step=global_step, config=cfg, metrics=metrics,
             )
             log(f"[best] val_loss improved to {best_val:+.4f} → saved best.pt")
+
+        epoch_iter.set_postfix(
+            train=f"{train_loss:+.3f}",
+            val=f"{val_loss:+.3f}",
+            best=f"{best_val:+.3f}",
+            refresh=False,
+        )
+    epoch_iter.close()
 
 
 # ---------------------------------------------------------------------------
