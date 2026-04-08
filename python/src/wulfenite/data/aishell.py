@@ -73,12 +73,26 @@ class AudioEntry:
 
 
 def _scan_split(split_dir: Path, dataset: str,
-                speaker_from_dir: bool = True) -> list[AudioEntry]:
+                speaker_from_dir: bool = True,
+                diagnostics: dict | None = None) -> list[AudioEntry]:
     """Walk a ``{split_dir}/{speaker_id}/*.wav`` tree and return entries.
 
-    Silently drops files with unexpected sample rate or channel count —
-    both AISHELL-1 and AISHELL-3 are supposed to be 16 kHz mono, so any
-    file that is not is either corrupt or was resampled by mistake.
+    Files with unexpected sample rate or channel count are dropped so
+    the mixer sees a homogeneous pool. If a ``diagnostics`` dict is
+    passed in, this function updates it with per-rejection counters
+    so the caller can build an informative error when the returned
+    list is empty:
+
+    - ``seen``: total .wav files found
+    - ``wrong_sr``: dropped because sample rate != 16000
+    - ``wrong_channels``: dropped because channels != 1
+    - ``sample_rates``: set of the rejected sample rates, for hints
+    - ``unreadable``: couldn't read the file header
+
+    AISHELL-1 ships at 16 kHz mono natively and needs no conversion.
+    **AISHELL-3 ships at 44.1 kHz** and must be resampled to 16 kHz
+    mono before the scanner will accept it — see
+    ``python/src/wulfenite/scripts/resample_aishell3.py``.
     """
     entries: list[AudioEntry] = []
     if not split_dir.exists():
@@ -88,11 +102,22 @@ def _scan_split(split_dir: Path, dataset: str,
             continue
         spk_id = spk_dir.name if speaker_from_dir else spk_dir.stem
         for wav in sorted(spk_dir.glob("*.wav")):
+            if diagnostics is not None:
+                diagnostics["seen"] = diagnostics.get("seen", 0) + 1
             try:
                 info = sf.info(str(wav))
             except Exception:
+                if diagnostics is not None:
+                    diagnostics["unreadable"] = diagnostics.get("unreadable", 0) + 1
                 continue
-            if info.samplerate != EXPECTED_SAMPLE_RATE or info.channels != 1:
+            if info.samplerate != EXPECTED_SAMPLE_RATE:
+                if diagnostics is not None:
+                    diagnostics["wrong_sr"] = diagnostics.get("wrong_sr", 0) + 1
+                    diagnostics.setdefault("sample_rates", set()).add(info.samplerate)
+                continue
+            if info.channels != 1:
+                if diagnostics is not None:
+                    diagnostics["wrong_channels"] = diagnostics.get("wrong_channels", 0) + 1
                 continue
             entries.append(AudioEntry(
                 speaker_id=spk_id,
@@ -158,17 +183,25 @@ def scan_aishell1(
             "Expected data_aishell/wav/{train,dev,test}/"
         )
 
+    diagnostics: dict = {}
     entries: list[AudioEntry] = []
+    scanned_dirs: list[Path] = []
     for split in splits:
         split_dir = base / "wav" / split
-        entries.extend(_scan_split(split_dir, dataset="aishell1"))
+        scanned_dirs.append(split_dir)
+        entries.extend(
+            _scan_split(split_dir, dataset="aishell1", diagnostics=diagnostics)
+        )
 
     if not entries:
-        raise RuntimeError(
-            f"No AISHELL-1 wavs found under {base}/wav/{splits}. "
-            "Check that the archive was extracted and the per-speaker "
-            "tarballs were unpacked."
-        )
+        raise RuntimeError(_format_empty_scan_error(
+            "AISHELL-1", scanned_dirs, diagnostics,
+            extra_hint=(
+                "Check that the archive was extracted and the per-speaker "
+                ".tar.gz files inside wav/{train,dev,test}/ were unpacked "
+                "(see TRAIN.md section 2)."
+            ),
+        ))
     return _group_by_speaker(entries, min_utts_per_speaker)
 
 
@@ -185,23 +218,97 @@ def scan_aishell3(
     """Scan AISHELL-3 and return ``{speaker_id: [entries]}``.
 
     Args:
-        root: path to the AISHELL-3 root (the directory that
-            contains ``train/wav/`` and ``test/wav/``).
+        root: path to the AISHELL-3 root. Accepts either the directory
+            that contains ``data_aishell3/`` (the tarball's default
+            wrapper) or ``data_aishell3/`` itself (after stripping
+            the wrapper with ``--strip-components=1``).
         splits: which splits to include.
         min_utts_per_speaker: drop speakers with fewer utterances.
+
+    **Warning**: the official AISHELL-3 distribution is at 44.1 kHz,
+    not 16 kHz. This scanner only accepts 16 kHz mono wavs (to match
+    AISHELL-1 and the model's sample rate). Run
+    ``python -m wulfenite.scripts.resample_aishell3`` once after
+    extraction to produce a 16 kHz version in place. The error
+    raised when no files are found includes an explicit "found N
+    files at sample rate X" summary so this pitfall is easy to spot.
     """
     root = Path(root)
+    # Auto-detect the tarball's data_aishell3/ wrapper.
+    if (root / "data_aishell3").exists():
+        base = root / "data_aishell3"
+    else:
+        base = root
+
+    diagnostics: dict = {}
     entries: list[AudioEntry] = []
+    scanned_dirs: list[Path] = []
     for split in splits:
-        split_dir = root / split / "wav"
-        entries.extend(_scan_split(split_dir, dataset="aishell3"))
+        split_dir = base / split / "wav"
+        scanned_dirs.append(split_dir)
+        entries.extend(
+            _scan_split(split_dir, dataset="aishell3", diagnostics=diagnostics)
+        )
 
     if not entries:
-        raise RuntimeError(
-            f"No AISHELL-3 wavs found under {root}/{splits}/wav/. "
-            "Check the archive path."
-        )
+        raise RuntimeError(_format_empty_scan_error(
+            "AISHELL-3", scanned_dirs, diagnostics,
+            extra_hint=(
+                "AISHELL-3 is distributed at 44.1 kHz; Wulfenite needs 16 kHz "
+                "mono. Run `python -m wulfenite.scripts.resample_aishell3 "
+                "--root ../assets/aishell3` once to convert in place, then "
+                "re-run training. See docs/TRAIN.md section 2."
+            ),
+        ))
     return _group_by_speaker(entries, min_utts_per_speaker)
+
+
+# ---------------------------------------------------------------------------
+# Error formatting
+# ---------------------------------------------------------------------------
+
+
+def _format_empty_scan_error(
+    dataset_name: str,
+    scanned_dirs: list[Path],
+    diagnostics: dict,
+    extra_hint: str = "",
+) -> str:
+    """Build an informative error message when a scan turns up nothing."""
+    lines = [f"No {dataset_name} wavs found."]
+    lines.append("Scanned the following directories:")
+    for d in scanned_dirs:
+        marker = "✓" if d.exists() else "✗ (does not exist)"
+        lines.append(f"  {marker} {d}")
+
+    seen = diagnostics.get("seen", 0)
+    if seen == 0:
+        lines.append("No .wav files were found at all under those paths.")
+    else:
+        lines.append(f"Found {seen} .wav file(s), but all were rejected:")
+        wrong_sr = diagnostics.get("wrong_sr", 0)
+        if wrong_sr:
+            rates = diagnostics.get("sample_rates", set())
+            rates_str = ", ".join(sorted(str(int(r)) for r in rates))
+            lines.append(
+                f"  - {wrong_sr} with wrong sample rate "
+                f"(required 16000 Hz, found: {rates_str} Hz)"
+            )
+        wrong_ch = diagnostics.get("wrong_channels", 0)
+        if wrong_ch:
+            lines.append(
+                f"  - {wrong_ch} not mono (required 1 channel)"
+            )
+        unreadable = diagnostics.get("unreadable", 0)
+        if unreadable:
+            lines.append(
+                f"  - {unreadable} could not be opened (corrupt or not wav)"
+            )
+
+    if extra_hint:
+        lines.append("")
+        lines.append(extra_hint)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
