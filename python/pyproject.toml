@@ -4,8 +4,12 @@ version = "0.1.0"
 description = "Wulfenite research crate — SpeakerBeam-SS target speaker extraction"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
-# Dependencies will be added as the pipeline is built out.
-dependencies = []
+dependencies = [
+    "torch>=2.4",
+    "torchaudio>=2.4",
+    "numpy>=1.26",
+    "soundfile>=0.12",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -14,9 +18,24 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/wulfenite"]
 
-[tool.uv]
-# Managed dev workflow; `uv sync` installs wulfenite in editable mode so
-# `from wulfenite.models import ...` works from anywhere in the venv.
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest>=8.0",
 ]
+
+[tool.uv.sources]
+# Default to CUDA 12.6 wheels via Aliyun's PyTorch mirror (China). These
+# still run on CPU-only hosts (torch transparently falls back), so
+# `uv sync` works anywhere. Training requires a CUDA GPU; inference can
+# run on CPU.
+torch = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
+
+# PyPI via Tsinghua mirror — much faster than pypi.org inside CN.
+[[tool.uv.index]]
+url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://mirrors.aliyun.com/pytorch-wheels/cu126"
+format = "flat"

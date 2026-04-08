@@ -28,3 +28,4 @@ python/.venv/
 .idea/
 .DS_Store
 Thumbs.db
+python/uv.lock
