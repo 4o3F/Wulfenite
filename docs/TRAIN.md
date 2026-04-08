@@ -29,7 +29,8 @@ engineering runtime in `rust/` only consumes the final ONNX file
 **Minimum**:
 - 1× NVIDIA GPU with ≥ 12 GB VRAM (tested on RTX 3090 / 4090, 24 GB)
 - ≥ 64 GB RAM
-- ≥ 300 GB free disk (see dataset sizes below)
+- ≥ 50 GB free disk for datasets (~15 GB AISHELL-1 + ~19 GB AISHELL-3
+  + ~3.6 GB MUSAN noise subset + ~30 MB CAM++ checkpoint)
 - Linux (Ubuntu 22.04+ recommended) or WSL2
 - Python 3.11 or 3.12
 - [uv](https://github.com/astral-sh/uv) ≥ 0.5
@@ -56,12 +57,31 @@ Three separate datasets, all free:
 
 Download link: `data_aishell.tgz` from openslr.org/33/resources.
 
-Extract to `~/datasets/aishell1/` so you end up with
-`~/datasets/aishell1/data_aishell/wav/train/S0002/BAC009S0002W0122.wav`
-etc. AISHELL-1 ships with nested per-speaker tarballs that must be
-unpacked once more:
+The tarball contains a top-level `data_aishell/` wrapper directory,
+so a plain extract gives you:
+
+```
+~/datasets/aishell1/
+└── data_aishell/
+    └── wav/
+        ├── train/S0002/BAC009S0002W0122.wav
+        ├── dev/...
+        └── test/...
+```
+
+**Both layouts work** with the scanner — you can either:
+- **Keep the wrapper** (default): `tar xzf data_aishell.tgz -C ~/datasets/aishell1/`
+- **Strip the wrapper** (cleaner path): `tar xzf data_aishell.tgz --strip-components=1 -C ~/datasets/aishell1/` → gives you `~/datasets/aishell1/wav/train/...`
+
+Pass `--aishell1-root ~/datasets/aishell1` either way. The scanner
+auto-detects the layout by looking for either `<root>/data_aishell/`
+or `<root>/wav/`.
+
+AISHELL-1 also ships with nested per-speaker tarballs inside each
+split that must be unpacked once more:
 
 ```bash
+# Adjust the first cd depending on which extraction layout you chose
 cd ~/datasets/aishell1/data_aishell/wav/train
 for f in *.tar.gz; do tar xzf "$f" && rm "$f"; done
 cd ../dev    && for f in *.tar.gz; do tar xzf "$f" && rm "$f"; done
@@ -80,25 +100,43 @@ cd ../test   && for f in *.tar.gz; do tar xzf "$f" && rm "$f"; done
 Extract to `~/datasets/aishell3/` so you end up with
 `~/datasets/aishell3/train/wav/SSB0005/SSB00050001.wav`.
 
-### DNS Challenge 4 noise (~80 GB)
+### MUSAN noise (~3.6 GB — recommended default)
 
-- **Source**: https://github.com/microsoft/DNS-Challenge (ICASSP 2023
-  DNS5 or DNS4 equivalent)
-- **Content**: thousands of short noise recordings (room tone, HVAC,
-  traffic, keyboard, crowd, etc.)
+- **Source**: http://openslr.org/17/
+- **Size**: the full MUSAN archive is ~11 GB but we only need the
+  `noise/` subdirectory, ~3.6 GB (~930 files)
+- **Content**: free-sound and sound-bible noise recordings covering
+  room tone, HVAC, traffic, keyboard, crowd, etc., 16 kHz mono
 - **Why**: teaches the mixture-aware silence branch to distinguish
-  "speech from another speaker" from "non-speech noise"
+  "speech from another speaker" from "non-speech noise". Much
+  smaller than DNS Challenge 4 (~80 GB) with comparable coverage
+  for our use case.
 
-DNS ships as a Git LFS repo — cloning it is slow but straightforward:
+Download and extract just the noise subset:
 
 ```bash
-git clone https://github.com/microsoft/DNS-Challenge.git
-cd DNS-Challenge/datasets/noise
-# flat .wav files, 16 kHz mono
+wget http://www.openslr.org/resources/17/musan.tar.gz
+tar xzf musan.tar.gz -C ~/datasets/
+# Optionally delete speech/ and music/ subsets — we only use noise/
+rm -rf ~/datasets/musan/speech ~/datasets/musan/music
 ```
 
-Point the mixer at `DNS-Challenge/datasets/noise/` (or a subset you
-have space for).
+You end up with:
+
+```
+~/datasets/musan/
+└── noise/
+    ├── free-sound/
+    │   └── noise-free-sound-*.wav
+    └── sound-bible/
+        └── noise-sound-bible-*.wav
+```
+
+Point the mixer at `~/datasets/musan/noise/`. The scanner is generic
+(`scan_noise_dir`) and works unchanged with any other 16 kHz noise
+corpus: DEMAND (~2 GB), FSD50K, ESC-50 resampled to 16 kHz, DNS
+Challenge, or a custom recording set. Just pass the root directory
+containing the `.wav` files.
 
 ---
 
@@ -109,20 +147,21 @@ After all downloads are in place, the local layout should look like:
 ```
 ~/datasets/
 ├── aishell1/
-│   └── data_aishell/
+│   └── data_aishell/          # or skip this layer via --strip-components=1
 │       └── wav/
 │           ├── train/S0002/BAC009S0002W0122.wav
 │           └── dev/...
 ├── aishell3/
 │   └── train/
 │       └── wav/SSB0005/SSB00050001.wav
-└── dns_noise/
-    ├── noise_000001.wav
-    └── ...
+└── musan/
+    └── noise/
+        ├── free-sound/
+        └── sound-bible/
 ```
 
 The Wulfenite scanners (`scan_aishell1`, `scan_aishell3`,
-`scan_dns_noise`) accept either the top-level roots or the nested
+`scan_noise_dir`) accept either the top-level roots or the nested
 `data_aishell/` / `train/wav/` subdirs — both work.
 
 ---
@@ -195,7 +234,7 @@ will look like:
 uv run --directory python python -m wulfenite.training.train \
     --aishell1-root ~/datasets/aishell1 \
     --aishell3-root ~/datasets/aishell3 \
-    --dns-noise-root ~/datasets/dns_noise \
+    --noise-root ~/datasets/musan/noise \
     --campplus-checkpoint ~/datasets/campplus/campplus_cn_common.bin \
     --out-dir ./checkpoints/phase1 \
     --batch-size 16 \
