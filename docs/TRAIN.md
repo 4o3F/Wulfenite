@@ -107,6 +107,25 @@ mkdir -p assets/aishell3
 tar xzf data_aishell3.tgz --strip-components=1 -C assets/aishell3/
 ```
 
+**Critical: resample to 16 kHz before training.** The official
+AISHELL-3 distribution is **44.1 kHz**, not 16 kHz. Wulfenite needs
+16 kHz mono, so you must run the bundled one-off resample script
+once (in place, idempotent):
+
+```bash
+uv run --directory python python -m wulfenite.scripts.resample_aishell3 \
+    --root ../assets/aishell3
+```
+
+This walks the tree, downmixes stereo → mono if needed, resamples
+to 16 kHz using a high-quality Kaiser-window filter, and rewrites
+each file as 16-bit PCM. Idempotent — running it again on an
+already-resampled tree just prints "nothing to do". Use
+``--dry-run`` first if you want to see what it would touch.
+
+Takes ~5-15 minutes on a modern multi-core CPU; the script
+parallelizes over ``--num-workers`` (default = cores − 1).
+
 ### MUSAN noise (~3.6 GB — recommended default)
 
 - **Source**: http://openslr.org/17/
