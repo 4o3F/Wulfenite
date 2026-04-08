@@ -3,7 +3,7 @@
 Public entry points:
 - :class:`WulfeniteMixer` / :class:`MixerConfig` / :func:`collate_mixer_batch`
 - :func:`scan_aishell1` / :func:`scan_aishell3` / :func:`merge_speaker_dicts`
-- :func:`scan_dns_noise`
+- :func:`scan_noise_dir`
 - :func:`synth_room_rir` / :func:`apply_rir` / :func:`add_noise_at_snr` /
   :func:`add_gaussian_noise` / :class:`ReverbConfig`
 - :class:`AudioEntry` / :class:`NoiseEntry`
@@ -22,8 +22,8 @@ from .augmentation import (
     apply_rir,
     synth_room_rir,
 )
-from .dns_noise import NoiseEntry, scan_dns_noise
 from .mixer import MixerConfig, WulfeniteMixer, collate_mixer_batch
+from .noise import NoiseEntry, scan_noise_dir
 
 __all__ = [
     "AudioEntry",
@@ -36,7 +36,7 @@ __all__ = [
     "apply_rir",
     "synth_room_rir",
     "NoiseEntry",
-    "scan_dns_noise",
+    "scan_noise_dir",
     "MixerConfig",
     "WulfeniteMixer",
     "collate_mixer_batch",

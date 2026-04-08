@@ -58,7 +58,7 @@ from .augmentation import (
     apply_rir,
     synth_room_rir,
 )
-from .dns_noise import NoiseEntry
+from .noise import NoiseEntry
 
 
 SAMPLE_RATE = 16000
@@ -95,9 +95,12 @@ class MixerConfig:
     apply_noise: bool = True
     noise_prob: float = 0.80
     noise_snr_range_db: tuple[float, float] = (10.0, 25.0)
-    # If True and dns_noises is provided, sample from DNS4;
-    # otherwise fall back to synthetic Gaussian noise.
-    use_dns_noise: bool = True
+    # If True and a noise_pool is provided, sample real noise files;
+    # otherwise (or if disabled here) fall back to synthetic Gaussian
+    # noise. Accepts any corpus that can be scanned by
+    # :func:`wulfenite.data.noise.scan_noise_dir` (MUSAN, DEMAND,
+    # DNS4, custom recordings, ...).
+    use_noise_pool: bool = True
 
     # --- Per-source loudness target ---
     rms_target: float = 0.1
@@ -219,9 +222,9 @@ class WulfeniteMixer(Dataset):
             )
 
         self.noise_pool = list(noise_pool) if noise_pool else []
-        # If caller disabled DNS noise or provided none, fall back
+        # If caller disabled the noise pool or provided none, fall back
         # silently to synthetic Gaussian noise when noise is applied.
-        self._has_dns = bool(self.noise_pool) and cfg.use_dns_noise
+        self._has_noise_pool = bool(self.noise_pool) and cfg.use_noise_pool
 
         self._base_seed = seed  # None ⇒ fresh entropy each call
 
@@ -285,7 +288,7 @@ class WulfeniteMixer(Dataset):
         # Additive noise on the mixture.
         if cfg.apply_noise and rng.random() < cfg.noise_prob:
             noise_snr = rng.uniform(*cfg.noise_snr_range_db)
-            if self._has_dns:
+            if self._has_noise_pool:
                 noise_entry = rng.choice(self.noise_pool)
                 noise = _load_noise_chunk(noise_entry, self.segment_len, rng)
                 mixture = add_noise_at_snr(mixture, noise, noise_snr)
@@ -341,7 +344,7 @@ class WulfeniteMixer(Dataset):
 
         if cfg.apply_noise and rng.random() < cfg.noise_prob:
             noise_snr = rng.uniform(*cfg.noise_snr_range_db)
-            if self._has_dns:
+            if self._has_noise_pool:
                 noise_entry = rng.choice(self.noise_pool)
                 noise = _load_noise_chunk(noise_entry, self.segment_len, rng)
                 mixture = add_noise_at_snr(mixture, noise, noise_snr)

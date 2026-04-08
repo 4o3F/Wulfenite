@@ -27,7 +27,7 @@ from wulfenite.data import (
     merge_speaker_dicts,
     scan_aishell1,
     scan_aishell3,
-    scan_dns_noise,
+    scan_noise_dir,
     synth_room_rir,
 )
 from wulfenite.data.augmentation import ReverbConfig
@@ -81,7 +81,7 @@ def _build_fake_aishell3(root: Path, num_speakers: int = 3,
     return root
 
 
-def _build_fake_dns_noise(root: Path, num_files: int = 4,
+def _build_fake_noise_dir(root: Path, num_files: int = 4,
                          seconds: float = 3.0) -> Path:
     """Write a flat directory of noise wavs under ``root``."""
     root.mkdir(parents=True, exist_ok=True)
@@ -139,20 +139,20 @@ def test_merge_speaker_dicts(tmp_path: Path) -> None:
     assert any(k.startswith("SSB") for k in merged)
 
 
-def test_scan_dns_noise(tmp_path: Path) -> None:
-    root = _build_fake_dns_noise(tmp_path / "dns", num_files=5, seconds=3.0)
-    noises = scan_dns_noise(root)
+def test_scan_noise_dir(tmp_path: Path) -> None:
+    root = _build_fake_noise_dir(tmp_path / "noise", num_files=5, seconds=3.0)
+    noises = scan_noise_dir(root)
     assert len(noises) == 5
     assert all(n.num_frames > 0 for n in noises)
 
 
-def test_scan_dns_noise_drops_short_files(tmp_path: Path) -> None:
-    root = tmp_path / "dns_short"
+def test_scan_noise_dir_drops_short_files(tmp_path: Path) -> None:
+    root = tmp_path / "noise_short"
     root.mkdir()
     # Short file (500 ms) should be dropped under the 1 s default.
     _write_sine_wav(root / "short.wav", 0.5, 100)
     _write_sine_wav(root / "long.wav", 2.0, 200)
-    noises = scan_dns_noise(root, min_duration_seconds=1.0)
+    noises = scan_noise_dir(root, min_duration_seconds=1.0)
     assert len(noises) == 1
     assert noises[0].path.name == "long.wav"
 
@@ -209,10 +209,10 @@ def _build_mixer(tmp_path: Path, with_noise: bool = True) -> WulfeniteMixer:
     speakers = merge_speaker_dicts(scan_aishell1(a1), scan_aishell3(a3))
     noise_pool = None
     if with_noise:
-        dns_root = tmp_path / "dns"
-        dns_root.mkdir()
-        _build_fake_dns_noise(dns_root, num_files=3, seconds=3.0)
-        noise_pool = scan_dns_noise(dns_root)
+        noise_root = tmp_path / "noise"
+        noise_root.mkdir()
+        _build_fake_noise_dir(noise_root, num_files=3, seconds=3.0)
+        noise_pool = scan_noise_dir(noise_root)
     cfg = MixerConfig(
         segment_seconds=1.0,
         enrollment_seconds=1.0,
