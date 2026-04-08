@@ -1,9 +1,13 @@
 # Rust build artifacts
+rust/target/
 /target
 
-# Local research artifacts (datasets, checkpoints, training outputs)
+# Local research artifacts (datasets, checkpoints, training outputs, exported ONNX)
 assets/
 converted/
+python/assets/
+rust/assets/
+*.onnx
 
 # Python
 __pycache__/
@@ -13,7 +17,6 @@ __pycache__/
 venv/
 .python-version
 python/.venv/
-python/uv.lock
 
 # Claude Code / Codex local state
 .claude/
