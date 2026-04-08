@@ -68,6 +68,18 @@ Delcroix — NTT, Interspeech 2024).
 from ModelScope, trained on ~200k Chinese speakers). 192-dim embedding,
 80-dim FBank input. **Frozen** throughout training.
 
+**Crucially, CAM++ runs exactly ONCE per session**, not per frame. TSE's
+core assumption is that the target speaker is fixed for the duration of
+a session (one streamer per broadcast, one caller per phone call, one
+gamer per match). The enrollment is processed once at session startup,
+the resulting 192-d embedding is cached, and every subsequent frame of
+the real-time separator is conditioned on that same cached embedding.
+CAM++'s ~7 M parameters and compute cost land in the *setup* budget
+(one-time ~50–200 ms), not the *steady-state* per-frame budget. This is
+the key architectural reason a heavyweight Chinese speaker encoder does
+not compromise sub-50 ms per-frame latency — see
+`docs/onnx_contract.md` for the concrete two-file split.
+
 ### Speaker embedding fusion — design decision
 
 The separator uses **multiplicative speaker adaptation** (SpeakerBeam's
