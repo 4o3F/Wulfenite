@@ -109,22 +109,75 @@ tar xzf data_aishell3.tgz --strip-components=1 -C assets/aishell3/
 
 **Critical: resample to 16 kHz before training.** The official
 AISHELL-3 distribution is **44.1 kHz**, not 16 kHz. Wulfenite needs
-16 kHz mono, so you must run the bundled one-off resample script
-once (in place, idempotent):
+16 kHz mono, so you must convert the tree once before training.
+Two options below — the ffmpeg path is 3-5× faster and recommended;
+the Python script is a pure-Python fallback for environments
+without ffmpeg.
+
+**Option A — ffmpeg (recommended, ~3-5 minutes on 16 cores)**
+
+Install ffmpeg if you don't already have it:
+
+```bash
+sudo apt install ffmpeg
+```
+
+Then from the repo root:
+
+```bash
+find assets/aishell3 -type f -name "*.wav" -print0 | \
+  xargs -0 -P "$(nproc)" -n 1 -I {} bash -c '
+    f="{}"
+    sr=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$f" 2>/dev/null)
+    if [ "$sr" != "16000" ]; then
+      tmp="${f%.wav}.16k.wav"
+      ffmpeg -y -loglevel error -i "$f" -ar 16000 -ac 1 -c:a pcm_s16le "$tmp" && mv "$tmp" "$f"
+    fi
+  '
+```
+
+Runs one ffmpeg job per CPU core. Idempotent: ``ffprobe`` skips
+files already at 16 kHz. Writes each output to a ``.16k.wav``
+sibling, then atomically renames over the original — so an
+interrupted run never leaves a half-written file.
+
+**Option A with progress bar** (needs GNU parallel):
+
+```bash
+sudo apt install parallel
+find assets/aishell3 -type f -name "*.wav" | \
+  parallel --bar -j "$(nproc)" '
+    sr=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 {})
+    if [ "$sr" != "16000" ]; then
+      ffmpeg -y -loglevel error -i {} -ar 16000 -ac 1 -c:a pcm_s16le {.}.16k.wav && mv {.}.16k.wav {}
+    fi
+  '
+```
+
+``--bar`` gives you a live progress bar with ETA.
+
+**Optional: SoX-quality resampler.** If your ffmpeg was built with
+``libsoxr`` (Ubuntu's default package is), you can add
+``-af aresample=resampler=soxr:precision=28`` before ``-ar 16000``
+for a marginally higher-quality resample at a small speed cost.
+For speech at 44.1 → 16 kHz the default swresample filter is
+already fine.
+
+**Option B — bundled Python script (slower, no extra deps)**
+
+If you cannot install ffmpeg, the repo ships a pure-Python
+equivalent using torchaudio's Kaiser-window resampler. Same
+behavior (idempotent, in-place, 16-bit PCM output) but 3-5× slower
+than the ffmpeg version. Runs in ~15-25 minutes on 16 cores with
+a live tqdm progress bar:
 
 ```bash
 uv run --directory python python -m wulfenite.scripts.resample_aishell3 \
     --root ../assets/aishell3
 ```
 
-This walks the tree, downmixes stereo → mono if needed, resamples
-to 16 kHz using a high-quality Kaiser-window filter, and rewrites
-each file as 16-bit PCM. Idempotent — running it again on an
-already-resampled tree just prints "nothing to do". Use
-``--dry-run`` first if you want to see what it would touch.
-
-Takes ~5-15 minutes on a modern multi-core CPU; the script
-parallelizes over ``--num-workers`` (default = cores − 1).
+Use ``--dry-run`` to preview which files would be touched, or
+``--num-workers N`` to control parallelism (default: cores − 1).
 
 ### MUSAN noise (~3.6 GB — recommended default)
 
