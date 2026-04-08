@@ -140,11 +140,23 @@ class AugmentationConfig:
     # the interferer is loud. Without this, the model has only ever seen
     # full-speech targets and will hallucinate an extraction whenever the
     # interferer is present, regardless of whether the target is talking.
+    #
+    # Defaults tuned to match a realistic streaming scenario where the
+    # target speaker is silent ~10% of the time (natural pauses between
+    # sentences + occasional longer gaps). Earlier aggressive defaults
+    # (prob=0.5, max_frac=0.80, max_regions=3) produced ~37% average
+    # silenced fraction in the training signal, which taught the model
+    # to suppress even the target speaker as a "safe default" behavior.
+    #
+    # Average silenced fraction per training sample with current values:
+    #   prob × (avg region count) × (avg region length / chunk)
+    #   ≈ 0.3 × (~1.5 regions) × (~0.2 of chunk) ≈ 0.09 → ~9% silence.
     sample_rate: int = 16000
-    target_silence_prob: float = 0.5     # apply silence to this fraction of samples
-    target_silence_max_frac: float = 0.80  # never zero more than this fraction (keep loss numerically stable)
-    target_silence_min_region_ms: float = 200.0
-    target_silence_max_regions: int = 3
+    target_silence_prob: float = 0.3          # fraction of samples that get silence
+    target_silence_max_frac: float = 0.50     # per-sample cap on silenced fraction
+    target_silence_min_region_ms: float = 150.0
+    target_silence_max_region_ms: float = 1200.0  # per-region cap (no single 3s dead block)
+    target_silence_max_regions: int = 2
 
     def __post_init__(self) -> None:
         if self.reverb is None:
@@ -211,6 +223,7 @@ def insert_target_silence(target: torch.Tensor,
 
     max_total_silence = int(cfg.target_silence_max_frac * n)
     min_region = int(cfg.target_silence_min_region_ms * cfg.sample_rate / 1000.0)
+    max_region = int(cfg.target_silence_max_region_ms * cfg.sample_rate / 1000.0)
     if max_total_silence < min_region:
         return target
 
@@ -218,10 +231,15 @@ def insert_target_silence(target: torch.Tensor,
     silenced_so_far = 0
     n_regions = rng.randint(1, cfg.target_silence_max_regions)
     for _ in range(n_regions):
-        remaining = max_total_silence - silenced_so_far
-        if remaining < min_region:
+        remaining_budget = max_total_silence - silenced_so_far
+        if remaining_budget < min_region:
             break
-        region_len = rng.randint(min_region, remaining)
+        # Per-region length capped by BOTH the per-region max and the
+        # remaining total budget, so no single region dominates the chunk.
+        upper = min(max_region, remaining_budget)
+        if upper < min_region:
+            break
+        region_len = rng.randint(min_region, upper)
         max_start = n - region_len
         if max_start <= 0:
             break

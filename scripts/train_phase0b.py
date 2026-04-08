@@ -177,6 +177,10 @@ def train(args: argparse.Namespace) -> None:
         p_reverb=args.p_reverb,
         p_noise=args.p_noise,
         reverb_enrollment=args.reverb_enrollment,
+        target_silence_prob=args.silence_prob,
+        target_silence_max_frac=args.silence_max_frac,
+        target_silence_max_region_ms=args.silence_max_region_ms,
+        target_silence_max_regions=args.silence_max_regions,
     )
     train_ds = AishellMixDataset(
         aishell_root=args.aishell_root,
@@ -250,6 +254,8 @@ def train(args: argparse.Namespace) -> None:
     log(f"train steps/epoch: {len(train_loader)}  val steps: {len(val_loader)}")
     log(f"augmentation: rt60={args.rt60_range} noise_snr={args.noise_snr_range_db} "
         f"p_reverb={args.p_reverb} p_noise={args.p_noise}")
+    log(f"silence: prob={args.silence_prob} max_frac={args.silence_max_frac} "
+        f"max_region_ms={args.silence_max_region_ms} max_regions={args.silence_max_regions}")
     log(f"loss weights: sdr={args.sdr_weight} si_sdr={args.si_weight}")
 
     best_val = float("inf")
@@ -388,6 +394,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--p-noise", type=float, default=0.80)
     parser.add_argument("--reverb-enrollment", action="store_true", default=True,
                         help="Also reverberate the enrollment signal")
+
+    # Target silence augmentation (false-extraction prevention). These
+    # values are deliberately conservative: overdoing it teaches the model
+    # to suppress everything as a safe default.
+    parser.add_argument("--silence-prob", type=float, default=0.3,
+                        help="Fraction of training samples that get target "
+                             "silence inserted")
+    parser.add_argument("--silence-max-frac", type=float, default=0.5,
+                        help="Per-sample cap on the fraction of target that "
+                             "can be silenced (0.5 = at most half)")
+    parser.add_argument("--silence-max-region-ms", type=float, default=1200.0,
+                        help="Per-region cap in milliseconds (prevents any "
+                             "single contiguous dead block from dominating)")
+    parser.add_argument("--silence-max-regions", type=int, default=2)
 
     # Loss knobs — Phase 0b uses non-scale-invariant SDR by default.
     # The previous (SI-SDR + log-mag) recipe converged to a pass-through
