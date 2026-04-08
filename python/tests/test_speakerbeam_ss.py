@@ -57,3 +57,49 @@ def test_speakerbeam_initial_state_shapes() -> None:
     model = SpeakerBeamSS(cfg).eval()
     state = model.initial_state(batch_size=1)
     assert len(state) == len(model.blocks)
+
+
+def test_speakerbeam_streaming_matches_forward() -> None:
+    """streaming_step on any chunking must match forward() exactly.
+
+    This is the central guarantee that lets us train with forward()
+    and deploy with streaming_step()/ONNX. The test feeds the same
+    utterance through both paths and asserts the outputs are equal
+    up to floating-point rounding.
+    """
+    torch.manual_seed(0)
+    cfg = _small_config()
+    model = SpeakerBeamSS(cfg).eval()
+
+    stride = cfg.enc_stride
+    T = 8 * stride  # 8 encoder frames
+    batch = 2
+    mixture = torch.randn(batch, T)
+    embedding = torch.nn.functional.normalize(
+        torch.randn(batch, cfg.bottleneck_channels), p=2, dim=-1,
+    )
+
+    with torch.no_grad():
+        # Whole-utterance reference.
+        out_whole = model(mixture, embedding)["clean"]
+
+        # Streaming with varying chunk sizes.
+        for chunk_size in (stride, 2 * stride, 4 * stride):
+            state = model.initial_streaming_state(batch_size=batch)
+            pieces = []
+            for start in range(0, T, chunk_size):
+                chunk = mixture[..., start:start + chunk_size]
+                if chunk.shape[-1] != chunk_size:
+                    continue  # skip trailing partial
+                y, state = model.streaming_step(chunk, embedding, state)
+                pieces.append(y)
+            out_stream = torch.cat(pieces, dim=-1)
+            assert out_stream.shape == out_whole.shape, (
+                f"chunk_size={chunk_size}: stream {tuple(out_stream.shape)} "
+                f"vs whole {tuple(out_whole.shape)}"
+            )
+            diff = (out_stream - out_whole).abs().max().item()
+            assert diff < 1e-4, (
+                f"chunk_size={chunk_size}: streaming / whole-utterance "
+                f"disagree by {diff:.2e}"
+            )

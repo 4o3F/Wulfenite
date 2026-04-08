@@ -303,18 +303,30 @@ class SpeakerBeamSS(nn.Module):
         mixture: torch.Tensor,
         speaker_embedding: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Whole-sequence training forward.
+        """Whole-sequence forward, numerically aligned with streaming.
+
+        The input is left-padded with ``enc_stride`` zeros and the
+        output is cropped back to ``T`` at the end, so that calling
+        ``forward`` on a full utterance produces bit-identical results
+        to calling ``streaming_step`` on the same utterance in any
+        valid chunking. This alignment is important: it means the
+        model we train with ``forward`` is the same model we deploy
+        via ``streaming_step`` / ONNX.
 
         Args:
             mixture: ``[B, T]`` waveform in ``[-1, 1]`` at 16 kHz.
-                ``T`` should be a multiple of ``enc_stride`` (160 by
-                default) to avoid encoder/decoder length mismatch.
+                ``T`` should be a multiple of ``enc_stride`` (160
+                default). Values that are not will still run but
+                will have a few samples of boundary artifact at the
+                decoder end.
             speaker_embedding: ``[B, 192]`` L2-normalized CAM++ output.
 
         Returns:
             Dict with:
-            - ``"clean"``: ``[B, T_out]`` estimated target waveform.
-            - ``"presence_logit"``: ``[B]`` pre-sigmoid target presence
+            - ``"clean"``: ``[B, T]`` estimated target waveform, same
+              length as the input mixture (cropped from the padded
+              decoder output).
+            - ``"presence_logit"``: ``[B]`` pre-sigmoid target-presence
               logit (present only when ``target_presence_head`` is
               enabled).
         """
@@ -329,9 +341,17 @@ class SpeakerBeamSS(nn.Module):
                 f"got {tuple(speaker_embedding.shape)}"
             )
 
+        T = mixture.shape[-1]
         x = mixture.unsqueeze(1)                    # [B, 1, T]
+
+        # Left-pad with ``enc_kernel_size - enc_stride`` zeros to match
+        # the streaming encoder's zero-initialized buffer. This makes
+        # forward() and streaming_step() produce the same output.
+        pad_left = self.config.enc_kernel_size - self.config.enc_stride
+        x = torch.nn.functional.pad(x, (pad_left, 0))
+
         enc = self.encoder(x)                       # [B, N_enc, L]
-        enc_abs = torch.relu(enc)                   # Conv-TasNet-style half-wave
+        enc_abs = torch.relu(enc)
 
         # Bottleneck + normalize.
         feat = self.pre_norm(enc_abs)
@@ -346,9 +366,14 @@ class SpeakerBeamSS(nn.Module):
 
         # Mask head → apply to encoded features.
         mask = self.mask_head(feat)                 # [B, N_enc, L]
-        masked = enc * mask                         # real-masking in encoder domain
+        masked = enc * mask
 
-        clean = self.decoder(masked).squeeze(1)     # [B, T]
+        clean = self.decoder(masked).squeeze(1)     # [B, T + pad_left]
+
+        # Crop the decoder's trailing overhang so the output matches
+        # the input length. The dropped tail is the ``decoder_overlap``
+        # that would otherwise be carried into the next streaming call.
+        clean = clean[..., :T]
 
         outputs: dict[str, torch.Tensor] = {"clean": clean}
         if self.presence_head is not None:
@@ -357,7 +382,7 @@ class SpeakerBeamSS(nn.Module):
         return outputs
 
     # ------------------------------------------------------------------
-    # Streaming helpers
+    # Block-level streaming state (kept for tests that inspect it)
     # ------------------------------------------------------------------
 
     def initial_state(
@@ -366,18 +391,12 @@ class SpeakerBeamSS(nn.Module):
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.float32,
     ) -> list:
-        """Allocate zero streaming state for one session.
+        """Return zero per-block streaming states for the separator stack.
 
-        Returns a list of per-block states, each entry being whatever
-        the block's ``zero_state`` returns. The caller does not need
-        to introspect the list — just pass it back into
-        ``forward_step``.
-
-        Note: this is the state for the *separator stack* only. The
-        encoder Conv1d also has left-context that the streaming code
-        in Rust will manage via its own ring buffer (outside this
-        module), because the encoder's stride > 1 needs careful
-        frame-aligned handling that is cleaner to do in the runtime.
+        This is a low-level helper that returns only the separator
+        blocks' states. For a full session streaming state including
+        encoder buffer and decoder overlap, use
+        :meth:`initial_streaming_state` instead.
         """
         if device is None:
             device = next(self.parameters()).device
@@ -385,3 +404,134 @@ class SpeakerBeamSS(nn.Module):
             block.zero_state(batch_size, device, dtype)
             for block in self.blocks
         ]
+
+    # ------------------------------------------------------------------
+    # Full session streaming
+    # ------------------------------------------------------------------
+
+    def initial_streaming_state(
+        self,
+        batch_size: int = 1,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> dict:
+        """Return the full streaming state for a fresh session.
+
+        The state dict threads three kinds of buffers across
+        ``streaming_step`` calls:
+
+        - ``"encoder_buffer"``: the last ``enc_kernel_size - enc_stride``
+          input samples, needed for the next encoder frame.
+        - ``"block_states"``: per-separator-block states, same thing
+          ``initial_state`` returns.
+        - ``"decoder_overlap"``: the trailing samples of the previous
+          decoder output that overlap with the next chunk's leading
+          samples under the ConvTranspose1d overlap-add arithmetic.
+
+        The initial state is all zeros, matching what ``forward``'s
+        left-pad represents. This ensures the first streaming call on
+        a fresh session produces the same samples as the first
+        ``enc_stride`` × N samples of a ``forward`` pass over the
+        concatenated chunk sequence.
+        """
+        if device is None:
+            device = next(self.parameters()).device
+        enc_overlap = self.config.enc_kernel_size - self.config.enc_stride
+        return {
+            "encoder_buffer": torch.zeros(
+                batch_size, 1, enc_overlap, device=device, dtype=dtype,
+            ),
+            "block_states": [
+                block.zero_state(batch_size, device, dtype) for block in self.blocks
+            ],
+            "decoder_overlap": torch.zeros(
+                batch_size, 1, enc_overlap, device=device, dtype=dtype,
+            ),
+        }
+
+    def streaming_step(
+        self,
+        mixture_chunk: torch.Tensor,
+        speaker_embedding: torch.Tensor,
+        state: dict,
+    ) -> tuple[torch.Tensor, dict]:
+        """Stateful frame-by-frame forward.
+
+        Args:
+            mixture_chunk: ``[B, T_chunk]`` new audio samples. ``T_chunk``
+                must be a positive multiple of ``enc_stride`` (160 by
+                default). Typical values: 160 (10 ms) or 320 (20 ms).
+            speaker_embedding: ``[B, 192]`` L2-normalized embedding,
+                normally computed once per session by CAM++.
+            state: dict from :meth:`initial_streaming_state` or the
+                previous call's second return value.
+
+        Returns:
+            Tuple of:
+            - ``clean_chunk``: ``[B, T_chunk]`` clean output for
+              exactly the samples that were fed in. The overlap-add
+              with the next chunk is handled via the updated state.
+            - ``new_state``: dict to pass into the next call.
+
+        This method does NOT compute the presence head. The presence
+        head uses global mean pool over the full utterance and is
+        meaningful only in the whole-sequence ``forward`` path.
+        """
+        if mixture_chunk.dim() != 2:
+            raise ValueError(
+                f"expected mixture_chunk shape [B, T], got {tuple(mixture_chunk.shape)}"
+            )
+        cfg = self.config
+        stride = cfg.enc_stride
+        if mixture_chunk.shape[-1] == 0 or mixture_chunk.shape[-1] % stride != 0:
+            raise ValueError(
+                f"streaming chunk length {mixture_chunk.shape[-1]} must be a "
+                f"positive multiple of enc_stride={stride}"
+            )
+        if speaker_embedding.dim() != 2 or speaker_embedding.size(-1) != cfg.bottleneck_channels:
+            raise ValueError(
+                "speaker_embedding must be [B, "
+                f"{cfg.bottleneck_channels}], got {tuple(speaker_embedding.shape)}"
+            )
+
+        # ---- Encoder with left-context buffer ----
+        x = mixture_chunk.unsqueeze(1)  # [B, 1, T_chunk]
+        x_full = torch.cat([state["encoder_buffer"], x], dim=-1)
+        enc = self.encoder(x_full)  # [B, N_enc, L_frames]
+        enc_abs = torch.relu(enc)
+        # New encoder buffer = last enc_kernel_size - enc_stride samples of x_full.
+        enc_overlap = cfg.enc_kernel_size - cfg.enc_stride
+        new_encoder_buffer = x_full[..., -enc_overlap:]
+
+        # ---- Bottleneck + speaker fusion ----
+        feat = self.pre_norm(enc_abs)
+        feat = self.bottleneck(feat)                     # [B, B, L_frames]
+        feat = feat * speaker_embedding.unsqueeze(-1)
+
+        # ---- Separator stack (with per-block state) ----
+        new_block_states = []
+        for block, block_state in zip(self.blocks, state["block_states"]):
+            feat, new_bs = block.forward_step(feat, block_state)
+            new_block_states.append(new_bs)
+
+        # ---- Mask head ----
+        mask = self.mask_head(feat)
+        masked = enc * mask
+
+        # ---- Decoder with overlap-add ----
+        decoded = self.decoder(masked)  # [B, 1, T_chunk + enc_overlap]
+        # Overlap-add with the previous chunk's tail.
+        decoded = decoded.clone()
+        decoded[..., :enc_overlap] = decoded[..., :enc_overlap] + state["decoder_overlap"]
+
+        # Commit exactly T_chunk samples, save the trailing enc_overlap
+        # samples as the next call's decoder_overlap.
+        committed = decoded[..., : mixture_chunk.shape[-1]]
+        new_decoder_overlap = decoded[..., mixture_chunk.shape[-1]:]
+
+        new_state = {
+            "encoder_buffer": new_encoder_buffer,
+            "block_states": new_block_states,
+            "decoder_overlap": new_decoder_overlap,
+        }
+        return committed.squeeze(1), new_state
