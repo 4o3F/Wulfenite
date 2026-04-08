@@ -175,21 +175,34 @@ class BSRNNCampPlus(nn.Module):
             batched[i, : f.size(0)] = f
         return self.spk_model(batched)  # [B, 192]
 
-    def forward(self, mixture: torch.Tensor, enrollment_wav: torch.Tensor) -> torch.Tensor:
-        if mixture.dim() != 2:
-            raise ValueError(f"Expected mixture shape [B, T], got {tuple(mixture.shape)}")
+    def compute_cond(self, enrollment_wav: torch.Tensor) -> torch.Tensor:
+        """Pre-compute the speaker conditioning signal from enrollment.
+
+        Returns the ``[B, 1, 192, 1]`` tensor that the BSRNN separator
+        ingests. Callers can cache this once and reuse it for many
+        ``separate_with_cond`` calls on consecutive streaming chunks,
+        avoiding the per-chunk CAM++ recomputation.
+        """
         if enrollment_wav.dim() != 2:
             raise ValueError(
                 f"Expected enrollment shape [B, T], got {tuple(enrollment_wav.shape)}"
             )
+        spk_embedding = self._compute_spk_embedding(enrollment_wav)  # [B, 192]
+        return spk_embedding.unsqueeze(1).unsqueeze(3)  # [B, 1, 192, 1]
+
+    def separate_with_cond(self, mixture: torch.Tensor,
+                           spk_embedding: torch.Tensor) -> torch.Tensor:
+        """Run the BSRNN separator given a pre-computed conditioning signal.
+
+        This is the streaming-friendly entry point: feed chunks of
+        ``mixture`` one at a time while reusing a cached ``spk_embedding``
+        from ``compute_cond``.
+        """
+        if mixture.dim() != 2:
+            raise ValueError(f"Expected mixture shape [B, T], got {tuple(mixture.shape)}")
 
         batch_size, num_samples = mixture.shape
 
-        # --- CAM++ speaker embedding ---
-        spk_embedding = self._compute_spk_embedding(enrollment_wav)  # [B, 192]
-        spk_embedding = spk_embedding.unsqueeze(1).unsqueeze(3)  # [B, 1, 192, 1]
-
-        # --- BSRNN spectral front-end (copied from WeSepBSRNN.forward) ---
         window = torch.hann_window(self.win, dtype=mixture.dtype, device=mixture.device)
         spec = torch.stft(
             mixture,
@@ -246,6 +259,15 @@ class BSRNNCampPlus(nn.Module):
             length=num_samples,
         )
         return output
+
+    def forward(self, mixture: torch.Tensor, enrollment_wav: torch.Tensor) -> torch.Tensor:
+        """Whole-utterance convenience: compute cond then separate.
+
+        For streaming use ``compute_cond`` once followed by many
+        ``separate_with_cond`` calls on consecutive chunks.
+        """
+        cond = self.compute_cond(enrollment_wav)
+        return self.separate_with_cond(mixture, cond)
 
 
 # ---------------------------------------------------------------------------
