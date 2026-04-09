@@ -24,9 +24,10 @@ well-defined regardless of batch composition.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from .mr_stft import MultiResolutionSTFTLoss
@@ -49,6 +50,7 @@ class LossWeights:
     mr_stft: float = 1.0
     absent: float = 1.0
     presence: float = 0.1
+    speaker_cls: float = 0.3
 
 
 @dataclass
@@ -64,6 +66,7 @@ class LossParts:
     mr_stft: float
     absent: float
     presence: float
+    speaker_cls: float
     n_present: int
     n_absent: int
 
@@ -96,6 +99,8 @@ class WulfeniteLoss(nn.Module):
         mixture: torch.Tensor,
         target_present: torch.Tensor,
         presence_logit: torch.Tensor | None = None,
+        speaker_logits: torch.Tensor | None = None,
+        target_speaker_idx: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, LossParts]:
         """Compute the full training loss.
 
@@ -113,6 +118,10 @@ class WulfeniteLoss(nn.Module):
             presence_logit: ``[B]`` optional presence-head output.
                 If ``None``, the presence term is skipped (useful for
                 ablations or when running a model without the head).
+            speaker_logits: optional ``[B, num_speakers]`` logits from
+                the learnable encoder's auxiliary classifier.
+            target_speaker_idx: optional ``[B]`` long tensor with the
+                claimed target speaker id for each enrollment.
 
         Returns:
             Tuple of ``(total_loss, parts)`` where ``parts`` is a
@@ -129,6 +138,19 @@ class WulfeniteLoss(nn.Module):
             raise ValueError(
                 f"target_present must be shape [B]; got "
                 f"{tuple(target_present.shape)}"
+            )
+        if speaker_logits is not None and speaker_logits.size(0) != clean.shape[0]:
+            raise ValueError(
+                "speaker_logits must have batch dimension [B, ...]; got "
+                f"{tuple(speaker_logits.shape)}"
+            )
+        if (
+            target_speaker_idx is not None
+            and target_speaker_idx.shape != clean.shape[:1]
+        ):
+            raise ValueError(
+                "target_speaker_idx must be shape [B]; got "
+                f"{tuple(target_speaker_idx.shape)}"
             )
 
         device = clean.device
@@ -165,12 +187,21 @@ class WulfeniteLoss(nn.Module):
                 presence_logit, target_present.to(device),
             )
 
+        # --- Auxiliary speaker classification on all samples ----------
+        l_speaker_cls = zero
+        if speaker_logits is not None and target_speaker_idx is not None:
+            l_speaker_cls = F.cross_entropy(
+                speaker_logits,
+                target_speaker_idx.to(device=device, dtype=torch.long),
+            )
+
         w = self.weights
         total = (
             w.sdr * l_sdr
             + w.mr_stft * l_stft
             + w.absent * l_absent
             + w.presence * l_presence
+            + w.speaker_cls * l_speaker_cls
         )
 
         parts = LossParts(
@@ -179,6 +210,7 @@ class WulfeniteLoss(nn.Module):
             mr_stft=float(l_stft.detach()),
             absent=float(l_absent.detach()),
             presence=float(l_presence.detach()),
+            speaker_cls=float(l_speaker_cls.detach()),
             n_present=n_present,
             n_absent=n_absent,
         )

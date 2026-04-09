@@ -36,6 +36,7 @@ Every call yields a dict with:
 - ``"target"``: ``[T]`` float tensor, loss reference (zeros for absent)
 - ``"enrollment"``: ``[T_enr]`` float tensor, fed to CAM++
 - ``"target_present"``: scalar tensor, 1.0 or 0.0
+- ``"target_speaker_idx"``: scalar ``long`` tensor, stable speaker id
 - ``"snr_db"``: scalar tensor for logging
 """
 
@@ -216,6 +217,9 @@ class WulfeniteMixer(Dataset):
         # absent branch needs one but we unify the requirement).
         self.speakers = {k: v for k, v in speakers.items() if len(v) >= 2}
         self.speaker_ids: list[str] = sorted(self.speakers.keys())
+        self.speaker_to_idx: dict[str, int] = {
+            sid: i for i, sid in enumerate(self.speaker_ids)
+        }
         if len(self.speaker_ids) < 2:
             raise RuntimeError(
                 "Need at least 2 speakers with ≥ 2 utterances each."
@@ -307,6 +311,9 @@ class WulfeniteMixer(Dataset):
             "target": target,
             "enrollment": enrollment,
             "target_present": torch.tensor(1.0, dtype=torch.float32),
+            "target_speaker_idx": torch.tensor(
+                self.speaker_to_idx[target_spk], dtype=torch.long,
+            ),
             "snr_db": torch.tensor(snr_db, dtype=torch.float32),
         }
 
@@ -360,6 +367,9 @@ class WulfeniteMixer(Dataset):
             "target": torch.zeros(self.segment_len, dtype=torch.float32),
             "enrollment": enrollment,
             "target_present": torch.tensor(0.0, dtype=torch.float32),
+            "target_speaker_idx": torch.tensor(
+                self.speaker_to_idx[target_spk], dtype=torch.long,
+            ),
             # SNR is not meaningful for absent samples; log as 0.
             "snr_db": torch.tensor(0.0, dtype=torch.float32),
         }
@@ -388,5 +398,8 @@ def collate_mixer_batch(batch: Sequence[dict]) -> dict:
         "target": torch.stack([b["target"] for b in batch], dim=0),
         "enrollment": torch.stack([b["enrollment"] for b in batch], dim=0),
         "target_present": torch.stack([b["target_present"] for b in batch], dim=0),
+        "target_speaker_idx": torch.stack(
+            [b["target_speaker_idx"] for b in batch], dim=0,
+        ),
         "snr_db": torch.stack([b["snr_db"] for b in batch], dim=0),
     }

@@ -235,7 +235,16 @@ def test_mixer_sample_shapes(tmp_path: Path) -> None:
     assert sample["target"].shape == (expected_len,)
     assert sample["enrollment"].shape == (expected_len,)
     assert sample["target_present"].shape == ()
+    assert sample["target_speaker_idx"].shape == ()
     assert sample["target_present"].item() in (0.0, 1.0)
+
+
+def test_mixer_emits_target_speaker_idx(tmp_path: Path) -> None:
+    mixer = _build_mixer(tmp_path)
+    sample = mixer[0]
+    assert "target_speaker_idx" in sample
+    assert sample["target_speaker_idx"].dtype == torch.long
+    assert 0 <= int(sample["target_speaker_idx"].item()) < len(mixer.speaker_ids)
 
 
 def test_mixer_present_and_absent_branches_fire(tmp_path: Path) -> None:
@@ -285,6 +294,7 @@ def test_mixer_collate(tmp_path: Path) -> None:
     assert collated["target"].shape == (4, int(1.0 * SR))
     assert collated["enrollment"].shape == (4, int(1.0 * SR))
     assert collated["target_present"].shape == (4,)
+    assert collated["target_speaker_idx"].shape == (4,)
 
 
 def test_mixer_without_noise_pool(tmp_path: Path) -> None:
