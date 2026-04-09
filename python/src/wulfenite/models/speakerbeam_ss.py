@@ -280,6 +280,26 @@ class SpeakerBeamSS(nn.Module):
                 d_state=cfg.s4d_state_dim,
             ))
 
+        # --- Per-channel speaker-conditioning gain ---
+        # The frozen CAM++ encoder produces L2-normalized 192-d speaker
+        # embeddings, so each component has standard deviation
+        # ~1/sqrt(d) ≈ 0.072 at d=192. Multiplying that into the
+        # post-cLN bottleneck features (which have unit std) would
+        # crush the conditioned features by about 22 dB per channel,
+        # leaving the separator with almost no usable speaker signal.
+        #
+        # The fix is a per-channel learnable gain initialized to
+        # sqrt(bottleneck_channels), which makes the post-multiply
+        # features start out at unit std on average. Training is then
+        # free to adjust per-channel emphasis without having to learn
+        # the systemic 22 dB rescue first.
+        self.speaker_gain = nn.Parameter(
+            torch.full(
+                (cfg.bottleneck_channels,),
+                float(cfg.bottleneck_channels) ** 0.5,
+            )
+        )
+
         # --- Mask head (back to encoder dim, sigmoid activation) ---
         self.mask_head = nn.Sequential(
             nn.PReLU(cfg.bottleneck_channels),
@@ -357,8 +377,11 @@ class SpeakerBeamSS(nn.Module):
         feat = self.pre_norm(enc_abs)
         feat = self.bottleneck(feat)                # [B, B, L]
 
-        # Multiplicative speaker fusion — broadcast embedding across T.
-        feat = feat * speaker_embedding.unsqueeze(-1)
+        # Multiplicative speaker fusion — broadcast embedding across T,
+        # with the per-channel learnable gain that compensates for the
+        # L2 normalization's small per-component magnitude.
+        scaled_emb = speaker_embedding * self.speaker_gain  # [B, B]
+        feat = feat * scaled_emb.unsqueeze(-1)
 
         # Separator stack.
         for block in self.blocks:
@@ -506,7 +529,8 @@ class SpeakerBeamSS(nn.Module):
         # ---- Bottleneck + speaker fusion ----
         feat = self.pre_norm(enc_abs)
         feat = self.bottleneck(feat)                     # [B, B, L_frames]
-        feat = feat * speaker_embedding.unsqueeze(-1)
+        scaled_emb = speaker_embedding * self.speaker_gain
+        feat = feat * scaled_emb.unsqueeze(-1)
 
         # ---- Separator stack (with per-block state) ----
         new_block_states = []
