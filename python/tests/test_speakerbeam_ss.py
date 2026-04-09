@@ -103,3 +103,26 @@ def test_speakerbeam_streaming_matches_forward() -> None:
                 f"chunk_size={chunk_size}: streaming / whole-utterance "
                 f"disagree by {diff:.2e}"
             )
+
+
+def test_speaker_proj_initializes_to_scaled_identity() -> None:
+    """Plan B invariant: at init, the speaker projection is sqrt(d) * I.
+
+    This makes the new architecture numerically identical to Fix A at
+    step 0, so any observed training divergence between the two is
+    purely due to the added channel-mixing expressivity during training.
+    """
+    torch.manual_seed(0)
+    cfg = _small_config()  # bottleneck_channels = 16
+    model = SpeakerBeamSS(cfg).eval()
+
+    d = cfg.bottleneck_channels
+    expected = (d ** 0.5) * torch.eye(d)
+    assert torch.allclose(
+        model.speaker_proj.weight, expected, atol=1e-6,
+    ), "speaker_proj.weight should be sqrt(d) * I at init"
+    assert model.speaker_proj.bias is None, \
+        "speaker_proj should be bias-free (bias=False in constructor)"
+    # Ensure `speaker_gain` has been removed.
+    assert not hasattr(model, "speaker_gain"), \
+        "speaker_gain must be replaced by speaker_proj"
