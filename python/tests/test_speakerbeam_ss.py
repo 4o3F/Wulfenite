@@ -105,24 +105,64 @@ def test_speakerbeam_streaming_matches_forward() -> None:
             )
 
 
-def test_speaker_proj_initializes_to_scaled_identity() -> None:
-    """Plan B invariant: at init, the speaker projection is sqrt(d) * I.
+def test_speaker_film_initializes_to_plan_b_point() -> None:
+    """Plan C2 invariant: at init, FiLM exactly reproduces Plan B's output.
 
-    This makes the new architecture numerically identical to Fix A at
-    step 0, so any observed training divergence between the two is
-    purely due to the added channel-mixing expressivity during training.
+    - speaker_gamma.weight == sqrt(d) * I  (Plan B's operator)
+    - speaker_beta.weight  == 0            (no additive effect)
+    - neither layer has bias (bias=False)
+    - old speaker_proj attribute is gone
     """
     torch.manual_seed(0)
     cfg = _small_config()  # bottleneck_channels = 16
     model = SpeakerBeamSS(cfg).eval()
 
     d = cfg.bottleneck_channels
-    expected = (d ** 0.5) * torch.eye(d)
+    expected_gamma = (d ** 0.5) * torch.eye(d)
+    expected_beta = torch.zeros(d, d)
+
     assert torch.allclose(
-        model.speaker_proj.weight, expected, atol=1e-6,
-    ), "speaker_proj.weight should be sqrt(d) * I at init"
-    assert model.speaker_proj.bias is None, \
-        "speaker_proj should be bias-free (bias=False in constructor)"
-    # Ensure `speaker_gain` has been removed.
-    assert not hasattr(model, "speaker_gain"), \
-        "speaker_gain must be replaced by speaker_proj"
+        model.speaker_gamma.weight, expected_gamma, atol=1e-6,
+    ), "speaker_gamma.weight should be sqrt(d) * I at init"
+    assert torch.allclose(
+        model.speaker_beta.weight, expected_beta, atol=1e-8,
+    ), "speaker_beta.weight should be zeros at init"
+
+    assert model.speaker_gamma.bias is None
+    assert model.speaker_beta.bias is None
+
+    # Plan B's speaker_proj should be gone.
+    assert not hasattr(model, "speaker_proj"), \
+        "speaker_proj must be replaced by speaker_gamma + speaker_beta"
+
+
+def test_speaker_film_helper_matches_plan_b_math_at_init() -> None:
+    """At init, _apply_speaker_conditioning must equal Plan B's math.
+
+    Plan B computed ``feat * sqrt(d) * e`` at init. Plan C2's FiLM
+    helper computes ``feat * gamma(e) + beta(e)``. With the prescribed
+    init, these are mathematically identical. This test catches any
+    broadcast / shape bug in the helper.
+    """
+    torch.manual_seed(0)
+    cfg = _small_config()
+    model = SpeakerBeamSS(cfg).eval()
+
+    d = cfg.bottleneck_channels
+    B, T = 2, 32
+    feat = torch.randn(B, d, T)
+    embedding = torch.nn.functional.normalize(
+        torch.randn(B, d), p=2, dim=-1,
+    )
+
+    with torch.no_grad():
+        actual = model._apply_speaker_conditioning(feat, embedding)
+        # Plan B reference: feat * sqrt(d) * embedding
+        scale = d ** 0.5
+        expected = feat * (scale * embedding).unsqueeze(-1)
+
+    diff = (actual - expected).abs().max().item()
+    assert diff < 1e-5, (
+        f"FiLM at init should reproduce Plan B's feat * sqrt(d) * e "
+        f"exactly; max abs diff = {diff:.2e}"
+    )
