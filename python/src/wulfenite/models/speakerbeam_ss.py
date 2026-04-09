@@ -280,25 +280,29 @@ class SpeakerBeamSS(nn.Module):
                 d_state=cfg.s4d_state_dim,
             ))
 
-        # --- Per-channel speaker-conditioning gain ---
-        # The frozen CAM++ encoder produces L2-normalized 192-d speaker
-        # embeddings, so each component has standard deviation
-        # ~1/sqrt(d) ≈ 0.072 at d=192. Multiplying that into the
-        # post-cLN bottleneck features (which have unit std) would
-        # crush the conditioned features by about 22 dB per channel,
-        # leaving the separator with almost no usable speaker signal.
+        # --- Learnable speaker-conditioning projection ---
+        # Fix A used a per-channel diagonal gain initialized to sqrt(d).
+        # That is equivalent to a *diagonal* linear transform, which cannot
+        # mix channels. Training plateaued at val_sdr ~ -4.7 because a
+        # diagonal scaling of a L2-normalized CAM++ embedding does not let
+        # the separator learn a useful rotation of the verification-trained
+        # speaker space into a separation-friendly subspace.
         #
-        # The fix is a per-channel learnable gain initialized to
-        # sqrt(bottleneck_channels), which makes the post-multiply
-        # features start out at unit std on average. Training is then
-        # free to adjust per-channel emphasis without having to learn
-        # the systemic 22 dB rescue first.
-        self.speaker_gain = nn.Parameter(
-            torch.full(
-                (cfg.bottleneck_channels,),
-                float(cfg.bottleneck_channels) ** 0.5,
-            )
+        # Plan B replaces the diagonal gain with a full Linear(d, d, bias=False)
+        # projection, initialized to sqrt(d) * I. At step 0 this is numerically
+        # identical to Fix A (so starting-point quality is preserved), but
+        # training is now free to learn any rotation and per-channel scaling
+        # of the speaker embedding, not only diagonal scaling.
+        self.speaker_proj = nn.Linear(
+            cfg.bottleneck_channels,
+            cfg.bottleneck_channels,
+            bias=False,
         )
+        with torch.no_grad():
+            scale = float(cfg.bottleneck_channels) ** 0.5
+            self.speaker_proj.weight.copy_(
+                scale * torch.eye(cfg.bottleneck_channels)
+            )
 
         # --- Mask head (back to encoder dim, sigmoid activation) ---
         self.mask_head = nn.Sequential(
@@ -317,6 +321,36 @@ class SpeakerBeamSS(nn.Module):
     # ------------------------------------------------------------------
     # Whole-sequence forward (training)
     # ------------------------------------------------------------------
+
+    def _apply_speaker_conditioning(
+        self,
+        feat: torch.Tensor,
+        speaker_embedding: torch.Tensor,
+    ) -> torch.Tensor:
+        """Multiplicative speaker fusion via the learnable Linear projection.
+
+        This helper is called from both ``forward`` and ``streaming_step``
+        so the two paths cannot drift.
+
+        Args:
+            feat: ``[B, bottleneck_channels, T]`` post-bottleneck features.
+            speaker_embedding: ``[B, bottleneck_channels]`` L2-normalized
+                CAM++ output (from ``encode_enrollment``).
+
+        Returns:
+            ``[B, bottleneck_channels, T]`` conditioned features.
+        """
+        if (
+            speaker_embedding.dim() != 2
+            or speaker_embedding.size(-1) != self.config.bottleneck_channels
+        ):
+            raise ValueError(
+                "speaker_embedding must be [B, "
+                f"{self.config.bottleneck_channels}], "
+                f"got {tuple(speaker_embedding.shape)}"
+            )
+        projected = self.speaker_proj(speaker_embedding)  # [B, d]
+        return feat * projected.unsqueeze(-1)             # [B, d, T]
 
     def forward(
         self,
@@ -377,11 +411,9 @@ class SpeakerBeamSS(nn.Module):
         feat = self.pre_norm(enc_abs)
         feat = self.bottleneck(feat)                # [B, B, L]
 
-        # Multiplicative speaker fusion — broadcast embedding across T,
-        # with the per-channel learnable gain that compensates for the
-        # L2 normalization's small per-component magnitude.
-        scaled_emb = speaker_embedding * self.speaker_gain  # [B, B]
-        feat = feat * scaled_emb.unsqueeze(-1)
+        # Multiplicative speaker fusion via the learnable Linear projection
+        # (shared with streaming_step through _apply_speaker_conditioning).
+        feat = self._apply_speaker_conditioning(feat, speaker_embedding)
 
         # Separator stack.
         for block in self.blocks:
@@ -529,8 +561,7 @@ class SpeakerBeamSS(nn.Module):
         # ---- Bottleneck + speaker fusion ----
         feat = self.pre_norm(enc_abs)
         feat = self.bottleneck(feat)                     # [B, B, L_frames]
-        scaled_emb = speaker_embedding * self.speaker_gain
-        feat = feat * scaled_emb.unsqueeze(-1)
+        feat = self._apply_speaker_conditioning(feat, speaker_embedding)
 
         # ---- Separator stack (with per-block state) ----
         new_block_states = []
