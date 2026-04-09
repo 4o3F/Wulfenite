@@ -31,6 +31,7 @@ from wulfenite.training.train import (
     build_dataset,
     build_loss,
     build_optimizer,
+    compute_enrollment_shuffle_sdr_drop,
     run_training,
     train_one_epoch,
     validate,
@@ -95,6 +96,22 @@ def _small_tse(device: torch.device | str = "cpu") -> WulfeniteTSE:
     return WulfeniteTSE(speaker_encoder=encoder, separator=separator).to(device)
 
 
+def _small_learnable_tse(
+    num_speakers: int,
+    device: torch.device | str = "cpu",
+) -> WulfeniteTSE:
+    separator_cfg = _small_separator_config()
+    return WulfeniteTSE.from_learnable_dvector(
+        num_speakers=num_speakers,
+        separator_config=separator_cfg,
+        dvector_kwargs={
+            "tdnn_channels": 64,
+            "stats_dim": 128,
+            "spec_augment": False,
+        },
+    ).to(device)
+
+
 def _small_loss() -> WulfeniteLoss:
     """Small MR-STFT so the test finishes quickly."""
     return WulfeniteLoss(
@@ -105,13 +122,17 @@ def _small_loss() -> WulfeniteLoss:
     )
 
 
-def _small_mixer(tmp_path: Path, samples: int = 8) -> WulfeniteMixer:
+def _small_mixer(
+    tmp_path: Path,
+    samples: int = 8,
+    target_present_prob: float = 0.75,
+) -> WulfeniteMixer:
     root = _build_aishell1_tree(tmp_path / "aishell1")
     speakers = scan_aishell1(root)
     cfg = MixerConfig(
         segment_seconds=1.0,
         enrollment_seconds=1.0,
-        target_present_prob=0.75,
+        target_present_prob=target_present_prob,
         # Disable reverb/noise to keep tests fast and deterministic enough
         apply_reverb=False,
         apply_noise=False,
@@ -133,6 +154,8 @@ def test_training_config_defaults() -> None:
     assert cfg.segment_seconds == 4.0
     assert cfg.enrollment_seconds == 4.0
     assert cfg.loss_sdr == 1.0
+    assert cfg.use_learnable_encoder is False
+    assert cfg.loss_speaker_cls == 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +322,50 @@ def test_run_training_one_epoch_writes_checkpoint(tmp_path: Path) -> None:
     assert "epoch 1" in log_text
 
 
+def test_run_training_one_epoch_learnable_encoder_writes_checkpoint(
+    tmp_path: Path,
+) -> None:
+    torch.manual_seed(30)
+    aishell_root = _build_aishell1_tree(
+        tmp_path / "aishell1", num_speakers=4, utts_per_speaker=3, seconds=2.0,
+    )
+
+    cfg = TrainingConfig(
+        aishell1_root=aishell_root,
+        aishell3_root=None,
+        noise_root=None,
+        campplus_checkpoint=None,
+        use_learnable_encoder=True,
+        segment_seconds=1.0,
+        enrollment_seconds=1.0,
+        batch_size=2,
+        epochs=1,
+        samples_per_epoch=4,
+        val_samples=4,
+        lr=1e-3,
+        warmup_ratio=0.1,
+        encoder_pretrain_epochs=1,
+        encoder_pretrain_lr=1e-3,
+        num_workers=0,
+        out_dir=tmp_path / "ckpts_learnable",
+        log_interval=1,
+        device="cpu",
+        seed=0,
+        noise_prob=0.0,
+        reverb_prob=0.0,
+    )
+
+    model = _small_learnable_tse(num_speakers=2)
+    run_training(cfg, model=model, show_progress=False)
+
+    assert (cfg.out_dir / "epoch001.pt").exists()
+    assert (cfg.out_dir / "best.pt").exists()
+    log_text = (cfg.out_dir / "train.log").read_text()
+    assert "[pretrain] epoch 1/1" in log_text
+    assert "top1=" in log_text
+    assert "shuffle_drop=" in log_text
+
+
 # ---------------------------------------------------------------------------
 # Validation helper alone
 # ---------------------------------------------------------------------------
@@ -321,3 +388,14 @@ def test_validate_runs(tmp_path: Path) -> None:
     val_loss, parts = validate(model, loader, criterion, device, show_progress=False)
     assert isinstance(val_loss, float)
     assert val_loss == val_loss  # not NaN
+
+
+def test_enrollment_shuffle_sdr_drop_present_mode(tmp_path: Path) -> None:
+    torch.manual_seed(31)
+    mixer = _small_mixer(tmp_path, samples=4, target_present_prob=1.0)
+    from wulfenite.data import collate_mixer_batch
+
+    batch = collate_mixer_batch([mixer[i] for i in range(2)])
+    model = _small_learnable_tse(num_speakers=len(mixer.speaker_ids))
+    drop = compute_enrollment_shuffle_sdr_drop(model, batch, torch.device("cpu"))
+    assert isinstance(drop, float)

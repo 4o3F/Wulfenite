@@ -39,16 +39,21 @@ class TrainingConfig:
     weight_decay: float = 1e-5
     warmup_ratio: float = 0.03
     grad_clip: float = 5.0
+    encoder_pretrain_epochs: int = 5
+    encoder_pretrain_lr: float = 3e-4
+    encoder_lr_scale: float = 0.25
 
     # --- Loss weights (matches LossWeights defaults) ---
     loss_sdr: float = 1.0
     loss_mr_stft: float = 1.0
     loss_absent: float = 1.0
     loss_presence: float = 0.1
+    loss_speaker_cls: float = 0.3
 
     # --- DataLoader ---
     num_workers: int = 8
     prefetch_factor: int = 4
+    val_speaker_ratio: float = 0.2
 
     # --- Output / logging ---
     out_dir: Path = field(default_factory=lambda: Path("./checkpoints"))
@@ -58,3 +63,4 @@ class TrainingConfig:
     # --- Runtime ---
     device: str = "cuda"
     seed: int = 1234
+    use_learnable_encoder: bool = False
