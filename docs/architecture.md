@@ -82,9 +82,22 @@ not compromise sub-50 ms per-frame latency — see
 
 ### Speaker embedding fusion — design decision
 
-The separator uses **multiplicative speaker adaptation** (SpeakerBeam's
-defining idea): the speaker embedding is element-wise multiplied with
-one of the separator's bottleneck feature tensors.
+The separator uses **FiLM speaker adaptation** (feature-wise linear
+modulation) on one of its bottleneck feature tensors. The L2-normalized
+CAM++ embedding `e` feeds two learnable `Linear(d, d, bias=False)`
+branches:
+
+```
+feat ← feat * gamma(e) + beta(e)
+```
+
+`gamma` is initialized to `sqrt(d) * I` and `beta` is initialized to
+zeros, so at step 0 this reduces to the original SpeakerBeam-style
+multiplicative adaptation (`feat * sqrt(d) * e`). During training the
+separator is free to learn a non-trivial rotation of the speaker space
+*and* an additive bias that the pure-multiplicative variant could not
+express — see `speakerbeam_ss.py::_apply_speaker_conditioning` for the
+implementation shared between `forward()` and `streaming_step()`.
 
 The SpeakerBeam-SS paper uses its own lightweight d-vector encoder with
 an internal dimension (B=256 in the paper). We instead use CAM++ (192-d)
@@ -101,8 +114,8 @@ directly with two deviations from the paper:
    emb = F.normalize(emb, p=2, dim=-1) # [B, 192], unit norm
    ```
    This is a **deterministic, parameter-free** operation. It pins
-   embedding magnitude so multiplicative fusion behaves consistently
-   across speakers. CAM++ is trained for speaker verification and
+   embedding magnitude so FiLM fusion (both the `gamma` and `beta`
+   branches) behaves consistently across speakers. CAM++ is trained for speaker verification and
    does not normalize by default, but unit-norm speaker embeddings
    are standard practice for TSE.
 
