@@ -276,15 +276,36 @@ def scan_aishell3(
 # ---------------------------------------------------------------------------
 
 
+_CNCELEB_DEFAULT_EXCLUDE_GENRES: tuple[str, ...] = ("singing",)
+"""Genres excluded by default from CN-Celeb scanning.
+
+CN-Celeb filenames encode the genre as the prefix before the first
+hyphen (e.g. ``singing-01-001.wav``). Singing is excluded because the
+vocal mode (pitch, breath, resonance) differs fundamentally from
+speech, which confuses the speaker encoder — it is not "noisy speech"
+but a different phonation mode entirely.
+
+Other in-the-wild genres (interview, entertainment, drama, etc.)
+contain background noise and overlapping speakers, but this acts as
+natural augmentation and trains the encoder toward robustness under
+real deployment conditions.
+"""
+
+
 def scan_cnceleb(
     root: Path | str,
     min_utts_per_speaker: int = 2,
+    exclude_genres: tuple[str, ...] = _CNCELEB_DEFAULT_EXCLUDE_GENRES,
 ) -> dict[str, list[AudioEntry]]:
-    """Scan CN-Celeb v2 and return ``{speaker_id: [entries]}``.
+    """Scan CN-Celeb and return ``{speaker_id: [entries]}``.
 
-    CN-Celeb is distributed at mixed sample rates. This scanner accepts
-    only 16 kHz mono wavs and rejects everything else with the same
-    diagnostics used by the AISHELL scanners.
+    CN-Celeb is distributed as FLAC at mixed sample rates. This scanner
+    accepts 16 kHz mono wav/flac files and rejects everything else with
+    the same diagnostics used by the AISHELL scanners.
+
+    Files whose name starts with any prefix in ``exclude_genres``
+    (matched case-insensitively against the part before the first ``-``)
+    are silently skipped. Default: ``("singing",)``.
     """
     root = Path(root)
     # Auto-detect common layouts:
@@ -308,6 +329,21 @@ def scan_cnceleb(
         base, dataset="cnceleb", diagnostics=diagnostics,
         extensions=("*.wav", "*.flac"),
     )
+
+    # Filter out excluded genres by filename prefix.
+    # CN-Celeb filenames: "{genre}-{segment}-{utt}.{ext}"
+    if exclude_genres:
+        lowered = tuple(g.lower() for g in exclude_genres)
+        before = len(entries)
+        entries = [
+            e for e in entries
+            if e.path.stem.split("-", 1)[0].lower() not in lowered
+        ]
+        n_excluded = before - len(entries)
+        if n_excluded > 0:
+            diagnostics["genre_excluded"] = n_excluded
+            diagnostics["excluded_genres"] = list(exclude_genres)
+
     if not entries:
         raise RuntimeError(_format_empty_scan_error(
             "CN-Celeb", [base], diagnostics,
