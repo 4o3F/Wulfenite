@@ -105,11 +105,15 @@ class WulfeniteTSE(nn.Module):
     @classmethod
     def from_learnable_dvector(
         cls,
-        num_speakers: int,
+        num_speakers: int | None,
         separator_config: SpeakerBeamSSConfig | None = None,
         dvector_kwargs: dict | None = None,
     ) -> "WulfeniteTSE":
-        """Build a TSE model with a learnable d-vector encoder."""
+        """Build a TSE model with a learnable d-vector encoder.
+
+        When ``num_speakers`` is ``None`` the encoder is built without
+        the auxiliary classifier head, which is useful for inference.
+        """
         separator = SpeakerBeamSS(separator_config)
         encoder = LearnableDVector(
             num_speakers=num_speakers,

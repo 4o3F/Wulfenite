@@ -7,11 +7,14 @@ clean output to a wav file.
 Usage:
 
     uv run --directory python python -m wulfenite.inference.whole \\
-        --checkpoint ./checkpoints/phase1/best.pt \\
-        --campplus-checkpoint ~/datasets/campplus/campplus_cn_common.bin \\
+        --checkpoint ./checkpoints/phase5b_cnceleb/best.pt \\
         --mixture ./samples/real_mixture.wav \\
         --enrollment ./samples/real_enrollment.wav \\
         --output ./output.wav
+
+For legacy frozen-CAM++ checkpoints also pass::
+
+    --campplus-checkpoint ~/datasets/campplus/campplus_cn_common.bin
 
 This is the quality-reference inference path. The streaming CLI in
 ``wulfenite.inference.streaming`` should produce numerically
@@ -31,8 +34,7 @@ from pathlib import Path
 import soundfile as sf
 import torch
 
-from ..models import WulfeniteTSE
-from ..training.checkpoint import load_checkpoint
+from .utils import build_model_from_checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -63,11 +65,12 @@ def _load_mono(path: Path) -> torch.Tensor:
 
 def run_whole(
     checkpoint: Path,
-    campplus_checkpoint: Path,
     mixture: Path,
     enrollment: Path,
     output: Path,
+    campplus_checkpoint: Path | None = None,
     device: str = "cpu",
+    use_learnable_encoder: bool | None = None,
 ) -> dict:
     """Run one whole-utterance inference and write the clean wav.
 
@@ -76,13 +79,12 @@ def run_whole(
     """
     dev = torch.device(device)
 
-    # Build the model with the correct CAM++ weights, then overlay the
-    # trained separator weights from the training checkpoint.
-    model = WulfeniteTSE.from_campplus_checkpoint(
-        campplus_checkpoint, device="cpu",
+    model, info = build_model_from_checkpoint(
+        checkpoint,
+        campplus_checkpoint=campplus_checkpoint,
+        use_learnable_encoder=use_learnable_encoder,
+        device=dev,
     )
-    info = load_checkpoint(checkpoint, model=model, map_location=dev)
-    model = model.to(dev).eval()
     print(
         f"[load] checkpoint {checkpoint} epoch={info.get('epoch')} "
         f"val_loss={info.get('metrics', {}).get('val_loss', '?')}"
@@ -130,8 +132,12 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True,
                         help="Trained Wulfenite training checkpoint (.pt)")
-    parser.add_argument("--campplus-checkpoint", type=Path, required=True,
-                        help="Frozen CAM++ zh-cn checkpoint (.bin)")
+    parser.add_argument("--campplus-checkpoint", type=Path, default=None,
+                        help="Frozen CAM++ zh-cn checkpoint (.bin). "
+                             "Required for legacy frozen-CAM++ checkpoints.")
+    parser.add_argument("--use-learnable-encoder", action="store_true", default=None,
+                        help="Force the learnable-encoder inference path. "
+                             "Normally auto-detected from the checkpoint config.")
     parser.add_argument("--mixture", type=Path, required=True)
     parser.add_argument("--enrollment", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -148,6 +154,7 @@ def main() -> None:
         enrollment=args.enrollment,
         output=args.output,
         device=args.device,
+        use_learnable_encoder=args.use_learnable_encoder,
     )
 
 

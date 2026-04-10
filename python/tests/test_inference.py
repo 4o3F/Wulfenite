@@ -17,6 +17,7 @@ from pathlib import Path
 
 import torch
 
+from wulfenite.inference.utils import build_model_from_checkpoint
 from wulfenite.models import (
     CAMPPlus,
     SpeakerBeamSS,
@@ -44,6 +45,10 @@ def _tiny_tse() -> WulfeniteTSE:
         p.requires_grad_(False)
     separator = SpeakerBeamSS(cfg)
     return WulfeniteTSE(speaker_encoder=encoder, separator=separator).eval()
+
+
+def _learnable_tse(num_speakers: int = 4) -> WulfeniteTSE:
+    return WulfeniteTSE.from_learnable_dvector(num_speakers=num_speakers).eval()
 
 
 def test_whole_vs_streaming_end_to_end() -> None:
@@ -103,6 +108,41 @@ def test_checkpoint_preserves_inference_output(tmp_path: Path) -> None:
 
     assert torch.allclose(before, after, atol=1e-6), (
         "inference output diverged after checkpoint round-trip"
+    )
+
+
+def test_build_model_from_checkpoint_learnable_path(tmp_path: Path) -> None:
+    """Learnable checkpoints should load without CAM++ via auto-detection."""
+    torch.manual_seed(3)
+    tse = _learnable_tse(num_speakers=4)
+    T = 4 * tse.separator.config.enc_stride
+    mixture = torch.randn(1, T)
+    enrollment = torch.randn(SR)
+
+    with torch.no_grad():
+        before = tse(mixture, enrollment)["clean"]
+
+    ckpt_path = tmp_path / "learnable.pt"
+    save_checkpoint(
+        ckpt_path,
+        model=tse,
+        config=TrainingConfig(use_learnable_encoder=True),
+    )
+
+    loaded, info = build_model_from_checkpoint(ckpt_path)
+    assert loaded.learnable_encoder is True
+    assert info["config"]["use_learnable_encoder"] is True
+    assert info["skipped_classifier_keys"]
+    assert all(
+        key.startswith("speaker_encoder.classifier.")
+        for key in info["skipped_classifier_keys"]
+    )
+
+    with torch.no_grad():
+        after = loaded(mixture, enrollment)["clean"]
+
+    assert torch.allclose(before, after, atol=1e-6), (
+        "learnable inference output diverged after checkpoint rebuild"
     )
 
 

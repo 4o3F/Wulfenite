@@ -15,12 +15,15 @@ control flow the Rust runtime will use. Serves two purposes:
 Usage:
 
     uv run --directory python python -m wulfenite.inference.streaming \\
-        --checkpoint ./checkpoints/phase1/best.pt \\
-        --campplus-checkpoint ~/datasets/campplus/campplus_cn_common.bin \\
+        --checkpoint ./checkpoints/phase5b_cnceleb/best.pt \\
         --mixture ./samples/real_mixture.wav \\
         --enrollment ./samples/real_enrollment.wav \\
         --output ./output_stream.wav \\
         --chunk-ms 20
+
+For legacy frozen-CAM++ checkpoints also pass::
+
+    --campplus-checkpoint ~/datasets/campplus/campplus_cn_common.bin
 """
 
 from __future__ import annotations
@@ -36,8 +39,7 @@ import soundfile as sf
 import torch
 from tqdm.auto import tqdm
 
-from ..models import WulfeniteTSE
-from ..training.checkpoint import load_checkpoint
+from .utils import build_model_from_checkpoint
 
 
 if platform.system() == "Windows":
@@ -60,12 +62,13 @@ def _load_mono(path: Path) -> torch.Tensor:
 
 def run_streaming(
     checkpoint: Path,
-    campplus_checkpoint: Path,
     mixture: Path,
     enrollment: Path,
     output: Path,
+    campplus_checkpoint: Path | None = None,
     chunk_ms: float = 20.0,
     device: str = "cpu",
+    use_learnable_encoder: bool | None = None,
 ) -> dict:
     """Run streaming inference and write the clean wav.
 
@@ -74,11 +77,12 @@ def run_streaming(
     """
     dev = torch.device(device)
 
-    model = WulfeniteTSE.from_campplus_checkpoint(
-        campplus_checkpoint, device="cpu",
+    model, info = build_model_from_checkpoint(
+        checkpoint,
+        campplus_checkpoint=campplus_checkpoint,
+        use_learnable_encoder=use_learnable_encoder,
+        device=dev,
     )
-    info = load_checkpoint(checkpoint, model=model, map_location=dev)
-    model = model.to(dev).eval()
     print(
         f"[load] checkpoint {checkpoint} epoch={info.get('epoch')}"
     )
@@ -194,7 +198,12 @@ def run_streaming(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--campplus-checkpoint", type=Path, required=True)
+    parser.add_argument("--campplus-checkpoint", type=Path, default=None,
+                        help="Frozen CAM++ zh-cn checkpoint (.bin). "
+                             "Required for legacy frozen-CAM++ checkpoints.")
+    parser.add_argument("--use-learnable-encoder", action="store_true", default=None,
+                        help="Force the learnable-encoder inference path. "
+                             "Normally auto-detected from the checkpoint config.")
     parser.add_argument("--mixture", type=Path, required=True)
     parser.add_argument("--enrollment", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -215,6 +224,7 @@ def main() -> None:
         output=args.output,
         chunk_ms=args.chunk_ms,
         device=args.device,
+        use_learnable_encoder=args.use_learnable_encoder,
     )
 
 

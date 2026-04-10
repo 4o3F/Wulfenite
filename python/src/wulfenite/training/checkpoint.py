@@ -100,6 +100,18 @@ def save_checkpoint(
     return path
 
 
+def peek_checkpoint_config(path: str | Path) -> dict[str, Any]:
+    """Read only the serialized config from a checkpoint.
+
+    This is used by inference to determine which model family should be
+    constructed before attempting a full ``load_state_dict``.
+    """
+    path = Path(path)
+    payload = torch.load(str(path), map_location="cpu", weights_only=False)
+    config = payload.get("config")
+    return config if isinstance(config, dict) else {}
+
+
 def load_checkpoint(
     path: str | Path,
     *,
