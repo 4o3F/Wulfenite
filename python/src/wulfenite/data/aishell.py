@@ -1,4 +1,4 @@
-"""AISHELL-1 and AISHELL-3 dataset scanners.
+"""AISHELL-1, AISHELL-3, and CN-Celeb dataset scanners.
 
 Both datasets ship as directory trees of 16 kHz mono wav files grouped
 by speaker. Layouts differ slightly:
@@ -258,6 +258,46 @@ def scan_aishell3(
                 "mono. Run `python -m wulfenite.scripts.resample_aishell3 "
                 "--root ../assets/aishell3` once to convert in place, then "
                 "re-run training. See docs/TRAIN.md section 2."
+            ),
+        ))
+    return _group_by_speaker(entries, min_utts_per_speaker)
+
+
+# ---------------------------------------------------------------------------
+# CN-Celeb
+# ---------------------------------------------------------------------------
+
+
+def scan_cnceleb(
+    root: Path | str,
+    min_utts_per_speaker: int = 2,
+) -> dict[str, list[AudioEntry]]:
+    """Scan CN-Celeb v2 and return ``{speaker_id: [entries]}``.
+
+    CN-Celeb is distributed at mixed sample rates. This scanner accepts
+    only 16 kHz mono wavs and rejects everything else with the same
+    diagnostics used by the AISHELL scanners.
+    """
+    root = Path(root)
+    if (root / "cn-celeb_v2").exists():
+        base = root / "cn-celeb_v2" / "data"
+    elif (root / "data").exists():
+        base = root / "data"
+    else:
+        raise RuntimeError(
+            f"CN-Celeb layout not found under {root}. "
+            "Expected cn-celeb_v2/data/{id00001,...}/ or data/{id00001,...}/"
+        )
+
+    diagnostics: dict = {}
+    entries = _scan_split(base, dataset="cnceleb", diagnostics=diagnostics)
+    if not entries:
+        raise RuntimeError(_format_empty_scan_error(
+            "CN-Celeb", [base], diagnostics,
+            extra_hint=(
+                "CN-Celeb ships with mixed sample rates; Wulfenite needs 16 kHz "
+                "mono. Run `python -m wulfenite.scripts.resample_cnceleb "
+                "--root ../assets/cn-celeb_v2` once, then re-run training."
             ),
         ))
     return _group_by_speaker(entries, min_utts_per_speaker)

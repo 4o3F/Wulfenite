@@ -44,6 +44,7 @@ from ..data import (
     merge_speaker_dicts,
     scan_aishell1,
     scan_aishell3,
+    scan_cnceleb,
     scan_noise_dir,
 )
 from ..losses import LossWeights, WulfeniteLoss, sdr_loss
@@ -91,10 +92,12 @@ def build_dataset(cfg: TrainingConfig) -> tuple[WulfeniteMixer, WulfeniteMixer]:
         speakers = scan_aishell1(cfg.aishell1_root)
     if cfg.aishell3_root is not None:
         speakers = merge_speaker_dicts(speakers, scan_aishell3(cfg.aishell3_root))
+    if cfg.cnceleb_root is not None:
+        speakers = merge_speaker_dicts(speakers, scan_cnceleb(cfg.cnceleb_root))
     if not speakers:
         raise RuntimeError(
             "Training requires at least one of --aishell1-root / "
-            "--aishell3-root to produce a non-empty speaker pool."
+            "--aishell3-root / --cnceleb-root to produce a non-empty speaker pool."
         )
 
     train_speakers, val_speakers = _split_speakers_for_val(
@@ -228,11 +231,11 @@ def build_joint_optimizer(
 def lambda_cls_schedule(
     epoch: int,
     total_epochs: int,
-    start: float = 0.3,
-    end: float = 0.1,
+    start: float = 0.2,
+    end: float = 0.2,
     decay_epochs: int = 25,
 ) -> float:
-    """Linearly decay the auxiliary speaker-classification weight."""
+    """Legacy helper for experiments with speaker-classification schedules."""
     if decay_epochs <= 0 or epoch >= decay_epochs:
         return end
     frac = epoch / decay_epochs
@@ -730,14 +733,6 @@ def run_training(
         dynamic_ncols=True,
     )
     for epoch in epoch_iter:
-        if model.learnable_encoder:
-            criterion.weights.speaker_cls = lambda_cls_schedule(
-                epoch - 1,
-                cfg.epochs,
-                start=cfg.loss_speaker_cls,
-                end=0.1,
-            )
-
         epoch_t0 = time.time()
         train_loss, global_step = train_one_epoch(
             model,
@@ -765,6 +760,7 @@ def run_training(
         metrics = {
             "train_loss": train_loss,
             "val_loss": val_loss,
+            "train_num_speakers": len(train_ds.speaker_ids),
             **{f"val_{k}": v for k, v in val_parts.items()},
         }
 
@@ -803,7 +799,6 @@ def run_training(
                 f"same_cos={same:.3f}",
                 f"diff_cos={diff:.3f}",
                 f"cos_gap={gap:.3f}",
-                f"lambda_cls={criterion.weights.speaker_cls:.3f}",
             ]
 
         log(
@@ -857,6 +852,7 @@ def _parse_args() -> TrainingConfig:
     # Data
     parser.add_argument("--aishell1-root", type=Path, default=None)
     parser.add_argument("--aishell3-root", type=Path, default=None)
+    parser.add_argument("--cnceleb-root", type=Path, default=None)
     parser.add_argument("--noise-root", type=Path, default=None)
     parser.add_argument("--campplus-checkpoint", type=Path, default=None)
     parser.add_argument("--use-learnable-encoder", action="store_true")
@@ -886,7 +882,7 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--loss-mr-stft", type=float, default=1.0)
     parser.add_argument("--loss-absent", type=float, default=1.0)
     parser.add_argument("--loss-presence", type=float, default=0.1)
-    parser.add_argument("--loss-speaker-cls", type=float, default=0.3)
+    parser.add_argument("--loss-speaker-cls", type=float, default=0.2)
     # DataLoader
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--prefetch-factor", type=int, default=4)
@@ -902,6 +898,7 @@ def _parse_args() -> TrainingConfig:
     return TrainingConfig(
         aishell1_root=args.aishell1_root,
         aishell3_root=args.aishell3_root,
+        cnceleb_root=args.cnceleb_root,
         noise_root=args.noise_root,
         campplus_checkpoint=args.campplus_checkpoint,
         segment_seconds=args.segment_seconds,

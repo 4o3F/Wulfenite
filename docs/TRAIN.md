@@ -179,6 +179,48 @@ uv run --directory python python -m wulfenite.scripts.resample_aishell3 \
 Use ``--dry-run`` to preview which files would be touched, or
 ``--num-workers N`` to control parallelism (default: cores − 1).
 
+### CN-Celeb v2 (optional speaker-count expansion)
+
+- **Source**: http://openslr.org/82/
+- **Size**: ~130 GB extracted
+- **Content**: ~1000 Chinese speakers across interview, reading,
+  singing, vlog, and other acoustic conditions
+- **Why**: materially increases train-speaker diversity for the
+  learnable d-vector path once AISHELL-only training stops improving
+
+Extract to `assets/cn-celeb_v2/` so you end up with
+`assets/cn-celeb_v2/data/id00001/*.wav`:
+
+```bash
+mkdir -p assets/cn-celeb_v2
+tar xzf cn-celeb_v2.tar.gz -C assets/
+```
+
+**Critical: resample to 16 kHz before training.** CN-Celeb v2 ships
+with mixed sample rates. Wulfenite rejects non-16 kHz files at scan
+time, so an un-resampled tree will silently lose most of the corpus.
+
+Bundled Python resampler:
+
+```bash
+uv run --directory python python -m wulfenite.scripts.resample_cnceleb \
+    --root ../assets/cn-celeb_v2
+```
+
+Or an ffmpeg one-liner from the repo root:
+
+```bash
+find assets/cn-celeb_v2/data -type f -name "*.wav" -print0 | \
+  xargs -0 -P "$(nproc)" -n 1 -I {} bash -c '
+    f="{}"
+    sr=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$f" 2>/dev/null)
+    if [ "$sr" != "16000" ]; then
+      tmp="${f%.wav}.16k.wav"
+      ffmpeg -y -loglevel error -i "$f" -ar 16000 -ac 1 -c:a pcm_s16le "$tmp" && mv "$tmp" "$f"
+    fi
+  '
+```
+
 ### MUSAN noise (~3.6 GB — recommended default)
 
 - **Source**: http://openslr.org/17/
@@ -235,6 +277,9 @@ Wulfenite/
 │   ├── aishell3/
 │   │   └── train/
 │   │       └── wav/SSB0005/SSB00050001.wav
+│   ├── cn-celeb_v2/
+│   │   └── data/
+│   │       └── id00001/example.wav
 │   ├── musan/
 │   │   └── noise/
 │   │       ├── free-sound/
@@ -321,8 +366,8 @@ reported before continuing.
 ## 7. Training
 
 The training loop lives at `python/src/wulfenite/training/train.py`
-and is invoked as a module. A minimal run with the canonical
-`assets/` paths:
+and is invoked as a module. A minimal frozen-CAM++ run with the
+canonical `assets/` paths:
 
 ```bash
 uv run --directory python python -m wulfenite.training.train \
@@ -335,6 +380,22 @@ uv run --directory python python -m wulfenite.training.train \
     --epochs 50 \
     --samples-per-epoch 20000 \
     --lr 1e-3
+```
+
+For the Plan C5/C5b learnable-encoder path, add `--use-learnable-encoder`
+and optionally merge CN-Celeb:
+
+```bash
+uv run --directory python python -m wulfenite.training.train \
+    --aishell1-root ../assets/aishell1 \
+    --aishell3-root ../assets/aishell3 \
+    --cnceleb-root ../assets/cn-celeb_v2 \
+    --noise-root ../assets/musan/noise \
+    --use-learnable-encoder \
+    --out-dir ../assets/checkpoints/phase5b_cnceleb \
+    --batch-size 16 \
+    --epochs 50 \
+    --loss-speaker-cls 0.2
 ```
 
 All paths are relative to the `python/` directory because
@@ -423,6 +484,18 @@ Two CLIs ship in `python/src/wulfenite/inference/`:
 
 ```bash
 uv run --directory python python -m wulfenite.inference.whole \
+    --checkpoint ../assets/checkpoints/phase5b_cnceleb/best.pt \
+    --mixture ../assets/samples/real_mixture.wav \
+    --enrollment ../assets/samples/real_enrollment.wav \
+    --output ../assets/samples/output_whole.wav
+```
+
+Learnable-encoder checkpoints auto-detect the encoder type from the
+saved checkpoint config and do **not** require `--campplus-checkpoint`.
+For legacy frozen-CAM++ checkpoints, keep passing the CAM++ `.bin`:
+
+```bash
+uv run --directory python python -m wulfenite.inference.whole \
     --checkpoint ../assets/checkpoints/phase1/best.pt \
     --campplus-checkpoint ../assets/campplus/campplus_cn_common.bin \
     --mixture ../assets/samples/real_mixture.wav \
@@ -438,12 +511,17 @@ measures real-time latency):
 
 ```bash
 uv run --directory python python -m wulfenite.inference.streaming \
-    --checkpoint ../assets/checkpoints/phase1/best.pt \
-    --campplus-checkpoint ../assets/campplus/campplus_cn_common.bin \
+    --checkpoint ../assets/checkpoints/phase5b_cnceleb/best.pt \
     --mixture ../assets/samples/real_mixture.wav \
     --enrollment ../assets/samples/real_enrollment.wav \
     --output ../assets/samples/output_stream.wav \
     --chunk-ms 20
+```
+
+Legacy frozen-CAM++ streaming inference still requires:
+
+```bash
+--campplus-checkpoint ../assets/campplus/campplus_cn_common.bin
 ```
 
 `--chunk-ms` must be a positive multiple of 10 ms (the encoder

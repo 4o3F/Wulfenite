@@ -27,6 +27,7 @@ from wulfenite.data import (
     merge_speaker_dicts,
     scan_aishell1,
     scan_aishell3,
+    scan_cnceleb,
     scan_noise_dir,
     synth_room_rir,
 )
@@ -47,6 +48,18 @@ def _write_sine_wav(path: Path, seconds: float, freq: float) -> None:
     t = np.arange(int(seconds * SR)) / SR
     audio = (0.3 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
     sf.write(str(path), audio, SR)
+
+
+def _write_sine_wav_at_sr(
+    path: Path,
+    seconds: float,
+    freq: float,
+    sample_rate: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    t = np.arange(int(seconds * sample_rate)) / sample_rate
+    audio = (0.3 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+    sf.write(str(path), audio, sample_rate)
 
 
 def _build_fake_aishell1(root: Path, num_speakers: int = 3,
@@ -76,6 +89,21 @@ def _build_fake_aishell3(root: Path, num_speakers: int = 3,
             freq = 300 + 60 * s + 7 * u
             _write_sine_wav(
                 split_dir / spk_id / f"{spk_id}{u:04d}.wav",
+                seconds, freq,
+            )
+    return root
+
+
+def _build_fake_cnceleb(root: Path, num_speakers: int = 3,
+                        utts_per_speaker: int = 4,
+                        seconds: float = 2.0) -> Path:
+    split_dir = root / "cn-celeb_v2" / "data"
+    for s in range(num_speakers):
+        spk_id = f"id{s + 1:05d}"
+        for u in range(utts_per_speaker):
+            freq = 350 + 40 * s + 3 * u
+            _write_sine_wav(
+                split_dir / spk_id / f"interview-{u + 1:02d}-{u + 1:03d}.wav",
                 seconds, freq,
             )
     return root
@@ -128,6 +156,29 @@ def test_scan_aishell3(tmp_path: Path) -> None:
     speakers = scan_aishell3(root)
     assert len(speakers) == 3
     assert all(k.startswith("SSB") for k in speakers.keys())
+
+
+def test_scan_cnceleb(tmp_path: Path) -> None:
+    root = _build_fake_cnceleb(tmp_path / "cnceleb")
+    speakers = scan_cnceleb(root)
+    assert len(speakers) == 3
+    assert all(k.startswith("id") for k in speakers.keys())
+    assert all(len(utts) == 4 for utts in speakers.values())
+    assert all(u.dataset == "cnceleb" for utts in speakers.values() for u in utts)
+
+
+def test_scan_cnceleb_reports_rejected_sample_rates(tmp_path: Path) -> None:
+    root = tmp_path / "cnceleb_bad"
+    wav = root / "cn-celeb_v2" / "data" / "id00001" / "bad.wav"
+    _write_sine_wav_at_sr(wav, seconds=1.0, freq=220.0, sample_rate=8000)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        scan_cnceleb(root)
+
+    msg = str(excinfo.value)
+    assert "CN-Celeb" in msg
+    assert "8000" in msg
+    assert "wrong sample rate" in msg
 
 
 def test_merge_speaker_dicts(tmp_path: Path) -> None:

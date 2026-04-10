@@ -18,6 +18,7 @@ class TrainingConfig:
     # --- Data paths ---
     aishell1_root: Path | None = None
     aishell3_root: Path | None = None
+    cnceleb_root: Path | None = None
     noise_root: Path | None = None
     campplus_checkpoint: Path | None = None
 
@@ -48,7 +49,7 @@ class TrainingConfig:
     loss_mr_stft: float = 1.0
     loss_absent: float = 1.0
     loss_presence: float = 0.1
-    loss_speaker_cls: float = 0.3
+    loss_speaker_cls: float = 0.2
 
     # --- DataLoader ---
     num_workers: int = 8
