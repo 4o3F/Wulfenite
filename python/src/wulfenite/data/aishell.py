@@ -74,7 +74,8 @@ class AudioEntry:
 
 def _scan_split(split_dir: Path, dataset: str,
                 speaker_from_dir: bool = True,
-                diagnostics: dict | None = None) -> list[AudioEntry]:
+                diagnostics: dict | None = None,
+                extensions: tuple[str, ...] = ("*.wav",)) -> list[AudioEntry]:
     """Walk a ``{split_dir}/{speaker_id}/*.wav`` tree and return entries.
 
     Files with unexpected sample rate or channel count are dropped so
@@ -83,7 +84,7 @@ def _scan_split(split_dir: Path, dataset: str,
     so the caller can build an informative error when the returned
     list is empty:
 
-    - ``seen``: total .wav files found
+    - ``seen``: total audio files found
     - ``wrong_sr``: dropped because sample rate != 16000
     - ``wrong_channels``: dropped because channels != 1
     - ``sample_rates``: set of the rejected sample rates, for hints
@@ -93,6 +94,10 @@ def _scan_split(split_dir: Path, dataset: str,
     **AISHELL-3 ships at 44.1 kHz** and must be resampled to 16 kHz
     mono before the scanner will accept it — see
     ``python/src/wulfenite/scripts/resample_aishell3.py``.
+
+    The ``extensions`` parameter controls which file globs are searched
+    (default ``("*.wav",)``). Pass ``("*.wav", "*.flac")`` for datasets
+    like CN-Celeb that ship in FLAC format.
     """
     entries: list[AudioEntry] = []
     if not split_dir.exists():
@@ -101,7 +106,10 @@ def _scan_split(split_dir: Path, dataset: str,
         if not spk_dir.is_dir():
             continue
         spk_id = spk_dir.name if speaker_from_dir else spk_dir.stem
-        for wav in sorted(spk_dir.glob("*.wav")):
+        audio_files: list[Path] = []
+        for ext in extensions:
+            audio_files.extend(spk_dir.glob(ext))
+        for wav in sorted(audio_files):
             if diagnostics is not None:
                 diagnostics["seen"] = diagnostics.get("seen", 0) + 1
             try:
@@ -279,25 +287,34 @@ def scan_cnceleb(
     diagnostics used by the AISHELL scanners.
     """
     root = Path(root)
-    if (root / "cn-celeb_v2").exists():
+    # Auto-detect common layouts:
+    #   CN-Celeb_flac/data/{id00001,...}/*.flac  (OpenSLR #82 default)
+    #   cn-celeb_v2/data/{id00001,...}/*.wav      (legacy / resampled)
+    #   data/{id00001,...}/*                       (bare extraction)
+    if (root / "CN-Celeb_flac").exists():
+        base = root / "CN-Celeb_flac" / "data"
+    elif (root / "cn-celeb_v2").exists():
         base = root / "cn-celeb_v2" / "data"
     elif (root / "data").exists():
         base = root / "data"
     else:
         raise RuntimeError(
             f"CN-Celeb layout not found under {root}. "
-            "Expected cn-celeb_v2/data/{id00001,...}/ or data/{id00001,...}/"
+            "Expected CN-Celeb_flac/data/{{id00001,...}}/ or data/{{id00001,...}}/"
         )
 
     diagnostics: dict = {}
-    entries = _scan_split(base, dataset="cnceleb", diagnostics=diagnostics)
+    entries = _scan_split(
+        base, dataset="cnceleb", diagnostics=diagnostics,
+        extensions=("*.wav", "*.flac"),
+    )
     if not entries:
         raise RuntimeError(_format_empty_scan_error(
             "CN-Celeb", [base], diagnostics,
             extra_hint=(
-                "CN-Celeb ships with mixed sample rates; Wulfenite needs 16 kHz "
-                "mono. Run `python -m wulfenite.scripts.resample_cnceleb "
-                "--root ../assets/cn-celeb_v2` once, then re-run training."
+                "CN-Celeb ships as FLAC at mixed sample rates; Wulfenite needs "
+                "16 kHz mono WAV. Run `python -m wulfenite.scripts.resample_cnceleb "
+                "--root ../assets/CN-Celeb_flac` once, then re-run training."
             ),
         ))
     return _group_by_speaker(entries, min_utts_per_speaker)

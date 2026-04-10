@@ -179,46 +179,39 @@ uv run --directory python python -m wulfenite.scripts.resample_aishell3 \
 Use ``--dry-run`` to preview which files would be touched, or
 ``--num-workers N`` to control parallelism (default: cores − 1).
 
-### CN-Celeb v2 (optional speaker-count expansion)
+### CN-Celeb (optional speaker-count expansion)
 
 - **Source**: http://openslr.org/82/
-- **Size**: ~130 GB extracted
+- **Format**: FLAC files (the archive extracts to `CN-Celeb_flac/`)
 - **Content**: ~1000 Chinese speakers across interview, reading,
   singing, vlog, and other acoustic conditions
 - **Why**: materially increases train-speaker diversity for the
   learnable d-vector path once AISHELL-only training stops improving
 
-Extract to `assets/cn-celeb_v2/` so you end up with
-`assets/cn-celeb_v2/data/id00001/*.wav`:
+Extract so you end up with `assets/CN-Celeb_flac/data/id00001/*.flac`:
 
 ```bash
-mkdir -p assets/cn-celeb_v2
 tar xzf cn-celeb_v2.tar.gz -C assets/
 ```
 
-**Critical: resample to 16 kHz before training.** CN-Celeb v2 ships
-with mixed sample rates. Wulfenite rejects non-16 kHz files at scan
-time, so an un-resampled tree will silently lose most of the corpus.
+**Critical: convert FLAC to 16 kHz mono WAV before training.**
+CN-Celeb ships as FLAC at mixed sample rates. Wulfenite rejects
+non-16 kHz files at scan time, so unconverted files will be skipped.
 
-Bundled Python resampler:
+Bundled Python converter (FLAC → 16 kHz WAV, written alongside
+the original FLAC files):
 
 ```bash
 uv run --directory python python -m wulfenite.scripts.resample_cnceleb \
-    --root ../assets/cn-celeb_v2
+    --root ../assets/CN-Celeb_flac
 ```
 
-Or an ffmpeg one-liner from the repo root:
+Or with GNU ``parallel`` + ffmpeg (converts FLAC to 16 kHz WAV and
+removes the original FLAC files):
 
 ```bash
-find assets/cn-celeb_v2/data -type f -name "*.wav" -print0 | \
-  xargs -0 -P "$(nproc)" -n 1 -I {} bash -c '
-    f="{}"
-    sr=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$f" 2>/dev/null)
-    if [ "$sr" != "16000" ]; then
-      tmp="${f%.wav}.16k.wav"
-      ffmpeg -y -loglevel error -i "$f" -ar 16000 -ac 1 -c:a pcm_s16le "$tmp" && mv "$tmp" "$f"
-    fi
-  '
+find assets/CN-Celeb_flac/data -type f -name '*.flac' | \
+  parallel ffmpeg -y -loglevel error -i {} -ar 16000 -ac 1 -c:a pcm_s16le {.}.wav '&&' rm {}
 ```
 
 ### MUSAN noise (~3.6 GB — recommended default)
@@ -277,7 +270,7 @@ Wulfenite/
 │   ├── aishell3/
 │   │   └── train/
 │   │       └── wav/SSB0005/SSB00050001.wav
-│   ├── cn-celeb_v2/
+│   ├── CN-Celeb_flac/
 │   │   └── data/
 │   │       └── id00001/example.wav
 │   ├── musan/
@@ -389,7 +382,7 @@ and optionally merge CN-Celeb:
 uv run --directory python python -m wulfenite.training.train \
     --aishell1-root ../assets/aishell1 \
     --aishell3-root ../assets/aishell3 \
-    --cnceleb-root ../assets/cn-celeb_v2 \
+    --cnceleb-root ../assets/CN-Celeb_flac \
     --noise-root ../assets/musan/noise \
     --use-learnable-encoder \
     --out-dir ../assets/checkpoints/phase5b_cnceleb \

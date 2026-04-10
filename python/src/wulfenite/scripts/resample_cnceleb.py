@@ -1,15 +1,17 @@
-"""Resample CN-Celeb v2 from mixed sample rates to 16 kHz mono in place.
+"""Convert CN-Celeb FLAC files to 16 kHz mono WAV in place.
 
-CN-Celeb v2 commonly ships with a mixture of 8 kHz, 16 kHz, and
-44.1 kHz wav files under ``cn-celeb_v2/data/<speaker_id>/*.wav``.
-Wulfenite training expects 16 kHz mono everywhere, so this script
-walks the tree, skips files that are already compliant, and rewrites
-the rest in place as 16-bit PCM.
+CN-Celeb (OpenSLR #82) ships as ``CN-Celeb_flac/data/<speaker_id>/*.flac``
+at mixed sample rates. Wulfenite training expects 16 kHz mono WAV, so this
+script walks the tree, converts each FLAC to a 16 kHz mono 16-bit PCM WAV
+(writing the .wav alongside the original .flac), and optionally deletes the
+original FLAC files afterwards.
+
+Already-compliant .wav files are skipped.
 
 Usage:
 
     uv run --directory python python -m wulfenite.scripts.resample_cnceleb \\
-        --root ../assets/cn-celeb_v2
+        --root ../assets/CN-Celeb_flac
 """
 
 from __future__ import annotations
@@ -29,28 +31,46 @@ TARGET_SR = 16000
 
 
 def _resolve_base(root: Path) -> Path:
+    if (root / "CN-Celeb_flac").exists():
+        return root / "CN-Celeb_flac" / "data"
     if (root / "cn-celeb_v2").exists():
         return root / "cn-celeb_v2" / "data"
     if (root / "data").exists():
         return root / "data"
     raise SystemExit(
-        f"CN-Celeb layout not found under {root}. Expected cn-celeb_v2/data/ "
+        f"CN-Celeb layout not found under {root}. Expected CN-Celeb_flac/data/ "
         "or data/."
     )
 
 
 def _scan_files(base: Path) -> list[Path]:
-    return sorted(base.rglob("*.wav"))
+    """Find all audio files (FLAC + WAV) under the data tree."""
+    files = sorted(base.rglob("*.flac"))
+    files.extend(sorted(base.rglob("*.wav")))
+    return files
 
 
 def _resample_one(job_path: str) -> tuple[str, str]:
     path = Path(job_path)
+    # Output is always .wav (convert FLAC → WAV)
+    out_path = path.with_suffix(".wav")
+
+    # If a .wav already exists and is compliant, skip
+    if out_path.exists() and out_path != path:
+        try:
+            info = sf.info(str(out_path))
+            if info.samplerate == TARGET_SR and info.channels == 1:
+                return (str(path), "skip")
+        except Exception:
+            pass  # re-process
+
     try:
         info = sf.info(str(path))
     except Exception as e:
         return (str(path), f"error:info:{e}")
 
-    if info.samplerate == TARGET_SR and info.channels == 1:
+    # If source is already a compliant wav, skip
+    if path.suffix == ".wav" and info.samplerate == TARGET_SR and info.channels == 1:
         return (str(path), "skip")
 
     try:
@@ -66,7 +86,7 @@ def _resample_one(job_path: str) -> tuple[str, str]:
         wav = AF.resample(wav, orig_freq=sr, new_freq=TARGET_SR)
 
     try:
-        sf.write(str(path), wav.squeeze(0).numpy(), TARGET_SR, subtype="PCM_16")
+        sf.write(str(out_path), wav.squeeze(0).numpy(), TARGET_SR, subtype="PCM_16")
     except Exception as e:
         return (str(path), f"error:write:{e}")
 
@@ -88,7 +108,7 @@ def main() -> None:
     files = _scan_files(base)
     if not files:
         raise SystemExit(
-            f"No .wav files found under {base}. Check --root points at CN-Celeb."
+            f"No audio files found under {base}. Check --root points at CN-Celeb."
         )
 
     needs_work = 0
