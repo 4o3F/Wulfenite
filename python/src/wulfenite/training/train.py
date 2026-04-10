@@ -2,8 +2,8 @@
 
 Ties together :mod:`wulfenite.data`, :mod:`wulfenite.models`, and
 :mod:`wulfenite.losses` into a standard PyTorch training loop with
-whole-utterance forward, AdamW + cosine+warmup LR schedule, gradient
-clipping, and epoch-level checkpointing.
+whole-utterance forward, Adam + ReduceLROnPlateau, gradient clipping,
+and epoch-level checkpointing.
 
 Call from the command line:
 
@@ -11,7 +11,6 @@ Call from the command line:
         --aishell1-root ~/datasets/aishell1 \\
         --aishell3-root ~/datasets/aishell3 \\
         --noise-root ~/datasets/musan/noise \\
-        --campplus-checkpoint ~/datasets/campplus/campplus_cn_common.bin \\
         --out-dir ./checkpoints/phase1
 
 Or from Python (used by tests):
@@ -25,7 +24,6 @@ Or from Python (used by tests):
 from __future__ import annotations
 
 import argparse
-import math
 import random
 import time
 from pathlib import Path
@@ -45,12 +43,20 @@ from ..data import (
     scan_aishell1,
     scan_aishell3,
     scan_cnceleb,
+    scan_magicdata,
     scan_noise_dir,
 )
-from ..losses import LossWeights, WulfeniteLoss, sdr_loss
+from ..losses import (
+    LossWeights,
+    WulfeniteLoss,
+    compute_sdr_db,
+    compute_sdri_db,
+)
 from ..models import WulfeniteTSE, compute_fbank_batch
 from .checkpoint import save_checkpoint
 from .config import TrainingConfig
+
+SchedulerT = torch.optim.lr_scheduler.ReduceLROnPlateau | None
 
 
 # ---------------------------------------------------------------------------
@@ -96,12 +102,18 @@ def build_dataset(cfg: TrainingConfig) -> tuple[WulfeniteMixer, WulfeniteMixer]:
         speakers = merge_speaker_dicts(
             speakers, scan_aishell3(cfg.aishell3_root, splits=("train", "test")),
         )
+    if cfg.magicdata_root is not None:
+        speakers = merge_speaker_dicts(
+            speakers,
+            scan_magicdata(cfg.magicdata_root, splits=("train", "dev", "test")),
+        )
     if cfg.cnceleb_root is not None:
         speakers = merge_speaker_dicts(speakers, scan_cnceleb(cfg.cnceleb_root))
     if not speakers:
         raise RuntimeError(
             "Training requires at least one of --aishell1-root / "
-            "--aishell3-root / --cnceleb-root to produce a non-empty speaker pool."
+            "--aishell3-root / --magicdata-root / --cnceleb-root to produce "
+            "a non-empty speaker pool."
         )
 
     train_speakers, val_speakers = _split_speakers_for_val(
@@ -146,23 +158,12 @@ def build_model(
     *,
     num_speakers: int | None = None,
 ) -> WulfeniteTSE:
-    """Build the TSE model for the selected encoder path."""
-    if cfg.use_learnable_encoder:
-        if num_speakers is None:
-            raise RuntimeError(
-                "num_speakers must be provided when using the learnable encoder."
-            )
-        return WulfeniteTSE.from_learnable_dvector(num_speakers=num_speakers)
-
-    if cfg.campplus_checkpoint is None:
+    """Build the TSE model with the trainable d-vector speaker encoder."""
+    if num_speakers is None:
         raise RuntimeError(
-            "TrainingConfig.campplus_checkpoint must be set for the frozen CAM++ "
-            "path; pass --campplus-checkpoint on the command line."
+            "num_speakers must be provided to build the training model."
         )
-    return WulfeniteTSE.from_campplus_checkpoint(
-        cfg.campplus_checkpoint,
-        device="cpu",
-    )
+    return WulfeniteTSE.from_learnable_dvector(num_speakers=num_speakers)
 
 
 def build_loss(cfg: TrainingConfig) -> WulfeniteLoss:
@@ -177,59 +178,36 @@ def build_loss(cfg: TrainingConfig) -> WulfeniteLoss:
     )
 
 
-def _build_scheduler(
-    optimizer: torch.optim.Optimizer,
-    cfg: TrainingConfig,
-    total_steps: int,
-) -> torch.optim.lr_scheduler.LRScheduler:
-    warmup_steps = max(1, int(cfg.warmup_ratio * total_steps))
-
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return (step + 1) / warmup_steps
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return 0.5 * (1.0 + math.cos(progress * math.pi))
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-
-
 def build_optimizer(
     model: torch.nn.Module,
     cfg: TrainingConfig,
-    total_steps: int,
-) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
-    """AdamW + cosine-with-warmup on all trainable parameters."""
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
-        trainable,
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
-    )
-    return optimizer, _build_scheduler(optimizer, cfg, total_steps)
-
-
-def build_joint_optimizer(
-    cfg: TrainingConfig,
-    model: WulfeniteTSE,
-    total_steps: int,
-) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
-    """AdamW + cosine-with-warmup with separate encoder/separator lrs."""
-    optimizer = torch.optim.AdamW(
+    total_steps: int | None = None,
+) -> tuple[torch.optim.Optimizer, SchedulerT]:
+    """Build the optimizer and optional LR scheduler."""
+    optimizer = torch.optim.Adam(
         [
             {
                 "params": [
                     p for p in model.speaker_encoder.parameters() if p.requires_grad
                 ],
-                "lr": cfg.lr * cfg.encoder_lr_scale,
+                "lr": cfg.learning_rate * cfg.encoder_lr_scale,
             },
             {
                 "params": [p for p in model.separator.parameters() if p.requires_grad],
-                "lr": cfg.lr,
+                "lr": cfg.learning_rate,
             },
         ],
         weight_decay=cfg.weight_decay,
     )
-    return optimizer, _build_scheduler(optimizer, cfg, total_steps)
+    scheduler: SchedulerT = None
+    if cfg.use_plateau_scheduler:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            patience=cfg.plateau_patience,
+            factor=cfg.plateau_factor,
+        )
+    return optimizer, scheduler
 
 
 def lambda_cls_schedule(
@@ -268,6 +246,36 @@ def _format_lr(optimizer: torch.optim.Optimizer) -> str:
 
 
 @torch.no_grad()
+def compute_val_sdri_present(
+    estimate: torch.Tensor,
+    target: torch.Tensor,
+    mixture: torch.Tensor,
+    target_present: torch.Tensor,
+) -> tuple[float, float, int]:
+    """Compute present-only SDR / SDRi sums for validation aggregation."""
+    present_mask = target_present.bool()
+    n_present = int(present_mask.sum().item())
+    if n_present == 0:
+        return 0.0, 0.0, 0
+    sdr_sum = float(
+        compute_sdr_db(
+            estimate[present_mask],
+            target[present_mask],
+            reduction="sum",
+        ).item()
+    )
+    sdri_sum = float(
+        compute_sdri_db(
+            estimate[present_mask],
+            target[present_mask],
+            mixture[present_mask],
+            reduction="sum",
+        ).item()
+    )
+    return sdr_sum, sdri_sum, n_present
+
+
+@torch.no_grad()
 def compute_speaker_top1_accuracy(
     model: WulfeniteTSE,
     loader: DataLoader,
@@ -276,9 +284,6 @@ def compute_speaker_top1_accuracy(
     max_batches: int | None = 8,
 ) -> float:
     """Compute top-1 speaker accuracy on a train-speaker probe set."""
-    if not model.learnable_encoder:
-        return 0.0
-
     model.eval()
     pin = device.type == "cuda"
     total = 0
@@ -288,7 +293,7 @@ def compute_speaker_top1_accuracy(
         fbank = compute_fbank_batch(batch["enrollment"])
         _, _, logits = model.speaker_encoder(fbank)
         if logits is None:
-            return 0.0
+            raise RuntimeError("Training diagnostics require a classifier head.")
         pred = logits.argmax(dim=-1)
         target = batch["target_speaker_idx"]
         correct += int((pred == target).sum().item())
@@ -307,9 +312,6 @@ def compute_same_diff_cosine_gap(
     max_batches: int | None = 8,
 ) -> tuple[float, float, float]:
     """Compute mean same-speaker / different-speaker cosine similarity."""
-    if not model.learnable_encoder:
-        return 0.0, 0.0, 0.0
-
     model.eval()
     pin = device.type == "cuda"
     embeddings: list[torch.Tensor] = []
@@ -349,9 +351,6 @@ def compute_enrollment_shuffle_sdr_drop(
     device: torch.device,
 ) -> float:
     """Measure how much SDR drops when enrollments are shuffled."""
-    if not model.learnable_encoder:
-        return 0.0
-
     model.eval()
     pin = device.type == "cuda"
     batch = _move_batch(batch, device, non_blocking=pin)
@@ -364,10 +363,11 @@ def compute_enrollment_shuffle_sdr_drop(
         return 0.0
 
     out_true = model(batch["mixture"], batch["enrollment"])
-    sdr_true = -float(
-        sdr_loss(
+    sdr_true = float(
+        compute_sdr_db(
             out_true["clean"][present_mask],
             batch["target"][present_mask],
+            reduction="mean",
         ).item()
     )
 
@@ -376,10 +376,11 @@ def compute_enrollment_shuffle_sdr_drop(
         perm = perm.roll(1)
 
     out_shuf = model(batch["mixture"], batch["enrollment"][perm])
-    sdr_shuf = -float(
-        sdr_loss(
+    sdr_shuf = float(
+        compute_sdr_db(
             out_shuf["clean"][present_mask],
             batch["target"][present_mask],
+            reduction="mean",
         ).item()
     )
     return sdr_true - sdr_shuf
@@ -390,7 +391,6 @@ def train_one_epoch(
     loader: DataLoader,
     criterion: WulfeniteLoss,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
     device: torch.device,
     cfg: TrainingConfig,
     epoch: int,
@@ -401,9 +401,6 @@ def train_one_epoch(
 ) -> tuple[float, int]:
     """Run one epoch of training. Returns ``(mean_loss, new_global_step)``."""
     model.train()
-    if not model.learnable_encoder:
-        # Frozen CAM++ stays in eval mode so BN statistics never drift.
-        model.speaker_encoder.eval()
 
     total_loss = 0.0
     n_batches = 0
@@ -439,7 +436,6 @@ def train_one_epoch(
                 max_norm=cfg.grad_clip,
             )
         optimizer.step()
-        scheduler.step()
 
         total_loss += parts.total
         n_batches += 1
@@ -449,12 +445,9 @@ def train_one_epoch(
             "loss": f"{parts.total:+.3f}",
             "sdr": f"{parts.sdr:+.2f}",
             "stft": f"{parts.mr_stft:.3f}",
+            "cls": f"{parts.speaker_cls:.3f}",
+            "lr_s": f"{optimizer.param_groups[-1]['lr']:.1e}",
         }
-        if model.learnable_encoder:
-            postfix["cls"] = f"{parts.speaker_cls:.3f}"
-            postfix["lr_s"] = f"{optimizer.param_groups[-1]['lr']:.1e}"
-        else:
-            postfix["lr"] = f"{optimizer.param_groups[0]['lr']:.1e}"
         pbar.set_postfix(refresh=False, **postfix)
 
         if global_step % cfg.log_interval == 0:
@@ -484,11 +477,14 @@ def validate(
     """Run one pass over the validation set. Returns ``(mean_loss, parts_mean)``."""
     model.eval()
     total = 0.0
-    sdr_sum = 0.0
+    sdr_loss_sum = 0.0
     stft_sum = 0.0
     absent_sum = 0.0
     presence_sum = 0.0
+    sdr_db_sum = 0.0
+    sdri_db_sum = 0.0
     n = 0
+    n_present = 0
     pin = device.type == "cuda"
 
     iterator = tqdm(
@@ -519,18 +515,31 @@ def validate(
             target_speaker_idx=None,
         )
         total += parts.total
-        sdr_sum += parts.sdr
+        sdr_loss_sum += parts.sdr
         stft_sum += parts.mr_stft
         absent_sum += parts.absent
         presence_sum += parts.presence
+        batch_sdr_db, batch_sdri_db, batch_n_present = compute_val_sdri_present(
+            outputs["clean"],
+            batch["target"],
+            batch["mixture"],
+            batch["target_present"],
+        )
+        sdr_db_sum += batch_sdr_db
+        sdri_db_sum += batch_sdri_db
+        n_present += batch_n_present
         n += 1
 
     n_safe = max(1, n)
+    n_present_safe = max(1, n_present)
     return total / n_safe, {
-        "sdr": sdr_sum / n_safe,
+        "sdr_loss": sdr_loss_sum / n_safe,
         "mr_stft": stft_sum / n_safe,
         "absent": absent_sum / n_safe,
         "presence": presence_sum / n_safe,
+        "sdr_db": sdr_db_sum / n_present_safe,
+        "sdri_db": sdri_db_sum / n_present_safe,
+        "n_present": float(n_present),
     }
 
 
@@ -546,13 +555,13 @@ def run_encoder_pretrain(
     show_progress: bool = True,
 ) -> None:
     """Phase A: pretrain only the speaker encoder + classifier."""
-    if not model.learnable_encoder or epochs <= 0:
+    if epochs <= 0:
         return
 
     for p in model.separator.parameters():
         p.requires_grad_(False)
 
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.Adam(
         [p for p in model.speaker_encoder.parameters() if p.requires_grad],
         lr=cfg.encoder_pretrain_lr,
         weight_decay=cfg.weight_decay,
@@ -664,9 +673,13 @@ def run_training(
             cfg,
             num_speakers=len(train_ds.speaker_ids),
         )
-    elif cfg.use_learnable_encoder != model.learnable_encoder:
+    elif model.speaker_encoder.classifier is None:
         raise ValueError(
-            "cfg.use_learnable_encoder must match the provided model's encoder path."
+            "Training requires a d-vector encoder with a classifier head."
+        )
+    elif model.speaker_encoder.classifier.out_features != len(train_ds.speaker_ids):
+        raise ValueError(
+            "Provided model classifier size must match the training speaker set."
         )
     model = model.to(device)
 
@@ -690,44 +703,39 @@ def run_training(
         f"train_speakers={len(train_ds.speaker_ids)} val_speakers={len(val_ds.speaker_ids)}"
     )
 
-    probe_loader: DataLoader | None = None
-    if model.learnable_encoder:
-        probe_ds = WulfeniteMixer(
-            speakers=train_ds.speakers,
-            noise_pool=train_ds.noise_pool,
-            config=train_ds.cfg,
-            samples_per_epoch=max(cfg.val_samples, cfg.batch_size * 4),
-            seed=cfg.seed + 17,
-        )
-        probe_loader = DataLoader(
-            probe_ds,
-            batch_size=cfg.batch_size,
-            shuffle=False,
-            num_workers=max(0, cfg.num_workers // 2),
-            collate_fn=collate_mixer_batch,
-            persistent_workers=cfg.num_workers > 1,
-            prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 1 else None,
-            pin_memory=pin_memory,
-            drop_last=False,
-        )
-        run_encoder_pretrain(
-            cfg,
-            model,
-            train_loader,
-            probe_loader,
-            device,
-            cfg.encoder_pretrain_epochs,
-            log,
-            show_progress=show_progress,
-        )
+    probe_ds = WulfeniteMixer(
+        speakers=train_ds.speakers,
+        noise_pool=train_ds.noise_pool,
+        config=train_ds.cfg,
+        samples_per_epoch=max(cfg.val_samples, cfg.batch_size * 4),
+        seed=cfg.seed + 17,
+    )
+    probe_loader = DataLoader(
+        probe_ds,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=max(0, cfg.num_workers // 2),
+        collate_fn=collate_mixer_batch,
+        persistent_workers=cfg.num_workers > 1,
+        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 1 else None,
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+    run_encoder_pretrain(
+        cfg,
+        model,
+        train_loader,
+        probe_loader,
+        device,
+        cfg.encoder_pretrain_epochs,
+        log,
+        show_progress=show_progress,
+    )
 
-    total_steps = cfg.epochs * len(train_loader)
-    if model.learnable_encoder:
-        optimizer, scheduler = build_joint_optimizer(cfg, model, total_steps)
-    else:
-        optimizer, scheduler = build_optimizer(model, cfg, total_steps)
+    optimizer, scheduler = build_optimizer(model, cfg)
 
-    best_val = float("inf")
+    best_sdri = float("-inf")
+    epochs_without_improvement = 0
     global_step = 0
     epoch_iter = tqdm(
         range(1, cfg.epochs + 1),
@@ -743,7 +751,6 @@ def run_training(
             train_loader,
             criterion,
             optimizer,
-            scheduler,
             device,
             cfg,
             epoch,
@@ -760,6 +767,8 @@ def run_training(
             device,
             show_progress=show_progress,
         )
+        if scheduler is not None:
+            scheduler.step(val_parts["sdri_db"])
 
         metrics = {
             "train_loss": train_loss,
@@ -768,46 +777,46 @@ def run_training(
             **{f"val_{k}": v for k, v in val_parts.items()},
         }
 
-        diag_parts: list[str] = []
-        if model.learnable_encoder and probe_loader is not None:
-            top1 = compute_speaker_top1_accuracy(
-                model, probe_loader, device, max_batches=None
-            )
-            same, diff, gap = compute_same_diff_cosine_gap(
-                model, val_loader, device, max_batches=None
-            )
-            shuffle_batch = None
-            for candidate in val_loader:
-                if bool(candidate["target_present"].bool().any()):
-                    shuffle_batch = candidate
-                    break
-            if shuffle_batch is None:
-                shuffle_batch = next(iter(val_loader))
-            shuffle_drop = compute_enrollment_shuffle_sdr_drop(
-                model,
-                shuffle_batch,
-                device,
-            )
-            metrics.update(
-                {
-                    "speaker_top1": top1,
-                    "shuffle_sdr_drop": shuffle_drop,
-                    "same_cosine": same,
-                    "diff_cosine": diff,
-                    "cosine_gap": gap,
-                }
-            )
-            diag_parts = [
-                f"top1={top1:.3f}",
-                f"shuffle_drop={shuffle_drop:.3f}",
-                f"same_cos={same:.3f}",
-                f"diff_cos={diff:.3f}",
-                f"cos_gap={gap:.3f}",
-            ]
+        top1 = compute_speaker_top1_accuracy(
+            model, probe_loader, device, max_batches=None
+        )
+        same, diff, gap = compute_same_diff_cosine_gap(
+            model, val_loader, device, max_batches=None
+        )
+        shuffle_batch = None
+        for candidate in val_loader:
+            if bool(candidate["target_present"].bool().any()):
+                shuffle_batch = candidate
+                break
+        if shuffle_batch is None:
+            shuffle_batch = next(iter(val_loader))
+        shuffle_drop = compute_enrollment_shuffle_sdr_drop(
+            model,
+            shuffle_batch,
+            device,
+        )
+        metrics.update(
+            {
+                "speaker_top1": top1,
+                "shuffle_sdr_drop": shuffle_drop,
+                "same_cosine": same,
+                "diff_cosine": diff,
+                "cosine_gap": gap,
+            }
+        )
+        diag_parts = [
+            f"top1={top1:.3f}",
+            f"shuffle_drop={shuffle_drop:.3f}",
+            f"same_cos={same:.3f}",
+            f"diff_cos={diff:.3f}",
+            f"cos_gap={gap:.3f}",
+        ]
 
         log(
             f"epoch {epoch} train_loss={train_loss:+.4f} val_loss={val_loss:+.4f} "
-            f"val_sdr={val_parts['sdr']:+.3f} val_stft={val_parts['mr_stft']:.4f} "
+            f"val_sdr_db={val_parts['sdr_db']:+.3f} "
+            f"val_sdri_db={val_parts['sdri_db']:+.3f} "
+            f"val_stft={val_parts['mr_stft']:.4f} "
             f"val_absent={val_parts['absent']:.4f} time={train_time:.1f}s "
             + (" ".join(diag_parts) if diag_parts else "")
         )
@@ -823,8 +832,9 @@ def run_training(
                 config=cfg,
                 metrics=metrics,
             )
-        if val_loss < best_val:
-            best_val = val_loss
+        if val_parts["sdri_db"] > best_sdri:
+            best_sdri = val_parts["sdri_db"]
+            epochs_without_improvement = 0
             save_checkpoint(
                 out_dir / "best.pt",
                 model=model,
@@ -835,14 +845,23 @@ def run_training(
                 config=cfg,
                 metrics=metrics,
             )
-            log(f"[best] val_loss improved to {best_val:+.4f} -> saved best.pt")
+            log(f"[best] val_sdri_db improved to {best_sdri:+.4f} -> saved best.pt")
+        else:
+            epochs_without_improvement += 1
 
         epoch_iter.set_postfix(
             train=f"{train_loss:+.3f}",
-            val=f"{val_loss:+.3f}",
-            best=f"{best_val:+.3f}",
+            sdri=f"{val_parts['sdri_db']:+.3f}",
+            best=f"{best_sdri:+.3f}",
             refresh=False,
         )
+        if epochs_without_improvement >= cfg.early_stopping_patience:
+            log(
+                "[early-stop] "
+                f"no val_sdri_db improvement for {epochs_without_improvement} epochs "
+                f"(best={best_sdri:+.4f}); stopping at epoch {epoch}"
+            )
+            break
     epoch_iter.close()
 
 
@@ -856,10 +875,9 @@ def _parse_args() -> TrainingConfig:
     # Data
     parser.add_argument("--aishell1-root", type=Path, default=None)
     parser.add_argument("--aishell3-root", type=Path, default=None)
+    parser.add_argument("--magicdata-root", type=Path, default=None)
     parser.add_argument("--cnceleb-root", type=Path, default=None)
     parser.add_argument("--noise-root", type=Path, default=None)
-    parser.add_argument("--campplus-checkpoint", type=Path, default=None)
-    parser.add_argument("--use-learnable-encoder", action="store_true")
     # Mixer
     parser.add_argument("--segment-seconds", type=float, default=4.0)
     parser.add_argument("--enrollment-seconds", type=float, default=4.0)
@@ -871,12 +889,14 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--val-speaker-ratio", type=float, default=0.2)
     # Optimizer
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--samples-per-epoch", type=int, default=20000)
     parser.add_argument("--val-samples", type=int, default=500)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-5)
-    parser.add_argument("--warmup-ratio", type=float, default=0.03)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--plateau-patience", type=int, default=5)
+    parser.add_argument("--plateau-factor", type=float, default=0.5)
+    parser.add_argument("--early-stopping-patience", type=int, default=20)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--encoder-pretrain-epochs", type=int, default=5)
     parser.add_argument("--encoder-pretrain-lr", type=float, default=3e-4)
@@ -902,9 +922,9 @@ def _parse_args() -> TrainingConfig:
     return TrainingConfig(
         aishell1_root=args.aishell1_root,
         aishell3_root=args.aishell3_root,
+        magicdata_root=args.magicdata_root,
         cnceleb_root=args.cnceleb_root,
         noise_root=args.noise_root,
-        campplus_checkpoint=args.campplus_checkpoint,
         segment_seconds=args.segment_seconds,
         enrollment_seconds=args.enrollment_seconds,
         snr_range_db=tuple(args.snr_range_db),
@@ -916,9 +936,12 @@ def _parse_args() -> TrainingConfig:
         epochs=args.epochs,
         samples_per_epoch=args.samples_per_epoch,
         val_samples=args.val_samples,
-        lr=args.lr,
+        learning_rate=args.lr,
         weight_decay=args.weight_decay,
-        warmup_ratio=args.warmup_ratio,
+        use_plateau_scheduler=True,
+        plateau_patience=args.plateau_patience,
+        plateau_factor=args.plateau_factor,
+        early_stopping_patience=args.early_stopping_patience,
         grad_clip=args.grad_clip,
         encoder_pretrain_epochs=args.encoder_pretrain_epochs,
         encoder_pretrain_lr=args.encoder_pretrain_lr,
@@ -936,7 +959,6 @@ def _parse_args() -> TrainingConfig:
         save_every_epoch=not args.no_save_every_epoch,
         device=args.device,
         seed=args.seed,
-        use_learnable_encoder=args.use_learnable_encoder,
     )
 
 

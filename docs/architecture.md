@@ -1,7 +1,7 @@
 # Wulfenite — Architecture
 
 This document records the frozen design decisions for the main branch
-(post v1 reset). The v1 branch preserves the earlier BSRNN+CAM++ work;
+(post v1 reset). The v1 branch preserves the earlier BSRNN pipeline;
 main starts from this architecture.
 
 ## 1. Goal
@@ -52,39 +52,44 @@ Delcroix — NTT, Interspeech 2024).
 
 - **Backbone**: Conv-TasNet-style time-domain encoder → separator
   stack → decoder.
-- **Separator stack**: 2 repetitions of convolutional blocks with
-  **S4D state-space modules** inserted for long-range context. S4D
-  replaces the traditional stacked dilated conv context accumulation,
-  reducing compute while preserving effective receptive field.
+- **Paper-faithful defaults**: encoder channels `N = 4096`,
+  bottleneck `B = 256`, hidden `H = 512`, S4D state `D = 32`.
+- **Separator stack**: `2 × (TCN(d=1), TCN(d=2), TCN(d=4), S4D, TCN(d=8))`.
+  The S4D block uses channel-wise LayerNorm, the S4D core, then an
+  `Linear(B, H) -> activation -> Linear(H, B)` sublayer before the
+  residual add.
 - **Frontend**: learned 1-D conv encoder, kernel size 320, hop 160
   (20 ms at 16 kHz). Over-parameterized relative to the 2 ms kernel
   of the original TD-SpeakerBeam to compensate for the larger stride.
-- **Parameter count**: ~7.9 M (smaller than v1's BSRNN).
+- **Parameter count**: ~7.57 M for the current separator implementation.
+  The paper reports ~7.93 M for its reference configuration; the
+  remaining delta is now isolated to the exact block-level accounting,
+  not the gross topology or channel widths.
 - **Causality**: **causal by default.** Global LayerNorm replaced by
   channel-wise LayerNorm; convolutions are strictly causal. S4D has a
   recurrent form that supports stateful inference across frames.
 
-**Speaker encoder**: CAM++ zh-cn (`iic/speech_campplus_sv_zh-cn_16k-common`
-from ModelScope, trained on ~200k Chinese speakers). 192-dim embedding,
-80-dim FBank input. **Frozen** throughout training.
+**Speaker encoders**:
 
-**Crucially, CAM++ runs exactly ONCE per session**, not per frame. TSE's
-core assumption is that the target speaker is fixed for the duration of
-a session (one streamer per broadcast, one caller per phone call, one
-gamer per match). The enrollment is processed once at session startup,
-the resulting 192-d embedding is cached, and every subsequent frame of
-the real-time separator is conditioned on that same cached embedding.
-CAM++'s ~7 M parameters and compute cost land in the *setup* budget
-(one-time ~50–200 ms), not the *steady-state* per-frame budget. This is
-the key architectural reason a heavyweight Chinese speaker encoder does
-not compromise sub-50 ms per-frame latency — see
+- **Single path**: a small x-vector-style d-vector encoder whose
+  normalized embedding is native 256-d and is trained jointly with the
+  separator.
+
+The speaker encoder still runs exactly ONCE per session, not per frame.
+TSE's core assumption is that the target speaker is fixed for the
+duration of a session (one streamer per broadcast, one caller per phone
+call, one gamer per match). The enrollment is processed once at session
+startup, the resulting speaker embedding is cached, and every
+subsequent frame of the real-time separator is conditioned on that same
+cached embedding. This keeps the encoder in the setup budget rather than
+the steady-state per-frame budget — see
 `docs/onnx_contract.md` for the concrete two-file split.
 
 ### Speaker embedding fusion — design decision
 
 The separator uses **FiLM speaker adaptation** (feature-wise linear
 modulation) on one of its bottleneck feature tensors. The L2-normalized
-CAM++ embedding `e` feeds two learnable `Linear(d, d, bias=False)`
+speaker embedding `e` feeds two learnable `Linear(d, d, bias=False)`
 branches:
 
 ```
@@ -99,25 +104,16 @@ separator is free to learn a non-trivial rotation of the speaker space
 express — see `speakerbeam_ss.py::_apply_speaker_conditioning` for the
 implementation shared between `forward()` and `streaming_step()`.
 
-The SpeakerBeam-SS paper uses its own lightweight d-vector encoder with
-an internal dimension (B=256 in the paper). We instead use CAM++ (192-d)
-directly with two deviations from the paper:
+The separator stays faithful to the paper's internal `B = 256`, and the
+speaker encoder emits embeddings directly in that space:
 
-1. **Separator bottleneck `B = 192`** (match CAM++ output).
-   No projection layer. The whole separator is native 192-d. This
-   eliminates the "fuse layer learns to translate between encoder and
-   separator spaces" attractor that crippled v1 Phase 0a.
+```python
+emb = dvector(enrollment)             # [B, 256]
+emb = F.normalize(emb, p=2, dim=-1)   # [B, 256]
+```
 
-2. **CAM++ output is L2-normalized** before fusion:
-   ```python
-   emb = campplus(enrollment)          # [B, 192], norm ~12-15
-   emb = F.normalize(emb, p=2, dim=-1) # [B, 192], unit norm
-   ```
-   This is a **deterministic, parameter-free** operation. It pins
-   embedding magnitude so FiLM fusion (both the `gamma` and `beta`
-   branches) behaves consistently across speakers. CAM++ is trained for speaker verification and
-   does not normalize by default, but unit-norm speaker embeddings
-   are standard practice for TSE.
+No adapter projection is required between enrollment encoding and
+separator conditioning.
 
 ## 4. Latency target: 40 ms
 
@@ -201,8 +197,8 @@ interface so Rust-side code can use it for optional VAD-style gating.
 
 - **AISHELL-1** (178 h, 400 spk) — primary clean Chinese speech
 - **AISHELL-3** (~85 h, 218 spk) — additional speaker diversity
-- **DNS4 noise** (from DNS Challenge 4, ~80 GB) — broadband noise for
-  mixture-aware robustness
+- **MAGICDATA** (~755 h, 1080 spk) — large clean Mandarin speaker expansion
+- **MUSAN noise** (~3.6 GB subset) — additive non-speech noise augmentation
 
 On-the-fly 2-speaker mixer produces training samples:
 
@@ -212,8 +208,9 @@ On-the-fly 2-speaker mixer produces training samples:
 - Additive DNS4 noise at 10-25 dB SNR on the final mixture
 - Optional room reverb (synthetic RIRs, RT60 0.08-0.25 s)
 
-CN-Celeb and WenetSpeech are deferred to a later phase if AISHELL +
-DNS4 is insufficient. Start small, measure, scale only if needed.
+CN-Celeb and WenetSpeech remain optional later expansions if AISHELL +
+MAGICDATA is still insufficient. Start with the clean three-corpus pool,
+measure, then scale only if needed.
 
 ## 7. Training → deployment boundary
 
@@ -223,9 +220,8 @@ coupling.
 
 Two separate ONNX files:
 
-1. `cam_plus_chinese.onnx` — frozen speaker encoder, exported once
-   from the ModelScope CAM++ weights. Never retrained on main; if the
-   encoder ever needs updating it's a separate workstream.
+1. `wulfenite_speaker_encoder.onnx` — the trained d-vector speaker
+   encoder, exported in eval mode for once-per-session enrollment.
 2. `wulfenite_tse.onnx` — the trained SpeakerBeam-SS separator, with
    explicit state tensors for frame-by-frame stateful inference.
 

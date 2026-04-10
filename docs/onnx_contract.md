@@ -17,7 +17,7 @@ The model is split into **two ONNX files** with distinct lifecycles:
 
 | File | Purpose | Lifecycle |
 |---|---|---|
-| `cam_plus_chinese.onnx` | Speaker encoder — runs once per session | Exported once from frozen ModelScope weights |
+| `wulfenite_speaker_encoder.onnx` | Speaker encoder — runs once per session | Exported in eval mode from the trained checkpoint |
 | `wulfenite_tse.onnx` | Target speaker extractor — runs every audio frame | Exported after each training run |
 
 Both files target **ONNX opset 17** (the minimum opset that supports
@@ -28,17 +28,17 @@ Expected on disk (under `rust/assets/` or similar at deploy time):
 
 ```
 <deployment>/
-├── cam_plus_chinese.onnx     # ≈ 30 MB
+├── wulfenite_speaker_encoder.onnx
 └── wulfenite_tse.onnx        # ≈ 8 MB
 ```
 
 ---
 
-## File 1: `cam_plus_chinese.onnx`
+## File 1: `wulfenite_speaker_encoder.onnx`
 
-The frozen Chinese CAM++ speaker encoder. This file contains both the
-FBank extraction and the CAM++ network; the Rust side sees raw audio
-in and a speaker embedding out.
+The trained d-vector speaker encoder. This file contains both the
+FBank extraction and the speaker encoder network; the Rust side sees
+raw audio in and a speaker embedding out.
 
 ### Inputs
 
@@ -50,25 +50,24 @@ in and a speaker embedding out.
 
 | Name | dtype | Shape | Description |
 |---|---|---|---|
-| `speaker_embedding` | float32 | `[1, 192]` | **Already L2-normalized**. Pass this verbatim to `wulfenite_tse.onnx` without further processing. |
+| `speaker_embedding` | float32 | `[1, 256]` | Already L2-normalized separator-space speaker embedding. Feed it directly into `wulfenite_tse.onnx`. |
 
 ### Semantics
 
 - Runs once per session at startup (or whenever the user swaps enrollment).
 - Output is deterministic for a given enrollment waveform; no state.
 - The embedded FBank extraction uses 80 mel bins, 25 ms window, 10 ms hop,
-  dither = 0, utterance-level mean normalization — matches the 3D-Speaker
-  reference implementation.
+  dither = 0, utterance-level mean normalization — matches the training path.
 
 ### Internal structure (not part of the contract, but documented for debugging)
 
 ```
 enrollment_audio
   ↓ Kaldi FBank (n_mels=80, dither=0, utt mean norm)
-  ↓ CAMPPlus.forward  (FCM → TDNN → 3× CAMDenseTDNNBlock → StatsPool → DenseLayer)
-  ↓ embedding [1, 192]
+  ↓ LearnableDVector.forward
+  ↓ raw_embedding [1, 256]
   ↓ L2 normalize (torch.nn.functional.normalize(..., p=2, dim=-1))
-  ↓ speaker_embedding [1, 192]
+  ↓ speaker_embedding [1, 256]
 ```
 
 ---
@@ -94,7 +93,7 @@ is pure.
 | Name | dtype | Shape | Description |
 |---|---|---|---|
 | `mixture_chunk` | float32 | `[1, 320]` | The **latest** 20 ms of microphone audio, 16 kHz mono, amplitude `[-1, 1]`. Never shorter, never longer. If the caller has no more audio, pad with zeros to 320 samples and run a final call to flush. |
-| `speaker_embedding` | float32 | `[1, 192]` | From `cam_plus_chinese.onnx`. The caller keeps this constant for the entire session. |
+| `speaker_embedding` | float32 | `[1, 256]` | Separator-space speaker embedding from `wulfenite_speaker_encoder.onnx`. |
 | `state_in_0`, `state_in_1`, … | float32 | Various (fixed at export time) | Opaque state tensors. On the first call of a session, pass zero tensors of the correct shape. Shapes are documented in ONNX metadata `wulfenite_state_shape_N` for each N. |
 
 ### Outputs
@@ -151,7 +150,7 @@ inputs. On each call, the returned `state_out_N` replaces the stored
 | Caller mistake | ONNX behavior | Rust caller responsibility |
 |---|---|---|
 | `mixture_chunk` not `[1, 320]` | ORT shape error | Assemble exactly one frame before calling |
-| `speaker_embedding` not `[1, 192]` | ORT shape error | Cache embedding from `cam_plus_chinese.onnx` output |
+| `speaker_embedding` not `[1, 256]` | ORT shape error | Feed the normalized 256-d encoder output |
 | Wrong sample rate | Silent garbage output | Resample to 16 kHz before the ring buffer |
 | Forgot to pass state | ORT missing-input error | Initialize once, feed back every call |
 | Stale state from previous session | Garbage for first ~100 ms | Reset state to zero on session change |
@@ -192,7 +191,8 @@ is missing or does not match the version it was built against.
 
 ```rust
 // one-time setup
-let cam_plus = ort::Session::builder()?.commit_from_file("cam_plus_chinese.onnx")?;
+let speaker_encoder =
+    ort::Session::builder()?.commit_from_file("wulfenite_speaker_encoder.onnx")?;
 let tse = ort::Session::builder()?.commit_from_file("wulfenite_tse.onnx")?;
 
 let contract_version = tse.metadata()?.custom("wulfenite_contract_version")?;
@@ -200,7 +200,7 @@ assert_eq!(contract_version, "1");
 
 // enrollment (once per session)
 let enrollment_wav: Vec<f32> = load_wav_16k_mono("enrollment.wav")?;
-let emb_outputs = cam_plus.run(ort::inputs![
+let emb_outputs = speaker_encoder.run(ort::inputs![
     "enrollment_audio" => TensorRef::from_array_view(&enrollment_wav)?
 ])?;
 let speaker_embedding: ArrayD<f32> = emb_outputs["speaker_embedding"].try_extract_tensor()?;

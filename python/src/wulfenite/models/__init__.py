@@ -3,7 +3,6 @@
 Public entry points:
 - :class:`WulfeniteTSE` — end-to-end TSE model (speaker encoder + separator).
 - :class:`SpeakerBeamSS` / :class:`SpeakerBeamSSConfig` — separator alone.
-- :class:`CAMPPlus` / :func:`encode_enrollment` — speaker encoder alone.
 - :class:`LearnableDVector` — trainable speaker encoder for Plan C5.
 - :class:`S4D` — diagonal state-space layer (parallel + step forms).
 
@@ -13,25 +12,15 @@ S4DBlock) are available via ``wulfenite.models.layers`` and
 the higher-level ``WulfeniteTSE`` wrapper.
 """
 
-from .campplus import (
-    CAMPPlus,
-    compute_fbank,
-    encode_enrollment,
-    load_campplus_cn_common,
-)
 from .dvector import LearnableDVector, SpecAugment, compute_fbank_batch
 from .s4d import S4D
 from .speakerbeam_ss import SpeakerBeamSS, SpeakerBeamSSConfig
 from .tse import WulfeniteTSE
 
 __all__ = [
-    "CAMPPlus",
     "LearnableDVector",
     "SpecAugment",
-    "compute_fbank",
     "compute_fbank_batch",
-    "encode_enrollment",
-    "load_campplus_cn_common",
     "S4D",
     "SpeakerBeamSS",
     "SpeakerBeamSSConfig",

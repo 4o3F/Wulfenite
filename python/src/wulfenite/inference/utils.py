@@ -8,7 +8,43 @@ from typing import Any
 import torch
 
 from ..models import WulfeniteTSE
-from ..training.checkpoint import load_checkpoint, peek_checkpoint_config
+from ..models.speakerbeam_ss import SpeakerBeamSSConfig
+from ..training.checkpoint import peek_checkpoint_config
+
+
+def _rebuild_separator_config(
+    checkpoint_config: dict[str, Any],
+) -> SpeakerBeamSSConfig | None:
+    """Try to reconstruct SpeakerBeamSSConfig from saved checkpoint config.
+
+    If the checkpoint was saved by the current training loop, its config
+    dict contains all ``SpeakerBeamSSConfig`` field names. If any are
+    missing (e.g. a very old checkpoint), we fall back to the current
+    code defaults so that fresh checkpoints always load correctly.
+    """
+    if not checkpoint_config:
+        return None  # no config saved → use current defaults
+
+    # Map TrainingConfig field names that mirror SpeakerBeamSSConfig
+    # (the training config doesn't store a nested separator config but
+    # checkpoint metadata may contain separator-level overrides from
+    # the future — for now, try the fields we know about)
+    kwargs: dict[str, Any] = {}
+    field_map = {
+        "enc_channels": "enc_channels",
+        "bottleneck_channels": "bottleneck_channels",
+        "hidden_channels": "hidden_channels",
+        "s4d_state_dim": "s4d_state_dim",
+        "num_repeats": "num_repeats",
+        "r1_blocks": "r1_blocks",
+        "r2_blocks": "r2_blocks",
+    }
+    for ck_key, cfg_key in field_map.items():
+        if ck_key in checkpoint_config:
+            kwargs[cfg_key] = checkpoint_config[ck_key]
+    if kwargs:
+        return SpeakerBeamSSConfig(**kwargs)
+    return None
 
 
 def _checkpoint_info_from_payload(
@@ -53,40 +89,27 @@ def _load_learnable_checkpoint(
 
 def build_model_from_checkpoint(
     checkpoint: Path,
-    campplus_checkpoint: Path | None = None,
-    use_learnable_encoder: bool | None = None,
     device: str | torch.device = "cpu",
 ) -> tuple[WulfeniteTSE, dict[str, Any]]:
-    """Build and load the correct TSE model for a checkpoint."""
+    """Build and load a learnable-dvector TSE model from a checkpoint."""
     cfg = peek_checkpoint_config(checkpoint)
 
-    if use_learnable_encoder is not None:
-        learnable = use_learnable_encoder
-    elif "use_learnable_encoder" in cfg:
-        learnable = bool(cfg["use_learnable_encoder"])
-    elif campplus_checkpoint is not None:
-        learnable = False
-    else:
-        raise RuntimeError(
-            "Cannot determine encoder type from checkpoint. Pass "
-            "--use-learnable-encoder for learnable checkpoints or "
-            "--campplus-checkpoint for the frozen CAM++ path."
-        )
+    # Rebuild separator config from checkpoint metadata when available,
+    # so legacy checkpoints with different defaults (e.g. 512/192) load
+    # correctly against the current code whose defaults are 4096/256.
+    separator_config = _rebuild_separator_config(cfg)
 
     dev = torch.device(device)
-    if learnable:
-        model = WulfeniteTSE.from_learnable_dvector(num_speakers=None)
+    model = WulfeniteTSE.from_learnable_dvector(
+        num_speakers=None,
+        separator_config=separator_config,
+    )
+    try:
         info = _load_learnable_checkpoint(checkpoint, model, device="cpu")
-    else:
-        if campplus_checkpoint is None:
-            raise RuntimeError(
-                "Frozen CAM++ checkpoints require --campplus-checkpoint."
-            )
-        model = WulfeniteTSE.from_campplus_checkpoint(
-            campplus_checkpoint,
-            device="cpu",
-        )
-        info = load_checkpoint(checkpoint, model=model, map_location="cpu")
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Checkpoint is incompatible with the learnable d-vector TSE pipeline."
+        ) from exc
 
     model = model.to(dev).eval()
     return model, info

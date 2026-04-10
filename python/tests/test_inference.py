@@ -1,13 +1,11 @@
 """Smoke tests for the inference CLIs.
 
-Because CAM++ weights are not available locally, these tests do NOT
-exercise the full ``run_whole`` / ``run_streaming`` entry points (they
-require a real CAM++ .bin file). Instead, they test:
+These tests do NOT exercise the full ``run_whole`` / ``run_streaming``
+entry points. Instead, they test:
 
 1. The whole-utterance vs streaming numerical equivalence on random
    weights end-to-end through ``WulfeniteTSE`` — same guarantee as
-   the SpeakerBeam-SS separator test, but including the CAM++
-   encoder path and the TSE wrapper.
+   the SpeakerBeam-SS separator test, but including the TSE wrapper.
 2. The checkpoint round-trip preserves output bit-for-bit.
 """
 
@@ -18,12 +16,7 @@ from pathlib import Path
 import torch
 
 from wulfenite.inference.utils import build_model_from_checkpoint
-from wulfenite.models import (
-    CAMPPlus,
-    SpeakerBeamSS,
-    SpeakerBeamSSConfig,
-    WulfeniteTSE,
-)
+from wulfenite.models import SpeakerBeamSSConfig, WulfeniteTSE
 from wulfenite.training.checkpoint import load_checkpoint, save_checkpoint
 from wulfenite.training.config import TrainingConfig
 
@@ -34,21 +27,29 @@ SR = 16000
 def _tiny_tse() -> WulfeniteTSE:
     cfg = SpeakerBeamSSConfig(
         enc_channels=16,
-        bottleneck_channels=192,
+        bottleneck_channels=16,
         num_repeats=1,
-        num_blocks_per_repeat=2,
+        r1_blocks=1,
+        r2_blocks=1,
         hidden_channels=16,
         s4d_state_dim=8,
     )
-    encoder = CAMPPlus(feat_dim=80, embedding_size=192).eval()
-    for p in encoder.parameters():
-        p.requires_grad_(False)
-    separator = SpeakerBeamSS(cfg)
-    return WulfeniteTSE(speaker_encoder=encoder, separator=separator).eval()
+    return WulfeniteTSE.from_learnable_dvector(
+        num_speakers=4,
+        separator_config=cfg,
+        dvector_kwargs={
+            "tdnn_channels": 16,
+            "stats_dim": 16,
+            "spec_augment": False,
+        },
+    ).eval()
 
 
-def _learnable_tse(num_speakers: int = 4) -> WulfeniteTSE:
-    return WulfeniteTSE.from_learnable_dvector(num_speakers=num_speakers).eval()
+def _checkpoint_tse(num_speakers: int = 4) -> WulfeniteTSE:
+    return WulfeniteTSE.from_learnable_dvector(
+        num_speakers=num_speakers,
+        dvector_kwargs={"spec_augment": False},
+    ).eval()
 
 
 def test_whole_vs_streaming_end_to_end() -> None:
@@ -112,9 +113,9 @@ def test_checkpoint_preserves_inference_output(tmp_path: Path) -> None:
 
 
 def test_build_model_from_checkpoint_learnable_path(tmp_path: Path) -> None:
-    """Learnable checkpoints should load without CAM++ via auto-detection."""
+    """Inference checkpoints should rebuild through the classifier-free path."""
     torch.manual_seed(3)
-    tse = _learnable_tse(num_speakers=4)
+    tse = _checkpoint_tse(num_speakers=4)
     T = 4 * tse.separator.config.enc_stride
     mixture = torch.randn(1, T)
     enrollment = torch.randn(SR)
@@ -126,12 +127,11 @@ def test_build_model_from_checkpoint_learnable_path(tmp_path: Path) -> None:
     save_checkpoint(
         ckpt_path,
         model=tse,
-        config=TrainingConfig(use_learnable_encoder=True),
+        config=TrainingConfig(),
     )
 
     loaded, info = build_model_from_checkpoint(ckpt_path)
-    assert loaded.learnable_encoder is True
-    assert info["config"]["use_learnable_encoder"] is True
+    assert loaded.speaker_encoder.classifier is None
     assert info["skipped_classifier_keys"]
     assert all(
         key.startswith("speaker_encoder.classifier.")

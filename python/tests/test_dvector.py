@@ -11,8 +11,8 @@ def test_dvector_forward_shape() -> None:
     enc = LearnableDVector(num_speakers=100)
     fbank = torch.randn(4, 300, 80)
     raw, norm, logits = enc(fbank)
-    assert raw.shape == (4, 192)
-    assert norm.shape == (4, 192)
+    assert raw.shape == (4, 256)
+    assert norm.shape == (4, 256)
     assert logits is not None
     assert logits.shape == (4, 100)
     assert torch.allclose(norm.norm(dim=-1), torch.ones(4), atol=1e-5)
@@ -22,8 +22,8 @@ def test_dvector_no_classifier_in_eval() -> None:
     enc = LearnableDVector(num_speakers=None)
     fbank = torch.randn(2, 200, 80)
     raw, norm, logits = enc(fbank)
-    assert raw.shape == (2, 192)
-    assert norm.shape == (2, 192)
+    assert raw.shape == (2, 256)
+    assert norm.shape == (2, 256)
     assert logits is None
 
 
@@ -35,10 +35,10 @@ def test_compute_fbank_batch_shape() -> None:
     assert fbank.size(2) == 80
 
 
-def test_dvector_param_count_under_1m() -> None:
+def test_dvector_param_count_under_2m() -> None:
     enc = LearnableDVector(num_speakers=618)
     total = sum(p.numel() for p in enc.parameters())
-    assert total < 1_000_000, f"Expected <1M params, got {total}"
+    assert total < 2_000_000, f"Expected <2M params, got {total}"
 
 
 def test_spec_augment_disabled_in_eval() -> None:

@@ -1,9 +1,9 @@
 """Learnable d-vector speaker encoder for Plan C5.
 
-This module keeps the CAM++ path intact while providing a small
-trainable x-vector-style encoder that can be optimized jointly with
-the separator. The classifier head regularizes the raw embedding;
-the separator always consumes the L2-normalized embedding.
+This module provides a small trainable x-vector-style encoder that can
+be optimized jointly with the separator. The classifier head
+regularizes the raw embedding; the separator always consumes the
+L2-normalized embedding.
 """
 
 from __future__ import annotations
@@ -13,7 +13,79 @@ import torch.nn.functional as F
 import torchaudio.compliance.kaldi as kaldi
 from torch import nn
 
-from .campplus import FEAT_DIM, SAMPLE_RATE, StatsPool, TDNNLayer
+SAMPLE_RATE = 16000
+FEAT_DIM = 80
+
+
+def _get_nonlinear(config_str: str, channels: int) -> nn.Sequential:
+    nonlinear = nn.Sequential()
+    for name in config_str.split("-"):
+        if name == "relu":
+            nonlinear.add_module("relu", nn.ReLU(inplace=True))
+        elif name == "prelu":
+            nonlinear.add_module("prelu", nn.PReLU(channels))
+        elif name == "batchnorm":
+            nonlinear.add_module("batchnorm", nn.BatchNorm1d(channels))
+        elif name == "batchnorm_":
+            nonlinear.add_module("batchnorm", nn.BatchNorm1d(channels, affine=False))
+        else:
+            raise ValueError(f"Unexpected module ({name}).")
+    return nonlinear
+
+
+def _statistics_pooling(
+    x: torch.Tensor,
+    dim: int = -1,
+    keepdim: bool = False,
+    unbiased: bool = True,
+) -> torch.Tensor:
+    mean = x.mean(dim=dim)
+    std = x.std(dim=dim, unbiased=unbiased)
+    stats = torch.cat([mean, std], dim=-1)
+    if keepdim:
+        stats = stats.unsqueeze(dim=dim)
+    return stats
+
+
+class StatsPool(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _statistics_pooling(x)
+
+
+class TDNNLayer(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        bias: bool = False,
+        config_str: str = "batchnorm-relu",
+    ) -> None:
+        super().__init__()
+        if padding < 0:
+            if kernel_size % 2 != 1:
+                raise ValueError(
+                    f"Expect equal paddings, but got even kernel size ({kernel_size})"
+                )
+            padding = (kernel_size - 1) // 2 * dilation
+        self.linear = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+        )
+        self.nonlinear = _get_nonlinear(config_str, out_channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.linear(x)
+        x = self.nonlinear(x)
+        return x
 
 
 def compute_fbank_batch(
@@ -25,9 +97,9 @@ def compute_fbank_batch(
 ) -> torch.Tensor:
     """Compute Kaldi FBank features for ``[B, T]`` or ``[T]`` waveforms.
 
-    The existing CAM++ helper is single-utterance. This batch-aware
-    variant preserves the same per-item feature extraction settings and
-    pads shorter sequences to the batch maximum frame count.
+    This batch-aware variant preserves the same per-item feature
+    extraction settings across the speaker encoders and pads shorter
+    sequences to the batch maximum frame count.
     """
     if waveform.dim() == 1:
         waveform = waveform.unsqueeze(0)
@@ -126,7 +198,7 @@ class LearnableDVector(nn.Module):
     def __init__(
         self,
         num_speakers: int | None = None,
-        emb_dim: int = 192,
+        emb_dim: int = 256,
         tdnn_channels: int = 192,
         stats_dim: int = 576,
         feat_dim: int = FEAT_DIM,
@@ -173,7 +245,7 @@ class LearnableDVector(nn.Module):
 
     @torch.no_grad()
     def encode_enrollment(self, waveform: torch.Tensor) -> torch.Tensor:
-        """Drop-in raw-waveform helper matching the CAM++ API."""
+        """Drop-in raw-waveform helper matching the TSE encoder API."""
         was_training = self.training
         self.eval()
         fbank = compute_fbank_batch(waveform)

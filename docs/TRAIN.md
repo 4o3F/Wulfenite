@@ -14,7 +14,7 @@ engineering runtime in `rust/` only consumes the final ONNX file
 1. [Hardware and environment](#1-hardware-and-environment)
 2. [Datasets to download](#2-datasets-to-download)
 3. [Expected directory layout](#3-expected-directory-layout)
-4. [CAM++ checkpoint](#4-cam-checkpoint)
+4. [Speaker encoder weights](#4-speaker-encoder-weights)
 5. [Python environment setup](#5-python-environment-setup)
 6. [Running the unit tests](#6-running-the-unit-tests)
 7. [Training](#7-training)
@@ -31,7 +31,7 @@ engineering runtime in `rust/` only consumes the final ONNX file
 - ≥ 64 GB RAM
 - ≥ 50 GB free disk under the repo's `assets/` directory
   (~15 GB AISHELL-1 + ~19 GB AISHELL-3 + ~3.6 GB MUSAN noise subset
-  + ~30 MB CAM++ checkpoint + training checkpoints)
+  + training checkpoints)
 - Linux (Ubuntu 22.04+ recommended) or WSL2
 - Python 3.11 or 3.12
 - [uv](https://github.com/astral-sh/uv) ≥ 0.5
@@ -52,7 +52,7 @@ the canonical form is ``../assets/<dataset>/``.
 
 ## 2. Datasets to download
 
-Three separate datasets, all free:
+Four datasets are relevant for the current Phase 3 recipe:
 
 ### AISHELL-1 (primary clean Chinese speech)
 
@@ -179,6 +179,25 @@ uv run --directory python python -m wulfenite.scripts.resample_aishell3 \
 Use ``--dry-run`` to preview which files would be touched, or
 ``--num-workers N`` to control parallelism (default: cores − 1).
 
+### MAGICDATA (speaker-count expansion, Phase 3 default)
+
+- **Source**: http://openslr.org/68/
+- **Size**: ~755 hours, 1080 speakers
+- **Content**: clean Mandarin speech, 16 kHz mono WAV
+- **Why**: this is the main speaker-diversity expansion for the
+  paper-faithful Phase 3 run; it materially closes the gap between the
+  AISHELL-only pool and LibriMix-scale speaker counts
+
+Accepted layouts:
+
+```text
+assets/magicdata/{train,dev,test}/<speaker_id>/*.wav
+assets/magicdata/wav/{train,dev,test}/<speaker_id>/*.wav
+```
+
+No resampling is required. The scanner prefixes speaker ids as
+`MD_<orig>` internally so they do not collide with AISHELL speaker ids.
+
 ### CN-Celeb (optional speaker-count expansion)
 
 - **Source**: http://openslr.org/82/
@@ -270,6 +289,8 @@ Wulfenite/
 │   ├── aishell3/
 │   │   └── train/
 │   │       └── wav/SSB0005/SSB00050001.wav
+│   ├── magicdata/
+│   │   └── wav/train/14_3892/example.wav
 │   ├── CN-Celeb_flac/
 │   │   └── data/
 │   │       └── id00001/example.wav
@@ -277,8 +298,6 @@ Wulfenite/
 │   │   └── noise/
 │   │       ├── free-sound/
 │   │       └── sound-bible/
-│   ├── campplus/
-│   │   └── campplus_cn_common.bin
 │   └── checkpoints/               # training outputs land here
 ├── python/
 └── rust/
@@ -291,26 +310,12 @@ subdirs — both work.
 
 ---
 
-## 4. CAM++ checkpoint
+## 4. Speaker encoder weights
 
-The speaker encoder is the frozen 200k-speaker Chinese CAM++ release
-from 3D-Speaker on ModelScope:
-[`iic/speech_campplus_sv_zh-cn_16k-common`](https://modelscope.cn/models/iic/speech_campplus_sv_zh-cn_16k-common).
-
-Download the single file `campplus_cn_common.bin` (~28 MB) into
-`assets/campplus/`:
-
-```bash
-mkdir -p assets/campplus
-# Easiest: grab it from the ModelScope web UI and move it here.
-# Or use the modelscope CLI if you have it installed:
-# modelscope snapshot_download iic/speech_campplus_sv_zh-cn_16k-common \
-#     --local_dir assets/campplus --allow_patterns 'campplus_cn_common.bin'
-```
-
-A dedicated download script will likely land at
-`python/src/wulfenite/scripts/download_campplus.py` in a future
-commit; until then, manual download is the path.
+No separate speaker-encoder download is required. The d-vector encoder
+is trained jointly with the separator and stored inside the training
+checkpoint; ONNX export writes it out as its own graph for once-per-
+session enrollment.
 
 ---
 
@@ -343,14 +348,14 @@ uv run python -c "import wulfenite; print(wulfenite.__version__)"
 
 Unit tests are fast (~40 seconds total) and do not require any
 datasets — they use synthetic wav fixtures and randomly-initialized
-CAM++ modules. Run them before any training to catch install or
+d-vector models. Run them before any training to catch install or
 environment issues early:
 
 ```bash
 uv run --directory python pytest tests/ -v
 ```
 
-Expected output: **50 passed** across models / losses / data /
+Expected output: **67 passed** across models / losses / data /
 training / inference. Any failure here is a red flag and should be
 reported before continuing.
 
@@ -359,36 +364,20 @@ reported before continuing.
 ## 7. Training
 
 The training loop lives at `python/src/wulfenite/training/train.py`
-and is invoked as a module. A minimal frozen-CAM++ run with the
-canonical `assets/` paths:
+and is invoked as a module. The Phase 3 paper-faithful run uses the
+learnable d-vector path plus the three clean speech datasets:
 
 ```bash
 uv run --directory python python -m wulfenite.training.train \
     --aishell1-root ../assets/aishell1 \
     --aishell3-root ../assets/aishell3 \
+    --magicdata-root ../assets/magicdata \
     --noise-root ../assets/musan/noise \
-    --campplus-checkpoint ../assets/campplus/campplus_cn_common.bin \
-    --out-dir ../assets/checkpoints/phase1 \
+    --out-dir ../assets/checkpoints/phase3_paper_magicdata \
     --batch-size 16 \
-    --epochs 50 \
+    --epochs 200 \
     --samples-per-epoch 20000 \
-    --lr 1e-3
-```
-
-For the Plan C5/C5b learnable-encoder path, add `--use-learnable-encoder`
-and optionally merge CN-Celeb:
-
-```bash
-uv run --directory python python -m wulfenite.training.train \
-    --aishell1-root ../assets/aishell1 \
-    --aishell3-root ../assets/aishell3 \
-    --cnceleb-root ../assets/CN-Celeb_flac \
-    --noise-root ../assets/musan/noise \
-    --use-learnable-encoder \
-    --out-dir ../assets/checkpoints/phase5b_cnceleb \
-    --batch-size 16 \
-    --epochs 50 \
-    --loss-speaker-cls 0.2
+    --lr 5e-4
 ```
 
 All paths are relative to the `python/` directory because
@@ -403,7 +392,6 @@ uv run --directory python python -m wulfenite.training.train \
     --aishell1-root ../assets/aishell1 \
     --aishell3-root ../assets/aishell3 \
     --noise-root ../assets/musan/noise \
-    --campplus-checkpoint ../assets/campplus/campplus_cn_common.bin \
     --out-dir ../assets/checkpoints/smoke_test \
     --batch-size 4 \
     --epochs 1 \
@@ -424,14 +412,16 @@ Key design points of the training loop (from `docs/architecture.md`):
 - **Mixture-aware silence** — `target_present_prob` defaults to
   0.85, so ~15 % of batches teach the "target is not talking →
   output silence" behavior.
-- **CAM++ is frozen** — `tse.speaker_encoder` is put in eval mode
-  and excluded from the optimizer, so no gradients flow through the
-  encoder.
+- **Speaker encoder is trainable** — the d-vector encoder is
+  optimized jointly with the separator, with an optional short
+  classifier-only warmup at the start of training.
 - **Mirror / offline-safe** — the default `pyproject.toml` uses the
   Aliyun PyTorch mirror so `uv sync` is fast inside China.
 
-Training should converge in 30-60 epochs at ~20 k samples per epoch
-on a 24 GB GPU, wall-clock ~24-48 hours.
+The current recipe uses Adam, `ReduceLROnPlateau(mode="max")` on
+present-only `val_sdri_db`, and early stopping with patience 20. On a
+24 GB GPU, batch size 16 is the first setting to try; if the
+paper-faithful `N = 4096` separator OOMs, drop to 12 or 8.
 
 Checkpoints are written to `--out-dir`:
 
@@ -441,7 +431,7 @@ assets/checkpoints/phase1/
 ├── epoch001.pt
 ├── epoch002.pt
 ├── ...
-└── best.pt            # copy of whichever epoch had the lowest val_loss
+└── best.pt            # copy of whichever epoch had the highest val_sdri_db
 ```
 
 ---
@@ -453,15 +443,14 @@ assets/checkpoints/phase1/
 
 ```bash
 uv run --directory python python -m wulfenite.inference.export_onnx \
-    --checkpoint ../assets/checkpoints/phase1/best.pt \
-    --campplus-checkpoint ../assets/campplus/campplus_cn_common.bin \
+    --checkpoint ../assets/checkpoints/phase3_paper_magicdata/best.pt \
     --out-dir ../assets/exported/
 ```
 
 Produces two files matching `docs/onnx_contract.md`:
 
-- `assets/exported/cam_plus_chinese.onnx` (~30 MB, exported from the
-  frozen CAM++ weights)
+- `assets/exported/wulfenite_speaker_encoder.onnx` (the trained
+  d-vector speaker encoder)
 - `assets/exported/wulfenite_tse.onnx` (~8 MB, the trained separator
   in its stateful form with opaque state tensors)
 
@@ -477,20 +466,7 @@ Two CLIs ship in `python/src/wulfenite/inference/`:
 
 ```bash
 uv run --directory python python -m wulfenite.inference.whole \
-    --checkpoint ../assets/checkpoints/phase5b_cnceleb/best.pt \
-    --mixture ../assets/samples/real_mixture.wav \
-    --enrollment ../assets/samples/real_enrollment.wav \
-    --output ../assets/samples/output_whole.wav
-```
-
-Learnable-encoder checkpoints auto-detect the encoder type from the
-saved checkpoint config and do **not** require `--campplus-checkpoint`.
-For legacy frozen-CAM++ checkpoints, keep passing the CAM++ `.bin`:
-
-```bash
-uv run --directory python python -m wulfenite.inference.whole \
-    --checkpoint ../assets/checkpoints/phase1/best.pt \
-    --campplus-checkpoint ../assets/campplus/campplus_cn_common.bin \
+    --checkpoint ../assets/checkpoints/phase3_paper_magicdata/best.pt \
     --mixture ../assets/samples/real_mixture.wav \
     --enrollment ../assets/samples/real_enrollment.wav \
     --output ../assets/samples/output_whole.wav
@@ -504,17 +480,11 @@ measures real-time latency):
 
 ```bash
 uv run --directory python python -m wulfenite.inference.streaming \
-    --checkpoint ../assets/checkpoints/phase5b_cnceleb/best.pt \
+    --checkpoint ../assets/checkpoints/phase3_paper_magicdata/best.pt \
     --mixture ../assets/samples/real_mixture.wav \
     --enrollment ../assets/samples/real_enrollment.wav \
     --output ../assets/samples/output_stream.wav \
     --chunk-ms 20
-```
-
-Legacy frozen-CAM++ streaming inference still requires:
-
-```bash
---campplus-checkpoint ../assets/campplus/campplus_cn_common.bin
 ```
 
 `--chunk-ms` must be a positive multiple of 10 ms (the encoder

@@ -1,10 +1,10 @@
 """Tests for the training pipeline.
 
 All tests use synthetic wav fixtures written to pytest's ``tmp_path``
-so they do not depend on the real AISHELL / MUSAN / CAM++ weights
-being present. Each test either builds a tiny model with a
-randomly-initialized CAM++ instance (no checkpoint) or exercises the
-checkpoint save/load utilities in isolation.
+so they do not depend on the real AISHELL / MUSAN assets being
+present. Each test either builds a tiny model with a
+randomly-initialized d-vector encoder or exercises the checkpoint
+save/load utilities in isolation.
 
 The ``test_run_training_one_epoch`` test is the end-to-end smoke
 test: it builds a mini mixer, a mini separator, runs a single
@@ -14,7 +14,6 @@ a checkpoint was written.
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -22,9 +21,9 @@ import pytest
 import soundfile as sf
 import torch
 
-from wulfenite.data import MixerConfig, WulfeniteMixer, merge_speaker_dicts, scan_aishell1
+from wulfenite.data import MixerConfig, WulfeniteMixer, scan_aishell1
 from wulfenite.losses import LossWeights, MultiResolutionSTFTLoss, WulfeniteLoss
-from wulfenite.models import CAMPPlus, SpeakerBeamSS, SpeakerBeamSSConfig, WulfeniteTSE
+from wulfenite.models import SpeakerBeamSSConfig, WulfeniteTSE
 from wulfenite.training.checkpoint import load_checkpoint, save_checkpoint
 from wulfenite.training.config import TrainingConfig
 from wulfenite.training.train import (
@@ -72,31 +71,16 @@ def _small_separator_config() -> SpeakerBeamSSConfig:
     """Tiny config so the smoke tests finish in seconds, not minutes."""
     return SpeakerBeamSSConfig(
         enc_channels=16,
-        bottleneck_channels=192,  # keep matching CAM++ output dim
+        bottleneck_channels=16,
         num_repeats=1,
-        num_blocks_per_repeat=2,
+        r1_blocks=1,
+        r2_blocks=1,
         hidden_channels=16,
         s4d_state_dim=8,
     )
 
 
-def _small_tse(device: torch.device | str = "cpu") -> WulfeniteTSE:
-    """Build a TSE model with a random-init CAM++ (no checkpoint) and a
-    tiny separator.
-
-    Tests never load CAM++ weights — they use random-init CAMPPlus
-    because the goal is to exercise the training/inference plumbing,
-    not to measure separation quality.
-    """
-    encoder = CAMPPlus(feat_dim=80, embedding_size=192)
-    encoder.eval()
-    for p in encoder.parameters():
-        p.requires_grad_(False)
-    separator = SpeakerBeamSS(_small_separator_config())
-    return WulfeniteTSE(speaker_encoder=encoder, separator=separator).to(device)
-
-
-def _small_learnable_tse(
+def _small_tse(
     num_speakers: int,
     device: torch.device | str = "cpu",
 ) -> WulfeniteTSE:
@@ -154,8 +138,11 @@ def test_training_config_defaults() -> None:
     assert cfg.segment_seconds == 4.0
     assert cfg.enrollment_seconds == 4.0
     assert cfg.loss_sdr == 1.0
-    assert cfg.use_learnable_encoder is False
     assert cfg.loss_speaker_cls == 0.2
+    assert cfg.learning_rate == pytest.approx(5e-4)
+    assert cfg.use_plateau_scheduler is True
+    assert cfg.plateau_patience == 5
+    assert cfg.early_stopping_patience == 20
 
 
 # ---------------------------------------------------------------------------
@@ -165,13 +152,12 @@ def test_training_config_defaults() -> None:
 
 def test_checkpoint_roundtrip(tmp_path: Path) -> None:
     torch.manual_seed(0)
-    model = _small_tse()
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=1e-3,
+    model = _small_tse(num_speakers=4)
+    optimizer = torch.optim.Adam(
+        [p for p in model.parameters() if p.requires_grad], lr=5e-4,
     )
     cfg = TrainingConfig(
         aishell1_root=Path("/fake/path"),
-        campplus_checkpoint=Path("/fake/campplus.bin"),
         out_dir=tmp_path / "ckpts",
     )
 
@@ -185,7 +171,7 @@ def test_checkpoint_roundtrip(tmp_path: Path) -> None:
     assert ckpt_path.exists()
 
     # Build a fresh model, load into it
-    model2 = _small_tse()
+    model2 = _small_tse(num_speakers=4)
     info = load_checkpoint(ckpt_path, model=model2)
     assert info["epoch"] == 3
     assert info["step"] == 42
@@ -200,9 +186,9 @@ def test_checkpoint_roundtrip(tmp_path: Path) -> None:
 
 def test_checkpoint_optimizer_state_preserved(tmp_path: Path) -> None:
     torch.manual_seed(1)
-    model = _small_tse()
-    opt = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=1e-3,
+    model = _small_tse(num_speakers=4)
+    opt = torch.optim.Adam(
+        [p for p in model.parameters() if p.requires_grad], lr=5e-4,
     )
 
     # Do one step so the optimizer has running state.
@@ -216,9 +202,9 @@ def test_checkpoint_optimizer_state_preserved(tmp_path: Path) -> None:
     ckpt_path = tmp_path / "opt.pt"
     save_checkpoint(ckpt_path, model=model, optimizer=opt, config=TrainingConfig())
 
-    model2 = _small_tse()
-    opt2 = torch.optim.AdamW(
-        [p for p in model2.parameters() if p.requires_grad], lr=1e-3,
+    model2 = _small_tse(num_speakers=4)
+    opt2 = torch.optim.Adam(
+        [p for p in model2.parameters() if p.requires_grad], lr=5e-4,
     )
     load_checkpoint(ckpt_path, model=model2, optimizer=opt2)
 
@@ -235,10 +221,10 @@ def test_training_single_step_backward(tmp_path: Path) -> None:
     """Forward + loss + backward should yield finite gradients."""
     torch.manual_seed(2)
     mixer = _small_mixer(tmp_path, samples=4)
-    model = _small_tse()
+    model = _small_tse(num_speakers=4)
     criterion = _small_loss()
-    opt = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=1e-3,
+    opt = torch.optim.Adam(
+        [p for p in model.parameters() if p.requires_grad], lr=5e-4,
     )
 
     from wulfenite.data import collate_mixer_batch
@@ -283,15 +269,13 @@ def test_run_training_one_epoch_writes_checkpoint(tmp_path: Path) -> None:
         aishell1_root=aishell_root,
         aishell3_root=None,
         noise_root=None,
-        campplus_checkpoint=Path("/unused/because/model/is/provided"),
         segment_seconds=1.0,
         enrollment_seconds=1.0,
         batch_size=2,
         epochs=1,
         samples_per_epoch=6,
         val_samples=4,
-        lr=1e-3,
-        warmup_ratio=0.1,
+        learning_rate=5e-4,
         num_workers=0,  # tests should not spawn workers
         out_dir=tmp_path / "ckpts",
         log_interval=1,
@@ -300,11 +284,10 @@ def test_run_training_one_epoch_writes_checkpoint(tmp_path: Path) -> None:
         # Disable augmentation for determinism
         noise_prob=0.0,
         reverb_prob=0.0,
+        encoder_pretrain_epochs=0,
     )
 
-    # Provide a pre-built model so run_training does not try to load
-    # CAM++ from disk.
-    model = _small_tse()
+    model = _small_tse(num_speakers=2)
 
     # Monkeypatch the mixer config inside build_dataset by giving the
     # data loader a non-augmented mixer. The simplest way is to set
@@ -320,9 +303,11 @@ def test_run_training_one_epoch_writes_checkpoint(tmp_path: Path) -> None:
     # Sanity-check the log has the expected epoch summary line.
     log_text = (cfg.out_dir / "train.log").read_text()
     assert "epoch 1" in log_text
+    assert "val_sdr_db=" in log_text
+    assert "val_sdri_db=" in log_text
 
 
-def test_run_training_one_epoch_learnable_encoder_writes_checkpoint(
+def test_run_training_one_epoch_with_pretrain_writes_checkpoint(
     tmp_path: Path,
 ) -> None:
     torch.manual_seed(30)
@@ -334,16 +319,13 @@ def test_run_training_one_epoch_learnable_encoder_writes_checkpoint(
         aishell1_root=aishell_root,
         aishell3_root=None,
         noise_root=None,
-        campplus_checkpoint=None,
-        use_learnable_encoder=True,
         segment_seconds=1.0,
         enrollment_seconds=1.0,
         batch_size=2,
         epochs=1,
         samples_per_epoch=4,
         val_samples=4,
-        lr=1e-3,
-        warmup_ratio=0.1,
+        learning_rate=5e-4,
         encoder_pretrain_epochs=1,
         encoder_pretrain_lr=1e-3,
         num_workers=0,
@@ -355,7 +337,7 @@ def test_run_training_one_epoch_learnable_encoder_writes_checkpoint(
         reverb_prob=0.0,
     )
 
-    model = _small_learnable_tse(num_speakers=2)
+    model = _small_tse(num_speakers=2)
     run_training(cfg, model=model, show_progress=False)
 
     assert (cfg.out_dir / "epoch001.pt").exists()
@@ -381,13 +363,15 @@ def test_validate_runs(tmp_path: Path) -> None:
     loader = DataLoader(
         mixer, batch_size=2, collate_fn=collate_mixer_batch, num_workers=0,
     )
-    model = _small_tse()
+    model = _small_tse(num_speakers=4)
     criterion = _small_loss()
     device = torch.device("cpu")
 
     val_loss, parts = validate(model, loader, criterion, device, show_progress=False)
     assert isinstance(val_loss, float)
     assert val_loss == val_loss  # not NaN
+    assert "sdr_db" in parts
+    assert "sdri_db" in parts
 
 
 def test_enrollment_shuffle_sdr_drop_present_mode(tmp_path: Path) -> None:
@@ -396,6 +380,14 @@ def test_enrollment_shuffle_sdr_drop_present_mode(tmp_path: Path) -> None:
     from wulfenite.data import collate_mixer_batch
 
     batch = collate_mixer_batch([mixer[i] for i in range(2)])
-    model = _small_learnable_tse(num_speakers=len(mixer.speaker_ids))
+    model = _small_tse(num_speakers=len(mixer.speaker_ids))
     drop = compute_enrollment_shuffle_sdr_drop(model, batch, torch.device("cpu"))
     assert isinstance(drop, float)
+
+
+def test_build_optimizer_uses_adam_and_plateau_scheduler() -> None:
+    model = _small_tse(num_speakers=4)
+    cfg = TrainingConfig()
+    optimizer, scheduler = build_optimizer(model, cfg)
+    assert isinstance(optimizer, torch.optim.Adam)
+    assert isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)

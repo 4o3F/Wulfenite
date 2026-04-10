@@ -15,15 +15,11 @@ control flow the Rust runtime will use. Serves two purposes:
 Usage:
 
     uv run --directory python python -m wulfenite.inference.streaming \\
-        --checkpoint ./checkpoints/phase5b_cnceleb/best.pt \\
+        --checkpoint ./checkpoints/phase3_paper_magicdata/best.pt \\
         --mixture ./samples/real_mixture.wav \\
         --enrollment ./samples/real_enrollment.wav \\
         --output ./output_stream.wav \\
         --chunk-ms 20
-
-For legacy frozen-CAM++ checkpoints also pass::
-
-    --campplus-checkpoint ~/datasets/campplus/campplus_cn_common.bin
 """
 
 from __future__ import annotations
@@ -65,10 +61,8 @@ def run_streaming(
     mixture: Path,
     enrollment: Path,
     output: Path,
-    campplus_checkpoint: Path | None = None,
     chunk_ms: float = 20.0,
     device: str = "cpu",
-    use_learnable_encoder: bool | None = None,
 ) -> dict:
     """Run streaming inference and write the clean wav.
 
@@ -79,8 +73,6 @@ def run_streaming(
 
     model, info = build_model_from_checkpoint(
         checkpoint,
-        campplus_checkpoint=campplus_checkpoint,
-        use_learnable_encoder=use_learnable_encoder,
         device=dev,
     )
     print(
@@ -103,7 +95,7 @@ def run_streaming(
 
     # --- Encode enrollment once ---
     with torch.no_grad():
-        speaker_embedding = model.encode_enrollment(enr_wav[0])  # [1, 192]
+        speaker_embedding = model.encode_enrollment(enr_wav[0])
 
     # --- Pad mixture so its length is a multiple of chunk_size ---
     pad_len = (chunk_size - mix_wav.shape[0] % chunk_size) % chunk_size
@@ -198,12 +190,6 @@ def run_streaming(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--campplus-checkpoint", type=Path, default=None,
-                        help="Frozen CAM++ zh-cn checkpoint (.bin). "
-                             "Required for legacy frozen-CAM++ checkpoints.")
-    parser.add_argument("--use-learnable-encoder", action="store_true", default=None,
-                        help="Force the learnable-encoder inference path. "
-                             "Normally auto-detected from the checkpoint config.")
     parser.add_argument("--mixture", type=Path, required=True)
     parser.add_argument("--enrollment", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -218,13 +204,11 @@ def main() -> None:
     args = _parse_args()
     run_streaming(
         checkpoint=args.checkpoint,
-        campplus_checkpoint=args.campplus_checkpoint,
         mixture=args.mixture,
         enrollment=args.enrollment,
         output=args.output,
         chunk_ms=args.chunk_ms,
         device=args.device,
-        use_learnable_encoder=args.use_learnable_encoder,
     )
 
 

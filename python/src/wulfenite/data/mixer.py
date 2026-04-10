@@ -34,7 +34,7 @@ Every call yields a dict with:
 
 - ``"mixture"``: ``[T]`` float tensor, 16 kHz mono input to the model
 - ``"target"``: ``[T]`` float tensor, loss reference (zeros for absent)
-- ``"enrollment"``: ``[T_enr]`` float tensor, fed to CAM++
+- ``"enrollment"``: ``[T_enr]`` float tensor, fed to the speaker encoder
 - ``"target_present"``: scalar tensor, 1.0 or 0.0
 - ``"target_speaker_idx"``: scalar ``long`` tensor, stable speaker id
 - ``"snr_db"``: scalar tensor for logging
