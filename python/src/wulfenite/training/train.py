@@ -52,7 +52,12 @@ from ..losses import (
     compute_sdr_db,
     compute_sdri_db,
 )
-from ..models import LearnableDVector, WulfeniteTSE, compute_fbank_batch
+from ..models import (
+    LearnableDVector,
+    SpeakerBeamSSConfig,
+    WulfeniteTSE,
+    compute_fbank_batch,
+)
 from .checkpoint import save_checkpoint
 from .config import TrainingConfig
 
@@ -160,12 +165,25 @@ def build_model(
     num_speakers: int | None = None,
 ) -> WulfeniteTSE:
     """Build the TSE model for the configured speaker encoder type."""
+    separator_config = SpeakerBeamSSConfig(
+        enc_channels=cfg.enc_channels,
+        bottleneck_channels=cfg.bottleneck_channels,
+        hidden_channels=cfg.hidden_channels,
+        num_repeats=cfg.num_repeats,
+        r1_blocks=cfg.r1_blocks,
+        r2_blocks=cfg.r2_blocks,
+        s4d_state_dim=cfg.s4d_state_dim,
+    )
+
     if cfg.encoder_type == "learnable":
         if num_speakers is None:
             raise RuntimeError(
                 "num_speakers must be provided to build the training model."
             )
-        return WulfeniteTSE.from_learnable_dvector(num_speakers=num_speakers)
+        return WulfeniteTSE.from_learnable_dvector(
+            num_speakers=num_speakers,
+            separator_config=separator_config,
+        )
 
     if cfg.encoder_type == "campplus-frozen":
         if cfg.campplus_checkpoint is None:
@@ -174,6 +192,7 @@ def build_model(
             )
         return WulfeniteTSE.from_campplus(
             cfg.campplus_checkpoint,
+            separator_config=separator_config,
             freeze_backbone=True,
         )
 
@@ -184,6 +203,7 @@ def build_model(
             )
         return WulfeniteTSE.from_campplus(
             cfg.campplus_checkpoint,
+            separator_config=separator_config,
             freeze_backbone=False,
         )
 
@@ -970,6 +990,13 @@ def _parse_args() -> TrainingConfig:
         default="learnable",
     )
     parser.add_argument("--campplus-checkpoint", type=Path, default=None)
+    parser.add_argument("--enc-channels", type=int, default=4096)
+    parser.add_argument("--bottleneck-channels", type=int, default=256)
+    parser.add_argument("--hidden-channels", type=int, default=512)
+    parser.add_argument("--num-repeats", type=int, default=2)
+    parser.add_argument("--r1-blocks", type=int, default=3)
+    parser.add_argument("--r2-blocks", type=int, default=1)
+    parser.add_argument("--s4d-state-dim", type=int, default=32)
     # Loss
     parser.add_argument("--loss-sdr", type=float, default=1.0)
     parser.add_argument("--loss-mr-stft", type=float, default=1.0)
@@ -1017,6 +1044,13 @@ def _parse_args() -> TrainingConfig:
         encoder_pretrain_epochs=args.encoder_pretrain_epochs,
         encoder_pretrain_lr=args.encoder_pretrain_lr,
         encoder_lr_scale=args.encoder_lr_scale,
+        enc_channels=args.enc_channels,
+        bottleneck_channels=args.bottleneck_channels,
+        hidden_channels=args.hidden_channels,
+        num_repeats=args.num_repeats,
+        r1_blocks=args.r1_blocks,
+        r2_blocks=args.r2_blocks,
+        s4d_state_dim=args.s4d_state_dim,
         loss_sdr=args.loss_sdr,
         loss_mr_stft=args.loss_mr_stft,
         loss_absent=args.loss_absent,

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 
 from wulfenite.inference.utils import build_model_from_checkpoint
@@ -24,8 +25,8 @@ from wulfenite.training.config import TrainingConfig
 SR = 16000
 
 
-def _tiny_tse() -> WulfeniteTSE:
-    cfg = SpeakerBeamSSConfig(
+def _tiny_separator_config() -> SpeakerBeamSSConfig:
+    return SpeakerBeamSSConfig(
         enc_channels=16,
         bottleneck_channels=16,
         num_repeats=1,
@@ -34,6 +35,27 @@ def _tiny_tse() -> WulfeniteTSE:
         hidden_channels=16,
         s4d_state_dim=8,
     )
+
+
+def _separator_checkpoint_config(
+    separator_config: SpeakerBeamSSConfig,
+    *,
+    encoder_type: str,
+) -> dict[str, int | str]:
+    return {
+        "encoder_type": encoder_type,
+        "enc_channels": separator_config.enc_channels,
+        "bottleneck_channels": separator_config.bottleneck_channels,
+        "hidden_channels": separator_config.hidden_channels,
+        "num_repeats": separator_config.num_repeats,
+        "r1_blocks": separator_config.r1_blocks,
+        "r2_blocks": separator_config.r2_blocks,
+        "s4d_state_dim": separator_config.s4d_state_dim,
+    }
+
+
+def _tiny_tse() -> WulfeniteTSE:
+    cfg = _tiny_separator_config()
     return WulfeniteTSE.from_learnable_dvector(
         num_speakers=4,
         separator_config=cfg,
@@ -49,6 +71,14 @@ def _checkpoint_tse(num_speakers: int = 4) -> WulfeniteTSE:
     return WulfeniteTSE.from_learnable_dvector(
         num_speakers=num_speakers,
         dvector_kwargs={"spec_augment": False},
+    ).eval()
+
+
+def _tiny_campplus_tse(freeze: bool) -> WulfeniteTSE:
+    return WulfeniteTSE.from_campplus(
+        campplus_checkpoint=None,
+        separator_config=_tiny_separator_config(),
+        freeze_backbone=freeze,
     ).eval()
 
 
@@ -144,6 +174,96 @@ def test_build_model_from_checkpoint_learnable_path(tmp_path: Path) -> None:
     assert torch.allclose(before, after, atol=1e-6), (
         "learnable inference output diverged after checkpoint rebuild"
     )
+
+
+@pytest.mark.parametrize("encoder_type", ("campplus-frozen", "campplus-finetune"))
+def test_build_model_from_checkpoint_campplus_roundtrip(
+    tmp_path: Path,
+    encoder_type: str,
+) -> None:
+    """CAM++ checkpoints should rebuild through the strict inference path."""
+    torch.manual_seed(4)
+    tse = _tiny_campplus_tse(freeze=encoder_type == "campplus-frozen")
+    T = 4 * tse.separator.config.enc_stride
+    mixture = torch.randn(1, T)
+    enrollment = torch.randn(SR)
+
+    with torch.no_grad():
+        before = tse(mixture, enrollment)["clean"]
+
+    ckpt_path = tmp_path / f"{encoder_type}.pt"
+    save_checkpoint(
+        ckpt_path,
+        model=tse,
+        config=_separator_checkpoint_config(
+            tse.separator.config,
+            encoder_type=encoder_type,
+        ),
+    )
+
+    loaded, info = build_model_from_checkpoint(ckpt_path)
+    assert loaded.separator.config == _tiny_separator_config()
+    assert info["config"]["encoder_type"] == encoder_type
+
+    with torch.no_grad():
+        after = loaded(mixture, enrollment)["clean"]
+
+    assert torch.allclose(before, after, atol=1e-6), (
+        "CAM++ inference output diverged after checkpoint rebuild"
+    )
+
+
+def test_campplus_whole_vs_streaming_end_to_end() -> None:
+    """End-to-end CAM++ TSE forward vs streaming_step must agree numerically."""
+    torch.manual_seed(5)
+    tse = _tiny_campplus_tse(freeze=True)
+
+    T = 8 * tse.separator.config.enc_stride
+    mixture = torch.randn(1, T)
+    enrollment_wav = torch.randn(SR)
+
+    with torch.no_grad():
+        whole_outputs = tse(mixture, enrollment_wav)
+        whole_clean = whole_outputs["clean"]
+
+        emb = tse.encode_enrollment(enrollment_wav)
+        state = tse.separator.initial_streaming_state(batch_size=1)
+        chunk_size = 2 * tse.separator.config.enc_stride
+        pieces = []
+        for start in range(0, T, chunk_size):
+            chunk = mixture[..., start:start + chunk_size]
+            if chunk.shape[-1] != chunk_size:
+                continue
+            out, state = tse.separator.streaming_step(chunk, emb, state)
+            pieces.append(out)
+        stream_clean = torch.cat(pieces, dim=-1)
+
+    assert whole_clean.shape == stream_clean.shape
+    diff = (whole_clean - stream_clean).abs().max().item()
+    assert diff < 1e-4, (
+        f"whole vs streaming CAM++ TSE disagree by {diff:.2e} (>1e-4)"
+    )
+
+
+def test_build_model_from_checkpoint_campplus_rejects_incompatible(
+    tmp_path: Path,
+) -> None:
+    """CAM++ inference loading should reject learnable checkpoints."""
+    torch.manual_seed(6)
+    tse = _tiny_tse()
+
+    ckpt_path = tmp_path / "campplus_incompatible.pt"
+    save_checkpoint(
+        ckpt_path,
+        model=tse,
+        config=_separator_checkpoint_config(
+            tse.separator.config,
+            encoder_type="campplus-frozen",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="CAM\\+\\+ TSE pipeline"):
+        build_model_from_checkpoint(ckpt_path)
 
 
 def test_presence_head_output_shape() -> None:

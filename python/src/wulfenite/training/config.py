@@ -49,6 +49,15 @@ class TrainingConfig:
     encoder_pretrain_lr: float = 3e-4
     encoder_lr_scale: float = 0.25
 
+    # --- Separator architecture ---
+    enc_channels: int = 4096
+    bottleneck_channels: int = 256
+    hidden_channels: int = 512
+    num_repeats: int = 2
+    r1_blocks: int = 3
+    r2_blocks: int = 1
+    s4d_state_dim: int = 32
+
     # --- Loss weights (matches LossWeights defaults) ---
     loss_sdr: float = 1.0
     loss_mr_stft: float = 1.0

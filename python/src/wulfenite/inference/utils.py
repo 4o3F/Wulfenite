@@ -73,15 +73,9 @@ def _load_learnable_checkpoint(
     payload = torch.load(str(checkpoint), map_location=device, weights_only=False)
     state = dict(payload["model_state_dict"])
 
-    classifier_keys = [
+    skipped_keys = [
         key for key in state
         if key.startswith("speaker_encoder.classifier.")
-    ]
-    skipped_keys = classifier_keys + [
-        key
-        for key in state
-        if key.startswith("speaker_encoder.backbone.")
-        or key.startswith("speaker_encoder.to_separator.")
     ]
     for key in skipped_keys:
         del state[key]
