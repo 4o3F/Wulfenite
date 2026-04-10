@@ -54,6 +54,7 @@ from ..losses import (
 )
 from ..models import (
     LearnableDVector,
+    SpeakerEncoderOutput,
     SpeakerBeamSSConfig,
     WulfeniteTSE,
     compute_fbank_batch,
@@ -194,6 +195,9 @@ def build_model(
             cfg.campplus_checkpoint,
             separator_config=separator_config,
             freeze_backbone=True,
+            num_speakers=num_speakers,
+            projection_type=cfg.campplus_projection_type,
+            projection_hidden_dim=cfg.campplus_projection_hidden_dim,
         )
 
     if cfg.encoder_type == "campplus-finetune":
@@ -205,6 +209,9 @@ def build_model(
             cfg.campplus_checkpoint,
             separator_config=separator_config,
             freeze_backbone=False,
+            num_speakers=num_speakers,
+            projection_type=cfg.campplus_projection_type,
+            projection_hidden_dim=cfg.campplus_projection_hidden_dim,
         )
 
     raise ValueError(f"Unsupported encoder_type: {cfg.encoder_type}")
@@ -278,6 +285,33 @@ def _move_batch(batch: dict, device: torch.device, non_blocking: bool) -> dict:
     }
 
 
+def _speaker_encoder_outputs(
+    model: WulfeniteTSE,
+    batch: dict,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Return raw embedding, separator embedding, and optional logits."""
+    fbank = batch.get("enrollment_fbank")
+    if isinstance(model.speaker_encoder, LearnableDVector):
+        if fbank is None:
+            fbank = compute_fbank_batch(batch["enrollment"])
+        return model.speaker_encoder(fbank)
+
+    encoder_out = model.speaker_encoder(
+        batch["enrollment"],
+        fbank=fbank,
+    )
+    if not isinstance(encoder_out, SpeakerEncoderOutput):
+        raise TypeError(
+            "speaker_encoder must return either the learnable "
+            "d-vector tuple or SpeakerEncoderOutput."
+        )
+    return (
+        encoder_out.native_embedding,
+        encoder_out.separator_embedding,
+        encoder_out.speaker_logits,
+    )
+
+
 def _format_lr(optimizer: torch.optim.Optimizer) -> str:
     parts = []
     for i, group in enumerate(optimizer.param_groups):
@@ -331,10 +365,7 @@ def compute_speaker_top1_accuracy(
     correct = 0
     for i, batch in enumerate(loader):
         batch = _move_batch(batch, device, non_blocking=pin)
-        fbank = batch.get("enrollment_fbank")
-        if fbank is None:
-            fbank = compute_fbank_batch(batch["enrollment"])
-        _, _, logits = model.speaker_encoder(fbank)
+        _, _, logits = _speaker_encoder_outputs(model, batch)
         if logits is None:
             raise RuntimeError("Training diagnostics require a classifier head.")
         pred = logits.argmax(dim=-1)
@@ -361,18 +392,8 @@ def compute_same_diff_cosine_gap(
     labels: list[torch.Tensor] = []
     for i, batch in enumerate(loader):
         batch = _move_batch(batch, device, non_blocking=pin)
-        enrollment_fbank = batch.get("enrollment_fbank")
-        if isinstance(model.speaker_encoder, LearnableDVector):
-            if enrollment_fbank is None:
-                enrollment_fbank = compute_fbank_batch(batch["enrollment"])
-            _, norm_emb, _ = model.speaker_encoder(enrollment_fbank)
-            embeddings.append(norm_emb)
-        else:
-            encoder_out = model.speaker_encoder(
-                batch["enrollment"],
-                fbank=enrollment_fbank,
-            )
-            embeddings.append(encoder_out.separator_embedding)
+        _, norm_emb, _ = _speaker_encoder_outputs(model, batch)
+        embeddings.append(norm_emb)
         labels.append(batch["target_speaker_idx"])
         if max_batches is not None and i + 1 >= max_batches:
             break
@@ -633,8 +654,7 @@ def run_encoder_pretrain(
         p.requires_grad_(False)
 
     optimizer = torch.optim.Adam(
-        [p for p in model.speaker_encoder.parameters() if p.requires_grad],
-        lr=cfg.encoder_pretrain_lr,
+        model.speaker_encoder.optimizer_groups(cfg, base_lr=cfg.encoder_pretrain_lr),
         weight_decay=cfg.weight_decay,
     )
     pin = device.type == "cuda"
@@ -653,13 +673,10 @@ def run_encoder_pretrain(
         )
         for batch in pbar:
             batch = _move_batch(batch, device, non_blocking=pin)
-            fbank = batch.get("enrollment_fbank")
-            if fbank is None:
-                fbank = compute_fbank_batch(batch["enrollment"])
-            _, _, logits = model.speaker_encoder(fbank)
+            _, _, logits = _speaker_encoder_outputs(model, batch)
             if logits is None:
                 raise RuntimeError(
-                    "Learnable encoder pretrain requires a classifier head."
+                    "Speaker-encoder pretrain requires a classifier head."
                 )
             loss = F.cross_entropy(logits, batch["target_speaker_idx"])
 
@@ -750,7 +767,7 @@ def run_training(
         classifier = getattr(model.speaker_encoder, "classifier", None)
         if classifier is None:
             raise ValueError(
-                "Training requires a d-vector encoder with a classifier head."
+                "Training requires a speaker encoder with a classifier head."
             )
         if classifier.out_features != len(train_ds.speaker_ids):
             raise ValueError(
@@ -990,6 +1007,16 @@ def _parse_args() -> TrainingConfig:
         default="learnable",
     )
     parser.add_argument("--campplus-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--campplus-projection-type",
+        choices=("mlp", "linear"),
+        default="mlp",
+    )
+    parser.add_argument(
+        "--campplus-projection-hidden-dim",
+        type=int,
+        default=384,
+    )
     parser.add_argument("--enc-channels", type=int, default=4096)
     parser.add_argument("--bottleneck-channels", type=int, default=256)
     parser.add_argument("--hidden-channels", type=int, default=512)
@@ -1000,7 +1027,7 @@ def _parse_args() -> TrainingConfig:
     # Loss
     parser.add_argument("--loss-sdr", type=float, default=1.0)
     parser.add_argument("--loss-mr-stft", type=float, default=1.0)
-    parser.add_argument("--loss-absent", type=float, default=1.0)
+    parser.add_argument("--loss-absent", type=float, default=0.5)
     parser.add_argument("--loss-presence", type=float, default=0.1)
     parser.add_argument("--loss-speaker-cls", type=float, default=0.2)
     # DataLoader
@@ -1022,6 +1049,8 @@ def _parse_args() -> TrainingConfig:
         cnceleb_root=args.cnceleb_root,
         noise_root=args.noise_root,
         campplus_checkpoint=args.campplus_checkpoint,
+        campplus_projection_type=args.campplus_projection_type,
+        campplus_projection_hidden_dim=args.campplus_projection_hidden_dim,
         segment_seconds=args.segment_seconds,
         enrollment_seconds=args.enrollment_seconds,
         snr_range_db=tuple(args.snr_range_db),

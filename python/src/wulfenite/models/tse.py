@@ -88,6 +88,9 @@ class WulfeniteTSE(nn.Module):
         campplus_checkpoint: str | Path | None,
         separator_config: SpeakerBeamSSConfig | None = None,
         freeze_backbone: bool = True,
+        num_speakers: int | None = None,
+        projection_type: str = "mlp",
+        projection_hidden_dim: int = 384,
     ) -> "WulfeniteTSE":
         """Build a TSE model with a CAM++ speaker encoder."""
         separator = SpeakerBeamSS(separator_config)
@@ -102,6 +105,9 @@ class WulfeniteTSE(nn.Module):
             backbone=backbone,
             bottleneck_dim=separator.config.bottleneck_channels,
             freeze_backbone=freeze_backbone,
+            num_speakers=num_speakers,
+            projection_type=projection_type,
+            projection_hidden_dim=projection_hidden_dim,
         )
         return cls(
             speaker_encoder=encoder,

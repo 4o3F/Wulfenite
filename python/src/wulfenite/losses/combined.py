@@ -48,7 +48,7 @@ class LossWeights:
 
     sdr: float = 1.0
     mr_stft: float = 1.0
-    absent: float = 1.0
+    absent: float = 0.5
     presence: float = 0.1
     speaker_cls: float = 0.2
 

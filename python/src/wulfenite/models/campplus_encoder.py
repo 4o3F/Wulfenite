@@ -40,11 +40,33 @@ class CampPlusSpeakerEncoder(nn.Module):
         backbone: CAMPPlus,
         bottleneck_dim: int,
         freeze_backbone: bool,
+        num_speakers: int | None = None,
+        projection_type: str = "mlp",
+        projection_hidden_dim: int = 384,
     ) -> None:
         super().__init__()
         self.backbone = backbone
         self.freeze_backbone = freeze_backbone
-        self.to_separator = nn.Linear(EMBEDDING_SIZE, bottleneck_dim)
+        if projection_type == "linear":
+            self.to_separator = nn.Linear(EMBEDDING_SIZE, bottleneck_dim)
+        elif projection_type == "mlp":
+            if projection_hidden_dim <= 0:
+                raise ValueError(
+                    "projection_hidden_dim must be positive for MLP projection."
+                )
+            self.to_separator = nn.Sequential(
+                nn.Linear(EMBEDDING_SIZE, projection_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(projection_hidden_dim, bottleneck_dim),
+            )
+        else:
+            raise ValueError(f"Unsupported projection_type: {projection_type}")
+        self.classifier = (
+            nn.Linear(bottleneck_dim, num_speakers)
+            if num_speakers is not None else None
+        )
+        self.supports_classifier = self.classifier is not None
+        self.supports_pretrain = self.classifier is not None
 
         if self.freeze_backbone:
             self.backbone.eval()
@@ -85,12 +107,13 @@ class CampPlusSpeakerEncoder(nn.Module):
             fbank = fbank.unsqueeze(0)
         raw = self._forward_backbone(fbank)
         norm = F.normalize(raw, p=2, dim=-1)
-        proj = self.to_separator(norm)
-        sep_emb = F.normalize(proj, p=2, dim=-1)
+        projected = self.to_separator(norm)
+        sep_emb = F.normalize(projected, p=2, dim=-1)
+        logits = self.classifier(projected) if self.classifier is not None else None
         return SpeakerEncoderOutput(
             separator_embedding=sep_emb,
             native_embedding=norm.detach(),
-            speaker_logits=None,
+            speaker_logits=logits,
         )
 
     @torch.no_grad()
@@ -103,15 +126,30 @@ class CampPlusSpeakerEncoder(nn.Module):
             self.train()
         return output.separator_embedding
 
-    def optimizer_groups(self, cfg: "TrainingConfig") -> list[dict]:
+    def optimizer_groups(
+        self,
+        cfg: "TrainingConfig",
+        base_lr: float | None = None,
+    ) -> list[dict]:
         """Return optimizer groups for frozen or fine-tuned CAM++."""
+        head_lr = cfg.learning_rate if base_lr is None else base_lr
         groups = [
             {
                 "name": "encoder_projection",
                 "params": [p for p in self.to_separator.parameters() if p.requires_grad],
-                "lr": cfg.learning_rate,
+                "lr": head_lr,
             }
         ]
+        if self.classifier is not None:
+            groups.append(
+                {
+                    "name": "encoder_classifier",
+                    "params": [
+                        p for p in self.classifier.parameters() if p.requires_grad
+                    ],
+                    "lr": head_lr,
+                }
+            )
         if not self.freeze_backbone:
             backbone_params = [
                 p for p in self.backbone.parameters() if p.requires_grad
@@ -122,7 +160,7 @@ class CampPlusSpeakerEncoder(nn.Module):
                     {
                         "name": "encoder_backbone",
                         "params": backbone_params,
-                        "lr": cfg.learning_rate * cfg.encoder_lr_scale,
+                        "lr": head_lr * cfg.encoder_lr_scale,
                     },
                 )
         return groups

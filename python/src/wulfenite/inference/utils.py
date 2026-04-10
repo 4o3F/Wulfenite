@@ -87,15 +87,27 @@ def _load_learnable_checkpoint(
     )
 
 
-def _load_checkpoint_strict(
+def _load_campplus_checkpoint(
     checkpoint: Path,
     model: WulfeniteTSE,
     device: str | torch.device = "cpu",
 ) -> dict[str, Any]:
-    """Load a checkpoint into a model whose architecture already matches."""
+    """Load a CAM++ checkpoint into a classifier-free inference model."""
     payload = torch.load(str(checkpoint), map_location=device, weights_only=False)
-    model.load_state_dict(payload["model_state_dict"], strict=True)
-    return _checkpoint_info_from_payload(payload)
+    state = dict(payload["model_state_dict"])
+
+    skipped_keys = [
+        key for key in state
+        if key.startswith("speaker_encoder.classifier.")
+    ]
+    for key in skipped_keys:
+        del state[key]
+
+    model.load_state_dict(state, strict=True)
+    return _checkpoint_info_from_payload(
+        payload,
+        skipped_classifier_keys=skipped_keys,
+    )
 
 
 def build_model_from_checkpoint(
@@ -124,13 +136,18 @@ def build_model_from_checkpoint(
                 "Checkpoint is incompatible with the learnable d-vector TSE pipeline."
             ) from exc
     elif encoder_type in {"campplus-frozen", "campplus-finetune"}:
+        projection_type = cfg.get("campplus_projection_type", "linear")
+        projection_hidden_dim = int(cfg.get("campplus_projection_hidden_dim", 384))
         model = WulfeniteTSE.from_campplus(
             campplus_checkpoint=None,
             separator_config=separator_config,
             freeze_backbone=encoder_type == "campplus-frozen",
+            num_speakers=None,
+            projection_type=projection_type,
+            projection_hidden_dim=projection_hidden_dim,
         )
         try:
-            info = _load_checkpoint_strict(checkpoint, model, device="cpu")
+            info = _load_campplus_checkpoint(checkpoint, model, device="cpu")
         except RuntimeError as exc:
             raise RuntimeError(
                 "Checkpoint is incompatible with the CAM++ TSE pipeline."

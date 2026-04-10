@@ -262,12 +262,20 @@ class LearnableDVector(nn.Module):
             self.train()
         return norm_emb
 
-    def optimizer_groups(self, cfg: "TrainingConfig") -> list[dict]:
+    def optimizer_groups(
+        self,
+        cfg: "TrainingConfig",
+        base_lr: float | None = None,
+    ) -> list[dict]:
         """Return the learnable encoder optimizer group."""
+        lr = (
+            cfg.learning_rate * cfg.encoder_lr_scale
+            if base_lr is None else base_lr
+        )
         return [
             {
                 "name": "encoder",
                 "params": [p for p in self.parameters() if p.requires_grad],
-                "lr": cfg.learning_rate * cfg.encoder_lr_scale,
+                "lr": lr,
             }
         ]

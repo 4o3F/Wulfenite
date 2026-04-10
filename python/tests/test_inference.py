@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch import nn
 
 from wulfenite.inference.utils import build_model_from_checkpoint
 from wulfenite.models import SpeakerBeamSSConfig, WulfeniteTSE
@@ -41,8 +42,10 @@ def _separator_checkpoint_config(
     separator_config: SpeakerBeamSSConfig,
     *,
     encoder_type: str,
+    campplus_projection_type: str | None = None,
+    campplus_projection_hidden_dim: int | None = None,
 ) -> dict[str, int | str]:
-    return {
+    config: dict[str, int | str] = {
         "encoder_type": encoder_type,
         "enc_channels": separator_config.enc_channels,
         "bottleneck_channels": separator_config.bottleneck_channels,
@@ -52,6 +55,11 @@ def _separator_checkpoint_config(
         "r2_blocks": separator_config.r2_blocks,
         "s4d_state_dim": separator_config.s4d_state_dim,
     }
+    if campplus_projection_type is not None:
+        config["campplus_projection_type"] = campplus_projection_type
+    if campplus_projection_hidden_dim is not None:
+        config["campplus_projection_hidden_dim"] = campplus_projection_hidden_dim
+    return config
 
 
 def _tiny_tse() -> WulfeniteTSE:
@@ -74,11 +82,20 @@ def _checkpoint_tse(num_speakers: int = 4) -> WulfeniteTSE:
     ).eval()
 
 
-def _tiny_campplus_tse(freeze: bool) -> WulfeniteTSE:
+def _tiny_campplus_tse(
+    freeze: bool,
+    *,
+    num_speakers: int | None = None,
+    projection_type: str = "mlp",
+    projection_hidden_dim: int = 384,
+) -> WulfeniteTSE:
     return WulfeniteTSE.from_campplus(
         campplus_checkpoint=None,
         separator_config=_tiny_separator_config(),
         freeze_backbone=freeze,
+        num_speakers=num_speakers,
+        projection_type=projection_type,
+        projection_hidden_dim=projection_hidden_dim,
     ).eval()
 
 
@@ -198,6 +215,8 @@ def test_build_model_from_checkpoint_campplus_roundtrip(
         config=_separator_checkpoint_config(
             tse.separator.config,
             encoder_type=encoder_type,
+            campplus_projection_type="mlp",
+            campplus_projection_hidden_dim=384,
         ),
     )
 
@@ -210,6 +229,90 @@ def test_build_model_from_checkpoint_campplus_roundtrip(
 
     assert torch.allclose(before, after, atol=1e-6), (
         "CAM++ inference output diverged after checkpoint rebuild"
+    )
+
+
+def test_build_model_from_checkpoint_campplus_mlp_classifier_roundtrip(
+    tmp_path: Path,
+) -> None:
+    """CAM++ inference loading should strip classifier keys from MLP checkpoints."""
+    torch.manual_seed(40)
+    tse = _tiny_campplus_tse(
+        freeze=True,
+        num_speakers=4,
+        projection_type="mlp",
+        projection_hidden_dim=48,
+    )
+    T = 4 * tse.separator.config.enc_stride
+    mixture = torch.randn(1, T)
+    enrollment = torch.randn(SR)
+
+    with torch.no_grad():
+        before = tse(mixture, enrollment)["clean"]
+
+    ckpt_path = tmp_path / "campplus_mlp_classifier.pt"
+    save_checkpoint(
+        ckpt_path,
+        model=tse,
+        config=_separator_checkpoint_config(
+            tse.separator.config,
+            encoder_type="campplus-frozen",
+            campplus_projection_type="mlp",
+            campplus_projection_hidden_dim=48,
+        ),
+    )
+
+    loaded, info = build_model_from_checkpoint(ckpt_path)
+    assert loaded.speaker_encoder.classifier is None
+    assert info["skipped_classifier_keys"]
+    assert all(
+        key.startswith("speaker_encoder.classifier.")
+        for key in info["skipped_classifier_keys"]
+    )
+
+    with torch.no_grad():
+        after = loaded(mixture, enrollment)["clean"]
+
+    assert torch.allclose(before, after, atol=1e-6), (
+        "CAM++ MLP inference output diverged after classifier stripping"
+    )
+
+
+def test_build_model_from_checkpoint_campplus_legacy_linear_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """Legacy CAM++ checkpoints without projector metadata should load as linear."""
+    torch.manual_seed(41)
+    tse = _tiny_campplus_tse(
+        freeze=True,
+        projection_type="linear",
+    )
+    T = 4 * tse.separator.config.enc_stride
+    mixture = torch.randn(1, T)
+    enrollment = torch.randn(SR)
+
+    with torch.no_grad():
+        before = tse(mixture, enrollment)["clean"]
+
+    ckpt_path = tmp_path / "campplus_legacy_linear.pt"
+    save_checkpoint(
+        ckpt_path,
+        model=tse,
+        config=_separator_checkpoint_config(
+            tse.separator.config,
+            encoder_type="campplus-frozen",
+        ),
+    )
+
+    loaded, info = build_model_from_checkpoint(ckpt_path)
+    assert isinstance(loaded.speaker_encoder.to_separator, nn.Linear)
+    assert info["config"]["encoder_type"] == "campplus-frozen"
+
+    with torch.no_grad():
+        after = loaded(mixture, enrollment)["clean"]
+
+    assert torch.allclose(before, after, atol=1e-6), (
+        "Legacy CAM++ linear checkpoint failed to round-trip"
     )
 
 

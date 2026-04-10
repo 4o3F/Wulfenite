@@ -22,6 +22,8 @@ class TrainingConfig:
     cnceleb_root: Path | None = None
     noise_root: Path | None = None
     campplus_checkpoint: Path | None = None
+    campplus_projection_type: str = "mlp"
+    campplus_projection_hidden_dim: int = 384
 
     # --- Mixer ---
     segment_seconds: float = 4.0
@@ -61,7 +63,7 @@ class TrainingConfig:
     # --- Loss weights (matches LossWeights defaults) ---
     loss_sdr: float = 1.0
     loss_mr_stft: float = 1.0
-    loss_absent: float = 1.0
+    loss_absent: float = 0.5
     loss_presence: float = 0.1
     loss_speaker_cls: float = 0.2
 
