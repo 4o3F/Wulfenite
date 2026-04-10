@@ -16,9 +16,13 @@ separator call reuses the same L2-normalized embedding.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 from torch import nn
 
+from .campplus import CAMPPlus, load_campplus_cn_common
+from .campplus_encoder import CampPlusSpeakerEncoder, SpeakerEncoderOutput
 from .dvector import LearnableDVector, compute_fbank_batch
 from .speakerbeam_ss import SpeakerBeamSS, SpeakerBeamSSConfig
 
@@ -44,7 +48,7 @@ class WulfeniteTSE(nn.Module):
 
     def __init__(
         self,
-        speaker_encoder: LearnableDVector,
+        speaker_encoder: nn.Module,
         separator: SpeakerBeamSS | None = None,
     ) -> None:
         super().__init__()
@@ -72,6 +76,32 @@ class WulfeniteTSE(nn.Module):
             num_speakers=num_speakers,
             emb_dim=separator.config.bottleneck_channels,
             **(dvector_kwargs or {}),
+        )
+        return cls(
+            speaker_encoder=encoder,
+            separator=separator,
+        )
+
+    @classmethod
+    def from_campplus(
+        cls,
+        campplus_checkpoint: str | Path | None,
+        separator_config: SpeakerBeamSSConfig | None = None,
+        freeze_backbone: bool = True,
+    ) -> "WulfeniteTSE":
+        """Build a TSE model with a CAM++ speaker encoder."""
+        separator = SpeakerBeamSS(separator_config)
+        if campplus_checkpoint is None:
+            backbone = CAMPPlus()
+        else:
+            backbone = load_campplus_cn_common(
+                campplus_checkpoint,
+                freeze=False,
+            )
+        encoder = CampPlusSpeakerEncoder(
+            backbone=backbone,
+            bottleneck_dim=separator.config.bottleneck_channels,
+            freeze_backbone=freeze_backbone,
         )
         return cls(
             speaker_encoder=encoder,
@@ -144,8 +174,19 @@ class WulfeniteTSE(nn.Module):
         if enrollment.dim() == 1:
             enrollment = enrollment.unsqueeze(0)
 
-        fbank = compute_fbank_batch(enrollment)
-        raw_emb, norm_emb, logits = self.speaker_encoder(fbank)
+        if isinstance(self.speaker_encoder, LearnableDVector):
+            fbank = compute_fbank_batch(enrollment)
+            raw_emb, norm_emb, logits = self.speaker_encoder(fbank)
+        else:
+            encoder_out = self.speaker_encoder(enrollment)
+            if not isinstance(encoder_out, SpeakerEncoderOutput):
+                raise TypeError(
+                    "speaker_encoder must return either the learnable "
+                    "d-vector tuple or SpeakerEncoderOutput."
+                )
+            raw_emb = encoder_out.native_embedding
+            norm_emb = encoder_out.separator_embedding
+            logits = encoder_out.speaker_logits
         if norm_emb.size(0) == 1 and mixture.size(0) > 1:
             raw_emb = raw_emb.expand(mixture.size(0), -1)
             norm_emb = norm_emb.expand(mixture.size(0), -1)

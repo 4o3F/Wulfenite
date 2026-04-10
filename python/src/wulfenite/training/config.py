@@ -21,6 +21,7 @@ class TrainingConfig:
     magicdata_root: Path | None = None
     cnceleb_root: Path | None = None
     noise_root: Path | None = None
+    campplus_checkpoint: Path | None = None
 
     # --- Mixer ---
     segment_seconds: float = 4.0
@@ -67,3 +68,4 @@ class TrainingConfig:
     # --- Runtime ---
     device: str = "cuda"
     seed: int = 1234
+    encoder_type: str = "learnable"

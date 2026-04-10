@@ -158,12 +158,35 @@ def build_model(
     *,
     num_speakers: int | None = None,
 ) -> WulfeniteTSE:
-    """Build the TSE model with the trainable d-vector speaker encoder."""
-    if num_speakers is None:
-        raise RuntimeError(
-            "num_speakers must be provided to build the training model."
+    """Build the TSE model for the configured speaker encoder type."""
+    if cfg.encoder_type == "learnable":
+        if num_speakers is None:
+            raise RuntimeError(
+                "num_speakers must be provided to build the training model."
+            )
+        return WulfeniteTSE.from_learnable_dvector(num_speakers=num_speakers)
+
+    if cfg.encoder_type == "campplus-frozen":
+        if cfg.campplus_checkpoint is None:
+            raise RuntimeError(
+                "campplus-frozen requires --campplus-checkpoint."
+            )
+        return WulfeniteTSE.from_campplus(
+            cfg.campplus_checkpoint,
+            freeze_backbone=True,
         )
-    return WulfeniteTSE.from_learnable_dvector(num_speakers=num_speakers)
+
+    if cfg.encoder_type == "campplus-finetune":
+        if cfg.campplus_checkpoint is None:
+            raise RuntimeError(
+                "campplus-finetune requires --campplus-checkpoint."
+            )
+        return WulfeniteTSE.from_campplus(
+            cfg.campplus_checkpoint,
+            freeze_backbone=False,
+        )
+
+    raise ValueError(f"Unsupported encoder_type: {cfg.encoder_type}")
 
 
 def build_loss(cfg: TrainingConfig) -> WulfeniteLoss:
@@ -184,19 +207,17 @@ def build_optimizer(
     total_steps: int | None = None,
 ) -> tuple[torch.optim.Optimizer, SchedulerT]:
     """Build the optimizer and optional LR scheduler."""
+    encoder_groups = model.speaker_encoder.optimizer_groups(cfg)
+    param_groups = [*encoder_groups]
+    param_groups.append(
+        {
+            "name": "separator",
+            "params": [p for p in model.separator.parameters() if p.requires_grad],
+            "lr": cfg.learning_rate,
+        }
+    )
     optimizer = torch.optim.Adam(
-        [
-            {
-                "params": [
-                    p for p in model.speaker_encoder.parameters() if p.requires_grad
-                ],
-                "lr": cfg.learning_rate * cfg.encoder_lr_scale,
-            },
-            {
-                "params": [p for p in model.separator.parameters() if p.requires_grad],
-                "lr": cfg.learning_rate,
-            },
-        ],
+        param_groups,
         weight_decay=cfg.weight_decay,
     )
     scheduler: SchedulerT = None
@@ -237,12 +258,11 @@ def _move_batch(batch: dict, device: torch.device, non_blocking: bool) -> dict:
 
 
 def _format_lr(optimizer: torch.optim.Optimizer) -> str:
-    if len(optimizer.param_groups) == 1:
-        return f"lr={optimizer.param_groups[0]['lr']:.2e}"
-    return (
-        f"lr_e={optimizer.param_groups[0]['lr']:.2e} "
-        f"lr_s={optimizer.param_groups[1]['lr']:.2e}"
-    )
+    parts = []
+    for i, group in enumerate(optimizer.param_groups):
+        name = group.get("name", f"g{i}")
+        parts.append(f"lr_{name}={group['lr']:.2e}")
+    return " ".join(parts)
 
 
 @torch.no_grad()
@@ -673,14 +693,16 @@ def run_training(
             cfg,
             num_speakers=len(train_ds.speaker_ids),
         )
-    elif model.speaker_encoder.classifier is None:
-        raise ValueError(
-            "Training requires a d-vector encoder with a classifier head."
-        )
-    elif model.speaker_encoder.classifier.out_features != len(train_ds.speaker_ids):
-        raise ValueError(
-            "Provided model classifier size must match the training speaker set."
-        )
+    elif getattr(model.speaker_encoder, "supports_classifier", False):
+        classifier = getattr(model.speaker_encoder, "classifier", None)
+        if classifier is None:
+            raise ValueError(
+                "Training requires a d-vector encoder with a classifier head."
+            )
+        if classifier.out_features != len(train_ds.speaker_ids):
+            raise ValueError(
+                "Provided model classifier size must match the training speaker set."
+            )
     model = model.to(device)
 
     criterion = build_loss(cfg).to(device)
@@ -721,16 +743,19 @@ def run_training(
         pin_memory=pin_memory,
         drop_last=False,
     )
-    run_encoder_pretrain(
-        cfg,
-        model,
-        train_loader,
-        probe_loader,
-        device,
-        cfg.encoder_pretrain_epochs,
-        log,
-        show_progress=show_progress,
-    )
+    if getattr(model.speaker_encoder, "supports_pretrain", False):
+        run_encoder_pretrain(
+            cfg,
+            model,
+            train_loader,
+            probe_loader,
+            device,
+            cfg.encoder_pretrain_epochs,
+            log,
+            show_progress=show_progress,
+        )
+    elif cfg.encoder_pretrain_epochs > 0:
+        log("[pretrain] skipped: selected speaker encoder does not support it")
 
     optimizer, scheduler = build_optimizer(model, cfg)
 
@@ -777,9 +802,13 @@ def run_training(
             **{f"val_{k}": v for k, v in val_parts.items()},
         }
 
-        top1 = compute_speaker_top1_accuracy(
-            model, probe_loader, device, max_batches=None
-        )
+        diag_parts = []
+        if getattr(model.speaker_encoder, "supports_classifier", False):
+            top1 = compute_speaker_top1_accuracy(
+                model, probe_loader, device, max_batches=None
+            )
+            metrics["speaker_top1"] = top1
+            diag_parts.append(f"top1={top1:.3f}")
         same, diff, gap = compute_same_diff_cosine_gap(
             model, val_loader, device, max_batches=None
         )
@@ -797,20 +826,20 @@ def run_training(
         )
         metrics.update(
             {
-                "speaker_top1": top1,
                 "shuffle_sdr_drop": shuffle_drop,
                 "same_cosine": same,
                 "diff_cosine": diff,
                 "cosine_gap": gap,
             }
         )
-        diag_parts = [
-            f"top1={top1:.3f}",
-            f"shuffle_drop={shuffle_drop:.3f}",
-            f"same_cos={same:.3f}",
-            f"diff_cos={diff:.3f}",
-            f"cos_gap={gap:.3f}",
-        ]
+        diag_parts.extend(
+            [
+                f"shuffle_drop={shuffle_drop:.3f}",
+                f"same_cos={same:.3f}",
+                f"diff_cos={diff:.3f}",
+                f"cos_gap={gap:.3f}",
+            ]
+        )
 
         log(
             f"epoch {epoch} train_loss={train_loss:+.4f} val_loss={val_loss:+.4f} "
@@ -901,6 +930,12 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--encoder-pretrain-epochs", type=int, default=5)
     parser.add_argument("--encoder-pretrain-lr", type=float, default=3e-4)
     parser.add_argument("--encoder-lr-scale", type=float, default=0.25)
+    parser.add_argument(
+        "--encoder-type",
+        choices=("learnable", "campplus-frozen", "campplus-finetune"),
+        default="learnable",
+    )
+    parser.add_argument("--campplus-checkpoint", type=Path, default=None)
     # Loss
     parser.add_argument("--loss-sdr", type=float, default=1.0)
     parser.add_argument("--loss-mr-stft", type=float, default=1.0)
@@ -925,6 +960,7 @@ def _parse_args() -> TrainingConfig:
         magicdata_root=args.magicdata_root,
         cnceleb_root=args.cnceleb_root,
         noise_root=args.noise_root,
+        campplus_checkpoint=args.campplus_checkpoint,
         segment_seconds=args.segment_seconds,
         enrollment_seconds=args.enrollment_seconds,
         snr_range_db=tuple(args.snr_range_db),
@@ -959,6 +995,7 @@ def _parse_args() -> TrainingConfig:
         save_every_epoch=not args.no_save_every_epoch,
         device=args.device,
         seed=args.seed,
+        encoder_type=args.encoder_type,
     )
 
 

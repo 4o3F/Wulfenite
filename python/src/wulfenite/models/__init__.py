@@ -13,12 +13,15 @@ the higher-level ``WulfeniteTSE`` wrapper.
 """
 
 from .dvector import LearnableDVector, SpecAugment, compute_fbank_batch
+from .campplus_encoder import CampPlusSpeakerEncoder, SpeakerEncoderOutput
 from .s4d import S4D
 from .speakerbeam_ss import SpeakerBeamSS, SpeakerBeamSSConfig
 from .tse import WulfeniteTSE
 
 __all__ = [
+    "CampPlusSpeakerEncoder",
     "LearnableDVector",
+    "SpeakerEncoderOutput",
     "SpecAugment",
     "compute_fbank_batch",
     "S4D",

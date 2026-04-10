@@ -8,10 +8,15 @@ L2-normalized embedding.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn.functional as F
 import torchaudio.compliance.kaldi as kaldi
 from torch import nn
+
+if TYPE_CHECKING:
+    from ..training.config import TrainingConfig
 
 SAMPLE_RATE = 16000
 FEAT_DIM = 80
@@ -195,6 +200,9 @@ class SpecAugment(nn.Module):
 class LearnableDVector(nn.Module):
     """Small x-vector-style speaker encoder used in Plan C5."""
 
+    supports_classifier = True
+    supports_pretrain = True
+
     def __init__(
         self,
         num_speakers: int | None = None,
@@ -253,3 +261,13 @@ class LearnableDVector(nn.Module):
         if was_training:
             self.train()
         return norm_emb
+
+    def optimizer_groups(self, cfg: "TrainingConfig") -> list[dict]:
+        """Return the learnable encoder optimizer group."""
+        return [
+            {
+                "name": "encoder",
+                "params": [p for p in self.parameters() if p.requires_grad],
+                "lr": cfg.learning_rate * cfg.encoder_lr_scale,
+            }
+        ]

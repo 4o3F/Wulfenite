@@ -442,20 +442,22 @@ def encode_enrollment(
 def load_campplus_cn_common(
     checkpoint_path: str | Path,
     device: str | torch.device = "cpu",
+    freeze: bool = False,
 ) -> CAMPPlus:
     """Load the CAM++ zh-cn 192-dim common checkpoint into a CAMPPlus instance.
 
     The ``iic/speech_campplus_sv_zh-cn_16k-common`` checkpoint from
     ModelScope is distributed as a plain ``state_dict`` .bin file.
-    Keeps the returned model in ``eval()`` mode so frozen inference is
-    the default; the caller can explicitly ``.train()`` if they want.
+    The returned module is left trainable by default so the higher-level
+    adapter can decide whether to freeze or fine-tune it.
     """
     model = CAMPPlus(feat_dim=FEAT_DIM, embedding_size=EMBEDDING_SIZE)
     state = torch.load(str(checkpoint_path), map_location=device, weights_only=True)
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
     model.load_state_dict(state, strict=True)
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
+    if freeze:
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
     return model

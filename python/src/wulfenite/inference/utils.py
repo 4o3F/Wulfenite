@@ -77,22 +77,40 @@ def _load_learnable_checkpoint(
         key for key in state
         if key.startswith("speaker_encoder.classifier.")
     ]
-    for key in classifier_keys:
+    skipped_keys = classifier_keys + [
+        key
+        for key in state
+        if key.startswith("speaker_encoder.backbone.")
+        or key.startswith("speaker_encoder.to_separator.")
+    ]
+    for key in skipped_keys:
         del state[key]
 
     model.load_state_dict(state, strict=True)
     return _checkpoint_info_from_payload(
         payload,
-        skipped_classifier_keys=classifier_keys,
+        skipped_classifier_keys=skipped_keys,
     )
+
+
+def _load_checkpoint_strict(
+    checkpoint: Path,
+    model: WulfeniteTSE,
+    device: str | torch.device = "cpu",
+) -> dict[str, Any]:
+    """Load a checkpoint into a model whose architecture already matches."""
+    payload = torch.load(str(checkpoint), map_location=device, weights_only=False)
+    model.load_state_dict(payload["model_state_dict"], strict=True)
+    return _checkpoint_info_from_payload(payload)
 
 
 def build_model_from_checkpoint(
     checkpoint: Path,
     device: str | torch.device = "cpu",
 ) -> tuple[WulfeniteTSE, dict[str, Any]]:
-    """Build and load a learnable-dvector TSE model from a checkpoint."""
+    """Build and load a Wulfenite TSE model from a checkpoint."""
     cfg = peek_checkpoint_config(checkpoint)
+    encoder_type = cfg.get("encoder_type", "learnable")
 
     # Rebuild separator config from checkpoint metadata when available,
     # so legacy checkpoints with different defaults (e.g. 512/192) load
@@ -100,16 +118,31 @@ def build_model_from_checkpoint(
     separator_config = _rebuild_separator_config(cfg)
 
     dev = torch.device(device)
-    model = WulfeniteTSE.from_learnable_dvector(
-        num_speakers=None,
-        separator_config=separator_config,
-    )
-    try:
-        info = _load_learnable_checkpoint(checkpoint, model, device="cpu")
-    except RuntimeError as exc:
-        raise RuntimeError(
-            "Checkpoint is incompatible with the learnable d-vector TSE pipeline."
-        ) from exc
+    if encoder_type == "learnable":
+        model = WulfeniteTSE.from_learnable_dvector(
+            num_speakers=None,
+            separator_config=separator_config,
+        )
+        try:
+            info = _load_learnable_checkpoint(checkpoint, model, device="cpu")
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Checkpoint is incompatible with the learnable d-vector TSE pipeline."
+            ) from exc
+    elif encoder_type in {"campplus-frozen", "campplus-finetune"}:
+        model = WulfeniteTSE.from_campplus(
+            campplus_checkpoint=None,
+            separator_config=separator_config,
+            freeze_backbone=encoder_type == "campplus-frozen",
+        )
+        try:
+            info = _load_checkpoint_strict(checkpoint, model, device="cpu")
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Checkpoint is incompatible with the CAM++ TSE pipeline."
+            ) from exc
+    else:
+        raise RuntimeError(f"Unsupported encoder_type in checkpoint: {encoder_type}")
 
     model = model.to(dev).eval()
     return model, info

@@ -43,6 +43,13 @@ Three clean Chinese speech datasets (AISHELL-1/3 + MAGICDATA) with
 on-the-fly mixing. See [`docs/TRAIN.md`](docs/TRAIN.md) for dataset
 download and preparation.
 
+Training uses Adam with ReduceLROnPlateau, early stopping (patience 20),
+and selects the best checkpoint by max `val_sdri_db` on speaker-disjoint
+validation. If the N=4096 separator OOMs on your GPU, try `--batch-size 12`
+or `--batch-size 8`.
+
+**Learnable d-vector** (default, trains encoder from scratch):
+
 ```bash
 uv run --directory python python -m wulfenite.training.train \
     --aishell1-root ../assets/aishell1 \
@@ -55,10 +62,38 @@ uv run --directory python python -m wulfenite.training.train \
     --lr 5e-4
 ```
 
-Training uses Adam with ReduceLROnPlateau, early stopping (patience 20),
-and selects the best checkpoint by max `val_sdri_db` on speaker-disjoint
-validation. If the N=4096 separator OOMs on your GPU, try `--batch-size 12`
-or `--batch-size 8`.
+**Frozen CAM++** (pretrained 200k-speaker encoder, only projection +
+separator train):
+
+```bash
+uv run --directory python python -m wulfenite.training.train \
+    --encoder-type campplus-frozen \
+    --campplus-checkpoint ../assets/campplus_cn_common.bin \
+    --aishell1-root ../assets/aishell1 \
+    --aishell3-root ../assets/aishell3 \
+    --magicdata-root ../assets/magicdata \
+    --noise-root ../assets/musan/noise \
+    --out-dir ../assets/checkpoints/phase3-campplus-frozen \
+    --batch-size 16 \
+    --epochs 200 \
+    --lr 5e-4
+```
+
+**Fine-tune CAM++** (pretrained encoder jointly trained at lower LR):
+
+```bash
+uv run --directory python python -m wulfenite.training.train \
+    --encoder-type campplus-finetune \
+    --campplus-checkpoint ../assets/campplus_cn_common.bin \
+    --aishell1-root ../assets/aishell1 \
+    --aishell3-root ../assets/aishell3 \
+    --magicdata-root ../assets/magicdata \
+    --noise-root ../assets/musan/noise \
+    --out-dir ../assets/checkpoints/phase3-campplus-finetune \
+    --batch-size 16 \
+    --epochs 200 \
+    --lr 5e-4
+```
 
 ### Inference
 
@@ -89,7 +124,7 @@ uv run --directory python python -m wulfenite.inference.streaming \
 uv run --directory python pytest tests/ -v
 ```
 
-Expected: **67 passed**. Tests cover model shapes, streaming/forward
+Expected: **73 passed**. Tests cover model shapes, streaming/forward
 equivalence, FiLM initialization, SDR metric helpers, data scanners,
 and training smoke tests. No external datasets or GPU required.
 
