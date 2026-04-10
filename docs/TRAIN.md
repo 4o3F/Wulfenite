@@ -206,12 +206,12 @@ uv run --directory python python -m wulfenite.scripts.resample_cnceleb \
     --root ../assets/CN-Celeb_flac
 ```
 
-Or with GNU ``parallel`` + ffmpeg (converts FLAC to 16 kHz WAV and
-removes the original FLAC files):
+Or with GNU ``parallel`` + ffmpeg (converts all FLAC to 16 kHz WAV
+with a progress bar, then removes the original FLAC files):
 
 ```bash
-find assets/CN-Celeb_flac/data -type f -name '*.flac' | \
-  parallel ffmpeg -y -loglevel error -i {} -ar 16000 -ac 1 -c:a pcm_s16le {.}.wav '&&' rm {}
+find assets/CN-Celeb_flac -type f -name '*.flac' | \
+  parallel --bar ffmpeg -y -loglevel error -i {} -ar 16000 -ac 1 -c:a pcm_s16le {.}.wav '&&' rm {}
 ```
 
 ### MUSAN noise (~3.6 GB — recommended default)

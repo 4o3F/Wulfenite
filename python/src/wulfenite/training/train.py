@@ -89,9 +89,13 @@ def build_dataset(cfg: TrainingConfig) -> tuple[WulfeniteMixer, WulfeniteMixer]:
     """Scan datasets, split speakers, and assemble train + val mixers."""
     speakers: dict = {}
     if cfg.aishell1_root is not None:
-        speakers = scan_aishell1(cfg.aishell1_root)
+        # Use all splits — our own speaker-disjoint split supersedes
+        # the dataset's original train/dev/test partition.
+        speakers = scan_aishell1(cfg.aishell1_root, splits=("train", "dev", "test"))
     if cfg.aishell3_root is not None:
-        speakers = merge_speaker_dicts(speakers, scan_aishell3(cfg.aishell3_root))
+        speakers = merge_speaker_dicts(
+            speakers, scan_aishell3(cfg.aishell3_root, splits=("train", "test")),
+        )
     if cfg.cnceleb_root is not None:
         speakers = merge_speaker_dicts(speakers, scan_cnceleb(cfg.cnceleb_root))
     if not speakers:
