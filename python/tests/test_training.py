@@ -155,7 +155,7 @@ def test_training_config_defaults() -> None:
     assert cfg.enrollment_seconds == 4.0
     assert cfg.loss_sdr == 1.0
     assert cfg.use_learnable_encoder is False
-    assert cfg.loss_speaker_cls == 0.3
+    assert cfg.loss_speaker_cls == 0.2
 
 
 # ---------------------------------------------------------------------------

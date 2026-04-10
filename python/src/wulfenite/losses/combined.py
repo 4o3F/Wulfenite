@@ -50,7 +50,7 @@ class LossWeights:
     mr_stft: float = 1.0
     absent: float = 1.0
     presence: float = 0.1
-    speaker_cls: float = 0.3
+    speaker_cls: float = 0.2
 
 
 @dataclass
