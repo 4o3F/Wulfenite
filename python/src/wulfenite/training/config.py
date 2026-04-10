@@ -18,9 +18,9 @@ class TrainingConfig:
     # --- Data paths ---
     aishell1_root: Path | None = None
     aishell3_root: Path | None = None
+    magicdata_root: Path | None = None
     cnceleb_root: Path | None = None
     noise_root: Path | None = None
-    campplus_checkpoint: Path | None = None
 
     # --- Mixer ---
     segment_seconds: float = 4.0
@@ -33,12 +33,15 @@ class TrainingConfig:
 
     # --- Optimization ---
     batch_size: int = 16
-    epochs: int = 50
+    epochs: int = 200
     samples_per_epoch: int = 20000
     val_samples: int = 500
-    lr: float = 1e-3
-    weight_decay: float = 1e-5
-    warmup_ratio: float = 0.03
+    learning_rate: float = 5e-4
+    weight_decay: float = 0.0
+    use_plateau_scheduler: bool = True
+    plateau_patience: int = 5
+    plateau_factor: float = 0.5
+    early_stopping_patience: int = 20
     grad_clip: float = 5.0
     encoder_pretrain_epochs: int = 5
     encoder_pretrain_lr: float = 3e-4
@@ -64,4 +67,3 @@ class TrainingConfig:
     # --- Runtime ---
     device: str = "cuda"
     seed: int = 1234
-    use_learnable_encoder: bool = False

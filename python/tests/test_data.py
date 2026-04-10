@@ -28,6 +28,7 @@ from wulfenite.data import (
     scan_aishell1,
     scan_aishell3,
     scan_cnceleb,
+    scan_magicdata,
     scan_noise_dir,
     synth_room_rir,
 )
@@ -109,6 +110,27 @@ def _build_fake_cnceleb(root: Path, num_speakers: int = 3,
     return root
 
 
+def _build_fake_magicdata(
+    root: Path,
+    num_speakers: int = 3,
+    utts_per_speaker: int = 4,
+    seconds: float = 2.0,
+    nested_wav_dir: bool = False,
+) -> Path:
+    base = root / "wav" if nested_wav_dir else root
+    split_dir = base / "train"
+    for s in range(num_speakers):
+        spk_id = f"{s:02d}_{1000 + s}"
+        for u in range(utts_per_speaker):
+            freq = 260 + 35 * s + 4 * u
+            _write_sine_wav(
+                split_dir / spk_id / f"{spk_id}_{u:04d}.wav",
+                seconds,
+                freq,
+            )
+    return root
+
+
 def _build_fake_noise_dir(root: Path, num_files: int = 4,
                          seconds: float = 3.0) -> Path:
     """Write a flat directory of noise wavs under ``root``."""
@@ -156,6 +178,14 @@ def test_scan_aishell3(tmp_path: Path) -> None:
     speakers = scan_aishell3(root)
     assert len(speakers) == 3
     assert all(k.startswith("SSB") for k in speakers.keys())
+
+
+def test_scan_magicdata_prefixes_speakers(tmp_path: Path) -> None:
+    root = _build_fake_magicdata(tmp_path / "magicdata", nested_wav_dir=True)
+    speakers = scan_magicdata(root)
+    assert len(speakers) == 3
+    assert all(k.startswith("MD_") for k in speakers.keys())
+    assert all(u.dataset == "magicdata" for utts in speakers.values() for u in utts)
 
 
 def test_scan_cnceleb(tmp_path: Path) -> None:

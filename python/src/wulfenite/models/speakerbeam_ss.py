@@ -11,11 +11,13 @@ Architecture at a glance:
         ↓ learned encoder (Conv1d kernel=320, hop=160, causal)
     encoded features [B, N_enc, L]
         ↓ bottleneck conv (Conv1d 1×1)
-    bottleneck [B, B, L]                          ← B = 192, matches CAM++
+    bottleneck [B, B_dim, L]
         ↓ FiLM speaker conditioning  (affine modulation from L2-normed embedding)
-    conditioned [B, B, L]
-        ↓ separator stack  (num_blocks * TCN+S4D block, all causal)
-    refined [B, B, L]
+    conditioned [B, B_dim, L]
+        ↓ separator stack
+          repeat x2:
+            TCN(d=1), TCN(d=2), TCN(d=4), S4D+FC, TCN(d=8)
+    refined [B, B_dim, L]
         ↓ mask head (Conv1d 1×1 → sigmoid)  +  presence head (Linear → logit)
     mask [B, N_enc, L]
         ↓ masked encoded (element-wise multiply)
@@ -23,29 +25,23 @@ Architecture at a glance:
         ↓ learned decoder (ConvTranspose1d kernel=320, hop=160)
     clean waveform [B, T]
 
-The critical design choices from `docs/architecture.md`:
+Default config matches the paper-faithful Phase 3 recipe:
 
-- Bottleneck dimension **B = 192** to match CAM++'s 192-dim output
-  directly, eliminating any projection layer between the encoder and
-  the separator. Speaker fusion is pure multiplicative adaptation on
-  an already-L2-normalized embedding.
-- Fully causal: every Conv1d in the post-encoder path is a
-  ``CausalConv1d`` from :mod:`wulfenite.models.layers`, and every
-  normalization is cLN.
-- S4D blocks provide long-range temporal context; the 2-block stack
-  follows the paper's "SS-2" configuration (2 repetitions, not 8 like
-  baseline TD-SpeakerBeam, because S4D is more sample-efficient).
-- The model exposes BOTH ``forward`` (whole-sequence training) and
-  ``forward_step`` (stateful streaming). The two must agree
-  numerically; the per-module streaming state carries S4D modes and
-  causal-conv left-context buffers.
+- encoder channels ``N = 4096``
+- bottleneck channels ``B = 256``
+- hidden channels ``H = 512``
+- S4D state dim ``D = 32``
+- block topology ``2 × (3 TCN + 1 S4D + 1 TCN)``
 
-Parameter count at default config: ~7.9 M.
+The model exposes both ``forward`` (whole-sequence training) and
+``streaming_step`` (stateful inference). In eval mode the two must agree
+numerically; the per-module streaming state carries S4D modes and
+causal-conv left-context buffers.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -63,9 +59,7 @@ from .s4d import S4D
 class SpeakerBeamSSConfig:
     """Hyperparameter bundle for SpeakerBeam-SS.
 
-    The defaults match the paper's low-latency (40 ms) variant with
-    the Wulfenite-specific change of bottleneck ``B = 192`` to accept
-    CAM++ embeddings without a projection.
+    The defaults match the paper-faithful low-latency (40 ms) variant.
     """
 
     sample_rate: int = 16000
@@ -73,19 +67,20 @@ class SpeakerBeamSSConfig:
     # Encoder / decoder (learned 1-D conv, matches SpeakerBeam-SS paper).
     enc_kernel_size: int = 320   # 20 ms @ 16 kHz
     enc_stride: int = 160        # 10 ms hop
-    enc_channels: int = 512
+    enc_channels: int = 4096
 
-    # Separator bottleneck — must equal the speaker embedding dim.
-    bottleneck_channels: int = 192
+    # Separator bottleneck.
+    bottleneck_channels: int = 256
 
     # TCN+S4D block stack.
     num_repeats: int = 2         # "SS-2" in the paper
-    num_blocks_per_repeat: int = 8
+    r1_blocks: int = 3           # TCN blocks before S4D
+    r2_blocks: int = 1           # TCN blocks after S4D
     conv_kernel_size: int = 3
     hidden_channels: int = 512   # "H" in the paper
 
     # S4D block.
-    s4d_state_dim: int = 64
+    s4d_state_dim: int = 32
 
     # Auxiliary heads.
     target_presence_head: bool = True
@@ -162,25 +157,37 @@ class TCNBlock(nn.Module):
 
 
 class S4DBlock(nn.Module):
-    """Wrap an S4D layer in a cLN + PReLU + residual shell.
+    """Paper-faithful S4D block: cLN -> S4D -> FC MLP -> dropout -> residual.
 
     The enclosing shape is ``[B, C, T]`` (channels-first) to match the
     TCN block; internally we transpose into the S4D's ``[B, T, C]``
     convention.
     """
 
-    def __init__(self, channels: int, d_state: int) -> None:
+    def __init__(
+        self,
+        channels: int,
+        d_state: int,
+        hidden_channels: int,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
         self.norm = ChannelwiseLayerNorm(channels)
-        self.prelu = nn.PReLU(channels)
         self.s4d = S4D(d_model=channels, d_state=d_state, transposed=False)
+        self.fc_in = nn.Linear(channels, hidden_channels)
+        self.activation = nn.PReLU(hidden_channels)
+        self.fc_out = nn.Linear(hidden_channels, channels)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.norm(x)
-        y = self.prelu(y)
         # S4D (transposed=False) expects [B, T, C]
         y = y.transpose(1, 2)
         y = self.s4d(y)
+        y = self.fc_in(y)
+        y = self.activation(y.transpose(1, 2)).transpose(1, 2)
+        y = self.fc_out(y)
+        y = self.dropout(y)
         y = y.transpose(1, 2)
         return x + y
 
@@ -207,7 +214,6 @@ class S4DBlock(nn.Module):
             streaming protocol (one state update per timestep).
         """
         y = self.norm(x_new)
-        y = self.prelu(y)
         # [B, C, T_new] → iterate over T_new
         outputs = []
         cur_state = state
@@ -215,6 +221,12 @@ class S4DBlock(nn.Module):
             y_t, cur_state = self.s4d.forward_step(y[..., t], cur_state)
             outputs.append(y_t)
         out = torch.stack(outputs, dim=-1)  # [B, C, T_new]
+        out = out.transpose(1, 2)
+        out = self.fc_in(out)
+        out = self.activation(out.transpose(1, 2)).transpose(1, 2)
+        out = self.fc_out(out)
+        out = self.dropout(out)
+        out = out.transpose(1, 2)
         return x_new + out, cur_state
 
 
@@ -226,13 +238,13 @@ class S4DBlock(nn.Module):
 class SpeakerBeamSS(nn.Module):
     """SpeakerBeam-SS target speaker extractor.
 
-    Takes a mixture waveform and an L2-normalized 192-d speaker
+    Takes a mixture waveform and an L2-normalized bottleneck-dim speaker
     embedding, returns the estimated target waveform and an optional
     target-presence logit.
 
-    The embedding is expected to have been produced by
-    :func:`wulfenite.models.campplus.encode_enrollment` on the user's
-    enrollment audio and cached for the entire session.
+    The embedding is expected to have been produced by the speaker
+    encoder on the user's enrollment audio and cached for the entire
+    session.
     """
 
     def __init__(self, config: SpeakerBeamSSConfig | None = None) -> None:
@@ -264,10 +276,10 @@ class SpeakerBeamSS(nn.Module):
             cfg.enc_channels, cfg.bottleneck_channels, 1
         )
 
-        # --- Separator stack: alternating TCN + S4D blocks ---
+        # --- Separator stack: per repeat = 3 TCN, 1 S4D, 1 TCN ---
         self.blocks = nn.ModuleList()
         for _ in range(cfg.num_repeats):
-            for i in range(cfg.num_blocks_per_repeat):
+            for i in range(cfg.r1_blocks):
                 dilation = 2 ** i
                 self.blocks.append(TCNBlock(
                     in_channels=cfg.bottleneck_channels,
@@ -278,7 +290,16 @@ class SpeakerBeamSS(nn.Module):
             self.blocks.append(S4DBlock(
                 channels=cfg.bottleneck_channels,
                 d_state=cfg.s4d_state_dim,
+                hidden_channels=cfg.hidden_channels,
             ))
+            for i in range(cfg.r2_blocks):
+                dilation = 2 ** (cfg.r1_blocks + i)
+                self.blocks.append(TCNBlock(
+                    in_channels=cfg.bottleneck_channels,
+                    hidden_channels=cfg.hidden_channels,
+                    kernel_size=cfg.conv_kernel_size,
+                    dilation=dilation,
+                ))
 
         # --- FiLM speaker conditioning (Plan C2) ---
         # Plan B used multiplicative-only conditioning:
@@ -340,7 +361,7 @@ class SpeakerBeamSS(nn.Module):
         Args:
             feat: ``[B, bottleneck_channels, T]`` post-bottleneck features.
             speaker_embedding: ``[B, bottleneck_channels]`` L2-normalized
-                CAM++ output (from ``encode_enrollment``).
+                speaker embedding (from ``encode_enrollment``).
 
         Returns:
             ``[B, bottleneck_channels, T]`` conditioned features.
@@ -379,7 +400,8 @@ class SpeakerBeamSS(nn.Module):
                 default). Values that are not will still run but
                 will have a few samples of boundary artifact at the
                 decoder end.
-            speaker_embedding: ``[B, 192]`` L2-normalized CAM++ output.
+            speaker_embedding: ``[B, bottleneck_channels]`` L2-normalized speaker
+                embedding.
 
         Returns:
             Dict with:
@@ -522,8 +544,8 @@ class SpeakerBeamSS(nn.Module):
             mixture_chunk: ``[B, T_chunk]`` new audio samples. ``T_chunk``
                 must be a positive multiple of ``enc_stride`` (160 by
                 default). Typical values: 160 (10 ms) or 320 (20 ms).
-            speaker_embedding: ``[B, 192]`` L2-normalized embedding,
-                normally computed once per session by CAM++.
+            speaker_embedding: ``[B, bottleneck_channels]`` L2-normalized
+                speaker embedding, normally computed once per session.
             state: dict from :meth:`initial_streaming_state` or the
                 previous call's second return value.
 

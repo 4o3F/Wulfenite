@@ -30,6 +30,88 @@ from __future__ import annotations
 import torch
 
 
+def _reduce(values: torch.Tensor, reduction: str) -> torch.Tensor:
+    if reduction == "mean":
+        return values.mean()
+    if reduction == "sum":
+        return values.sum()
+    if reduction == "none":
+        return values
+    raise ValueError(f"unknown reduction {reduction!r}")
+
+
+def _sdr_per_sample(
+    estimate: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+    zero_mean: bool = True,
+) -> torch.Tensor:
+    if estimate.shape != target.shape:
+        raise ValueError(
+            f"estimate shape {tuple(estimate.shape)} must equal "
+            f"target shape {tuple(target.shape)}"
+        )
+
+    if zero_mean:
+        estimate = estimate - estimate.mean(dim=-1, keepdim=True)
+        target = target - target.mean(dim=-1, keepdim=True)
+
+    error = estimate - target
+    target_energy = (target * target).sum(dim=-1)       # [B]
+    error_energy = (error * error).sum(dim=-1) + eps    # [B]
+    ratio = target_energy / error_energy
+    return 10.0 * torch.log10(ratio + eps)              # [B], positive = good
+
+
+def compute_sdr_db(
+    estimate: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+    zero_mean: bool = True,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Compute direct SDR in positive dB."""
+    sdr_per_sample = _sdr_per_sample(
+        estimate,
+        target,
+        eps=eps,
+        zero_mean=zero_mean,
+    )
+    return _reduce(sdr_per_sample, reduction)
+
+
+def compute_sdri_db(
+    estimate: torch.Tensor,
+    target: torch.Tensor,
+    mixture: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+    zero_mean: bool = True,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Compute direct SDR improvement over the input mixture."""
+    if mixture.shape != target.shape:
+        raise ValueError(
+            f"mixture shape {tuple(mixture.shape)} must equal "
+            f"target shape {tuple(target.shape)}"
+        )
+    estimate_sdr = _sdr_per_sample(
+        estimate,
+        target,
+        eps=eps,
+        zero_mean=zero_mean,
+    )
+    mixture_sdr = _sdr_per_sample(
+        mixture,
+        target,
+        eps=eps,
+        zero_mean=zero_mean,
+    )
+    return _reduce(estimate_sdr - mixture_sdr, reduction)
+
+
 def sdr_loss(
     estimate: torch.Tensor,
     target: torch.Tensor,
@@ -57,29 +139,10 @@ def sdr_loss(
     Returns:
         Scalar loss (``"mean"`` / ``"sum"``) or ``[B]`` (``"none"``).
     """
-    if estimate.shape != target.shape:
-        raise ValueError(
-            f"estimate shape {tuple(estimate.shape)} must equal "
-            f"target shape {tuple(target.shape)}"
-        )
-
-    if zero_mean:
-        estimate = estimate - estimate.mean(dim=-1, keepdim=True)
-        target = target - target.mean(dim=-1, keepdim=True)
-
-    error = estimate - target
-    target_energy = (target * target).sum(dim=-1)       # [B]
-    error_energy = (error * error).sum(dim=-1) + eps    # [B]
-
-    ratio = target_energy / error_energy
-    sdr_per_sample = 10.0 * torch.log10(ratio + eps)    # [B], positive = good
-
-    loss_per_sample = -sdr_per_sample                   # [B]
-
-    if reduction == "mean":
-        return loss_per_sample.mean()
-    if reduction == "sum":
-        return loss_per_sample.sum()
-    if reduction == "none":
-        return loss_per_sample
-    raise ValueError(f"unknown reduction {reduction!r}")
+    sdr_per_sample = _sdr_per_sample(
+        estimate,
+        target,
+        eps=eps,
+        zero_mean=zero_mean,
+    )
+    return _reduce(-sdr_per_sample, reduction)

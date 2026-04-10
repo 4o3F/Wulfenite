@@ -16,9 +16,10 @@ def _small_config() -> SpeakerBeamSSConfig:
     """A tiny config to keep the tests fast."""
     return SpeakerBeamSSConfig(
         enc_channels=32,
-        bottleneck_channels=16,   # keep in sync with the embedding in tests
+        bottleneck_channels=16,
         num_repeats=1,
-        num_blocks_per_repeat=2,
+        r1_blocks=1,
+        r2_blocks=1,
         hidden_channels=32,
         s4d_state_dim=8,
     )

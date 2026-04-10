@@ -419,9 +419,9 @@ def encode_enrollment(
 
     This is the one function called at Wulfenite session startup. It
     runs Kaldi FBank on the enrollment waveform, feeds it to CAM++,
-    and L2-normalizes the 192-d output so downstream separator code
-    can directly multiply it into the bottleneck features without any
-    additional conditioning or magnitude ambiguity.
+    and L2-normalizes the 192-d output. The frozen-path
+    :class:`wulfenite.models.tse.WulfeniteTSE` wrapper then projects
+    that raw CAM++ embedding into the separator bottleneck space.
 
     Args:
         model: a loaded ``CAMPPlus`` instance (typically from
@@ -431,8 +431,7 @@ def encode_enrollment(
         sample_rate: 16000.
 
     Returns:
-        ``[1, 192]`` unit-L2 speaker embedding ready to be fed to the
-        SpeakerBeam-SS separator's multiplicative fusion.
+        ``[1, 192]`` unit-L2 CAM++ speaker embedding.
     """
     fbank = compute_fbank(waveform, sample_rate=sample_rate)
     embedding = model(fbank)  # [1, 192]

@@ -17,6 +17,8 @@ from wulfenite.losses import (
     MultiResolutionSTFTLoss,
     STFTLoss,
     WulfeniteLoss,
+    compute_sdr_db,
+    compute_sdri_db,
     presence_loss,
     sdr_loss,
     target_absent_loss,
@@ -80,6 +82,23 @@ def test_sdr_per_sample_reduction() -> None:
     assert per_sample.shape == (3,)
     mean = sdr_loss(estimate, target, reduction="mean")
     assert torch.allclose(per_sample.mean(), mean)
+
+
+def test_compute_sdr_db_matches_negative_loss() -> None:
+    target = torch.randn(2, 8000)
+    estimate = torch.randn(2, 8000)
+    sdr_db = compute_sdr_db(estimate, target, reduction="mean")
+    loss = sdr_loss(estimate, target, reduction="mean")
+    assert torch.allclose(sdr_db, -loss)
+
+
+def test_compute_sdri_db_zero_for_passthrough() -> None:
+    torch.manual_seed(2)
+    target = torch.randn(2, 8000)
+    interferer = torch.randn(2, 8000)
+    mixture = target + interferer
+    sdri = compute_sdri_db(mixture, target, mixture, reduction="mean")
+    assert abs(float(sdri.item())) < 1e-5
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""AISHELL-1, AISHELL-3, and CN-Celeb dataset scanners.
+"""AISHELL-1, AISHELL-3, MAGICDATA, and CN-Celeb dataset scanners.
 
 Both datasets ship as directory trees of 16 kHz mono wav files grouped
 by speaker. Layouts differ slightly:
@@ -266,6 +266,67 @@ def scan_aishell3(
                 "mono. Run `python -m wulfenite.scripts.resample_aishell3 "
                 "--root ../assets/aishell3` once to convert in place, then "
                 "re-run training. See docs/TRAIN.md section 2."
+            ),
+        ))
+    return _group_by_speaker(entries, min_utts_per_speaker)
+
+
+# ---------------------------------------------------------------------------
+# MAGICDATA
+# ---------------------------------------------------------------------------
+
+
+def scan_magicdata(
+    root: Path | str,
+    splits: tuple[str, ...] = ("train", "dev", "test"),
+    min_utts_per_speaker: int = 2,
+) -> dict[str, list[AudioEntry]]:
+    """Scan MAGICDATA and return ``{speaker_id: [entries]}``.
+
+    Accepted layouts:
+
+    - ``<root>/{train,dev,test}/<speaker_id>/*.wav``
+    - ``<root>/wav/{train,dev,test}/<speaker_id>/*.wav``
+
+    Speaker ids are prefixed with ``MD_`` to avoid collisions with
+    other corpora in a merged training pool.
+    """
+    root = Path(root)
+    if (root / "wav").exists():
+        base = root / "wav"
+    else:
+        base = root
+
+    diagnostics: dict = {}
+    entries: list[AudioEntry] = []
+    scanned_dirs: list[Path] = []
+    for split in splits:
+        split_dir = base / split
+        scanned_dirs.append(split_dir)
+        split_entries = _scan_split(
+            split_dir,
+            dataset="magicdata",
+            diagnostics=diagnostics,
+        )
+        entries.extend(
+            AudioEntry(
+                speaker_id=f"MD_{entry.speaker_id}",
+                path=entry.path,
+                num_frames=entry.num_frames,
+                dataset=entry.dataset,
+            )
+            for entry in split_entries
+        )
+
+    if not entries:
+        raise RuntimeError(_format_empty_scan_error(
+            "MAGICDATA",
+            scanned_dirs,
+            diagnostics,
+            extra_hint=(
+                "Expected MAGICDATA under either "
+                "{train,dev,test}/<speaker_id>/*.wav or "
+                "wav/{train,dev,test}/<speaker_id>/*.wav."
             ),
         ))
     return _group_by_speaker(entries, min_utts_per_speaker)

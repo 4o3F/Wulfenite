@@ -13,7 +13,7 @@ Public entry points:
 from .combined import LossParts, LossWeights, WulfeniteLoss
 from .mr_stft import MultiResolutionSTFTLoss, STFTLoss
 from .presence import presence_loss
-from .sdr import sdr_loss
+from .sdr import compute_sdr_db, compute_sdri_db, sdr_loss
 from .silence import target_absent_loss
 
 __all__ = [
@@ -23,6 +23,8 @@ __all__ = [
     "MultiResolutionSTFTLoss",
     "STFTLoss",
     "presence_loss",
+    "compute_sdr_db",
+    "compute_sdri_db",
     "sdr_loss",
     "target_absent_loss",
 ]

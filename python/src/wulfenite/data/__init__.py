@@ -2,7 +2,8 @@
 
 Public entry points:
 - :class:`WulfeniteMixer` / :class:`MixerConfig` / :func:`collate_mixer_batch`
-- :func:`scan_aishell1` / :func:`scan_aishell3` / :func:`scan_cnceleb` /
+- :func:`scan_aishell1` / :func:`scan_aishell3` / :func:`scan_magicdata` /
+  :func:`scan_cnceleb` /
   :func:`merge_speaker_dicts`
 - :func:`scan_noise_dir`
 - :func:`synth_room_rir` / :func:`apply_rir` / :func:`add_noise_at_snr` /
@@ -16,6 +17,7 @@ from .aishell import (
     scan_aishell1,
     scan_aishell3,
     scan_cnceleb,
+    scan_magicdata,
 )
 from .augmentation import (
     ReverbConfig,
@@ -32,6 +34,7 @@ __all__ = [
     "merge_speaker_dicts",
     "scan_aishell1",
     "scan_aishell3",
+    "scan_magicdata",
     "scan_cnceleb",
     "ReverbConfig",
     "add_gaussian_noise",
