@@ -52,7 +52,7 @@ from ..losses import (
     compute_sdr_db,
     compute_sdri_db,
 )
-from ..models import WulfeniteTSE, compute_fbank_batch
+from ..models import LearnableDVector, WulfeniteTSE, compute_fbank_batch
 from .checkpoint import save_checkpoint
 from .config import TrainingConfig
 
@@ -134,6 +134,7 @@ def build_dataset(cfg: TrainingConfig) -> tuple[WulfeniteMixer, WulfeniteMixer]:
         noise_snr_range_db=tuple(cfg.noise_snr_range_db),
         noise_prob=cfg.noise_prob,
         reverb_prob=cfg.reverb_prob,
+        rir_pool_size=cfg.rir_pool_size,
         reverb=ReverbConfig(),
     )
     train_ds = WulfeniteMixer(
@@ -310,7 +311,9 @@ def compute_speaker_top1_accuracy(
     correct = 0
     for i, batch in enumerate(loader):
         batch = _move_batch(batch, device, non_blocking=pin)
-        fbank = compute_fbank_batch(batch["enrollment"])
+        fbank = batch.get("enrollment_fbank")
+        if fbank is None:
+            fbank = compute_fbank_batch(batch["enrollment"])
         _, _, logits = model.speaker_encoder(fbank)
         if logits is None:
             raise RuntimeError("Training diagnostics require a classifier head.")
@@ -338,7 +341,18 @@ def compute_same_diff_cosine_gap(
     labels: list[torch.Tensor] = []
     for i, batch in enumerate(loader):
         batch = _move_batch(batch, device, non_blocking=pin)
-        embeddings.append(model.encode_enrollment(batch["enrollment"]))
+        enrollment_fbank = batch.get("enrollment_fbank")
+        if isinstance(model.speaker_encoder, LearnableDVector):
+            if enrollment_fbank is None:
+                enrollment_fbank = compute_fbank_batch(batch["enrollment"])
+            _, norm_emb, _ = model.speaker_encoder(enrollment_fbank)
+            embeddings.append(norm_emb)
+        else:
+            encoder_out = model.speaker_encoder(
+                batch["enrollment"],
+                fbank=enrollment_fbank,
+            )
+            embeddings.append(encoder_out.separator_embedding)
         labels.append(batch["target_speaker_idx"])
         if max_batches is not None and i + 1 >= max_batches:
             break
@@ -382,7 +396,12 @@ def compute_enrollment_shuffle_sdr_drop(
     if int(present_mask.sum().item()) == 0:
         return 0.0
 
-    out_true = model(batch["mixture"], batch["enrollment"])
+    enrollment_fbank = batch.get("enrollment_fbank")
+    out_true = model(
+        batch["mixture"],
+        batch["enrollment"],
+        enrollment_fbank,
+    )
     sdr_true = float(
         compute_sdr_db(
             out_true["clean"][present_mask],
@@ -395,7 +414,11 @@ def compute_enrollment_shuffle_sdr_drop(
     if torch.equal(perm, torch.arange(perm.numel(), device=perm.device)):
         perm = perm.roll(1)
 
-    out_shuf = model(batch["mixture"], batch["enrollment"][perm])
+    out_shuf = model(
+        batch["mixture"],
+        batch["enrollment"][perm],
+        enrollment_fbank[perm] if enrollment_fbank is not None else None,
+    )
     sdr_shuf = float(
         compute_sdr_db(
             out_shuf["clean"][present_mask],
@@ -437,7 +460,11 @@ def train_one_epoch(
     for step, batch in enumerate(pbar):
         batch = _move_batch(batch, device, non_blocking=pin)
 
-        outputs = model(batch["mixture"], batch["enrollment"])
+        outputs = model(
+            batch["mixture"],
+            batch["enrollment"],
+            batch.get("enrollment_fbank"),
+        )
         loss, parts = criterion(
             clean=outputs["clean"],
             target=batch["target"],
@@ -517,7 +544,11 @@ def validate(
     )
     for batch in iterator:
         batch = _move_batch(batch, device, non_blocking=pin)
-        outputs = model(batch["mixture"], batch["enrollment"])
+        outputs = model(
+            batch["mixture"],
+            batch["enrollment"],
+            batch.get("enrollment_fbank"),
+        )
         _, parts = criterion(
             clean=outputs["clean"],
             target=batch["target"],
@@ -602,7 +633,9 @@ def run_encoder_pretrain(
         )
         for batch in pbar:
             batch = _move_batch(batch, device, non_blocking=pin)
-            fbank = compute_fbank_batch(batch["enrollment"])
+            fbank = batch.get("enrollment_fbank")
+            if fbank is None:
+                fbank = compute_fbank_batch(batch["enrollment"])
             _, _, logits = model.speaker_encoder(fbank)
             if logits is None:
                 raise RuntimeError(
@@ -915,6 +948,7 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--noise-snr-range-db", type=float, nargs=2, default=(10.0, 25.0))
     parser.add_argument("--noise-prob", type=float, default=0.80)
     parser.add_argument("--reverb-prob", type=float, default=0.85)
+    parser.add_argument("--rir-pool-size", type=int, default=1000)
     parser.add_argument("--val-speaker-ratio", type=float, default=0.2)
     # Optimizer
     parser.add_argument("--batch-size", type=int, default=16)
@@ -968,6 +1002,7 @@ def _parse_args() -> TrainingConfig:
         noise_snr_range_db=tuple(args.noise_snr_range_db),
         noise_prob=args.noise_prob,
         reverb_prob=args.reverb_prob,
+        rir_pool_size=args.rir_pool_size,
         batch_size=args.batch_size,
         epochs=args.epochs,
         samples_per_epoch=args.samples_per_epoch,

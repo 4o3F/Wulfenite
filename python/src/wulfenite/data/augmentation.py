@@ -83,7 +83,9 @@ def synth_room_rir(
     tau_samples = max(1.0, rt60 * cfg.sample_rate / (3.0 * math.log(10.0)))
     t = torch.arange(length, dtype=torch.float32)
     envelope = torch.exp(-t / tau_samples)
-    rir = rir + torch.randn(length) * envelope * cfg.diffuse_tail_scale
+    tail_gen = torch.Generator()
+    tail_gen.manual_seed(rng.getrandbits(63))
+    rir = rir + torch.randn(length, generator=tail_gen) * envelope * cfg.diffuse_tail_scale
 
     peak = float(rir.abs().max())
     if peak > 0:

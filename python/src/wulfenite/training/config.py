@@ -31,6 +31,7 @@ class TrainingConfig:
     noise_snr_range_db: tuple[float, float] = (10.0, 25.0)
     noise_prob: float = 0.80
     reverb_prob: float = 0.85
+    rir_pool_size: int = 1000
 
     # --- Optimization ---
     batch_size: int = 16

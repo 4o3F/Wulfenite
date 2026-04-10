@@ -71,9 +71,18 @@ class CampPlusSpeakerEncoder(nn.Module):
                 return self.backbone(fbank)
         return self.backbone(fbank)
 
-    def forward(self, waveform: torch.Tensor) -> SpeakerEncoderOutput:
-        """Encode raw waveform into separator-space speaker embeddings."""
-        fbank = compute_fbank_batch(waveform)
+    def forward(
+        self,
+        waveform: torch.Tensor | None = None,
+        fbank: torch.Tensor | None = None,
+    ) -> SpeakerEncoderOutput:
+        """Encode waveform or pre-computed FBank into speaker embeddings."""
+        if fbank is None:
+            if waveform is None:
+                raise ValueError("waveform must be provided when fbank is None.")
+            fbank = compute_fbank_batch(waveform)
+        elif fbank.dim() == 2:
+            fbank = fbank.unsqueeze(0)
         raw = self._forward_backbone(fbank)
         norm = F.normalize(raw, p=2, dim=-1)
         proj = self.to_separator(norm)

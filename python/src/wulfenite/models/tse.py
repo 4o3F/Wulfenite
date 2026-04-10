@@ -160,6 +160,7 @@ class WulfeniteTSE(nn.Module):
         self,
         mixture: torch.Tensor,
         enrollment: torch.Tensor,
+        enrollment_fbank: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Convenience forward for training.
 
@@ -167,18 +168,29 @@ class WulfeniteTSE(nn.Module):
             mixture: ``[B, T_mix]``.
             enrollment: ``[B, T_enr]`` or a single ``[T_enr]`` to
                 broadcast across the batch.
+            enrollment_fbank: optional pre-computed enrollment FBank
+                ``[B, T, F]`` or ``[T, F]``.
 
         Returns:
             Separator output dict plus cached speaker-encoder outputs.
         """
         if enrollment.dim() == 1:
             enrollment = enrollment.unsqueeze(0)
+        if enrollment_fbank is not None and enrollment_fbank.dim() == 2:
+            enrollment_fbank = enrollment_fbank.unsqueeze(0)
 
         if isinstance(self.speaker_encoder, LearnableDVector):
-            fbank = compute_fbank_batch(enrollment)
+            fbank = (
+                enrollment_fbank
+                if enrollment_fbank is not None
+                else compute_fbank_batch(enrollment)
+            )
             raw_emb, norm_emb, logits = self.speaker_encoder(fbank)
         else:
-            encoder_out = self.speaker_encoder(enrollment)
+            encoder_out = self.speaker_encoder(
+                enrollment,
+                fbank=enrollment_fbank,
+            )
             if not isinstance(encoder_out, SpeakerEncoderOutput):
                 raise TypeError(
                     "speaker_encoder must return either the learnable "

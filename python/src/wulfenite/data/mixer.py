@@ -35,6 +35,8 @@ Every call yields a dict with:
 - ``"mixture"``: ``[T]`` float tensor, 16 kHz mono input to the model
 - ``"target"``: ``[T]`` float tensor, loss reference (zeros for absent)
 - ``"enrollment"``: ``[T_enr]`` float tensor, fed to the speaker encoder
+- ``"enrollment_fbank"``: ``[T_frames, 80]`` float tensor computed in
+  the data worker for the enrollment encoder path
 - ``"target_present"``: scalar tensor, 1.0 or 0.0
 - ``"target_speaker_idx"``: scalar ``long`` tensor, stable speaker id
 - ``"snr_db"``: scalar tensor for logging
@@ -51,6 +53,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
+from ..models.dvector import compute_fbank_batch
 from .aishell import AudioEntry
 from .augmentation import (
     ReverbConfig,
@@ -91,6 +94,7 @@ class MixerConfig:
     reverb_prob: float = 0.85
     reverb: ReverbConfig = field(default_factory=ReverbConfig)
     reverb_enrollment: bool = True
+    rir_pool_size: int = 1000
 
     # --- Additive noise on the final mixture ---
     apply_noise: bool = True
@@ -117,6 +121,11 @@ class MixerConfig:
 
 def _rms(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return torch.sqrt(torch.mean(x * x) + eps)
+
+
+def _compute_enrollment_fbank(enrollment: torch.Tensor) -> torch.Tensor:
+    """Compute one enrollment FBank feature matrix on CPU."""
+    return compute_fbank_batch(enrollment).squeeze(0)
 
 
 def _load_chunk(
@@ -231,11 +240,20 @@ class WulfeniteMixer(Dataset):
         self._has_noise_pool = bool(self.noise_pool) and cfg.use_noise_pool
 
         self._base_seed = seed  # None ⇒ fresh entropy each call
+        pool_seed = None if seed is None else seed + 1_000_003
+        pool_rng = random.Random(pool_seed)
+        pool_size = max(0, cfg.rir_pool_size)
+        build_pool = cfg.apply_reverb and cfg.reverb_prob > 0.0 and pool_size > 0
+        self._rir_pool = [
+            synth_room_rir(cfg.reverb, pool_rng)
+            for _ in range(pool_size)
+        ] if build_pool else []
 
         total_utts = sum(len(v) for v in self.speakers.values())
         print(
             f"[WulfeniteMixer] speakers={len(self.speaker_ids)} "
             f"utterances={total_utts} noise_files={len(self.noise_pool)} "
+            f"rir_pool={len(self._rir_pool)} "
             f"epoch={samples_per_epoch} target_present_prob={cfg.target_present_prob}"
         )
 
@@ -250,6 +268,11 @@ class WulfeniteMixer(Dataset):
         if self._base_seed is None:
             return random.Random()
         return random.Random(self._base_seed + index)
+
+    def _sample_rir(self, rng: random.Random) -> torch.Tensor:
+        if self._rir_pool:
+            return rng.choice(self._rir_pool)
+        return synth_room_rir(self.cfg.reverb, rng)
 
     def _make_present_sample(self, rng: random.Random) -> dict:
         cfg = self.cfg
@@ -272,12 +295,12 @@ class WulfeniteMixer(Dataset):
 
         # Reverb.
         if cfg.apply_reverb and rng.random() < cfg.reverb_prob:
-            rir_t = synth_room_rir(cfg.reverb, rng)
-            rir_i = synth_room_rir(cfg.reverb, rng)
+            rir_t = self._sample_rir(rng)
+            rir_i = self._sample_rir(rng)
             target = apply_rir(target, rir_t)
             interferer = apply_rir(interferer, rir_i)
             if cfg.reverb_enrollment:
-                rir_e = synth_room_rir(cfg.reverb, rng)
+                rir_e = self._sample_rir(rng)
                 enrollment = apply_rir(enrollment, rir_e)
             # Reverb changes RMS, re-normalize.
             target = target / (_rms(target) + 1e-8) * cfg.rms_target
@@ -306,10 +329,12 @@ class WulfeniteMixer(Dataset):
             mixture = mixture * scale
             target = target * scale
 
+        enrollment_fbank = _compute_enrollment_fbank(enrollment)
         return {
             "mixture": mixture,
             "target": target,
             "enrollment": enrollment,
+            "enrollment_fbank": enrollment_fbank,
             "target_present": torch.tensor(1.0, dtype=torch.float32),
             "target_speaker_idx": torch.tensor(
                 self.speaker_to_idx[target_spk], dtype=torch.long,
@@ -339,11 +364,11 @@ class WulfeniteMixer(Dataset):
 
         # Reverb on the mixture content (and optionally the enrollment).
         if cfg.apply_reverb and rng.random() < cfg.reverb_prob:
-            rir_m = synth_room_rir(cfg.reverb, rng)
+            rir_m = self._sample_rir(rng)
             mixture_source = apply_rir(mixture_source, rir_m)
             mixture_source = mixture_source / (_rms(mixture_source) + 1e-8) * cfg.rms_target
             if cfg.reverb_enrollment:
-                rir_e = synth_room_rir(cfg.reverb, rng)
+                rir_e = self._sample_rir(rng)
                 enrollment = apply_rir(enrollment, rir_e)
                 enrollment = enrollment / (_rms(enrollment) + 1e-8) * cfg.rms_target
 
@@ -362,10 +387,12 @@ class WulfeniteMixer(Dataset):
         if peak > cfg.peak_clip:
             mixture = mixture * (cfg.peak_clip / peak)
 
+        enrollment_fbank = _compute_enrollment_fbank(enrollment)
         return {
             "mixture": mixture,
             "target": torch.zeros(self.segment_len, dtype=torch.float32),
             "enrollment": enrollment,
+            "enrollment_fbank": enrollment_fbank,
             "target_present": torch.tensor(0.0, dtype=torch.float32),
             "target_speaker_idx": torch.tensor(
                 self.speaker_to_idx[target_spk], dtype=torch.long,
@@ -397,6 +424,7 @@ def collate_mixer_batch(batch: Sequence[dict]) -> dict:
         "mixture": torch.stack([b["mixture"] for b in batch], dim=0),
         "target": torch.stack([b["target"] for b in batch], dim=0),
         "enrollment": torch.stack([b["enrollment"] for b in batch], dim=0),
+        "enrollment_fbank": torch.stack([b["enrollment_fbank"] for b in batch], dim=0),
         "target_present": torch.stack([b["target_present"] for b in batch], dim=0),
         "target_speaker_idx": torch.stack(
             [b["target_speaker_idx"] for b in batch], dim=0,
