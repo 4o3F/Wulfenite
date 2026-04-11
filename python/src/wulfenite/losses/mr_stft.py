@@ -72,7 +72,7 @@ class STFTLoss(nn.Module):
         n_fft: int,
         hop_length: int,
         win_length: int,
-        eps: float = 1e-7,
+        eps: float = 1e-4,
     ) -> None:
         super().__init__()
         self.n_fft = n_fft
@@ -142,7 +142,7 @@ class MultiResolutionSTFTLoss(nn.Module):
         win_lengths: tuple[int, ...] = (512, 1024, 2048),
         sc_weight: float = 0.5,
         log_mag_weight: float = 0.5,
-        eps: float = 1e-7,
+        eps: float = 1e-4,
     ) -> None:
         super().__init__()
         if not (len(fft_sizes) == len(hop_sizes) == len(win_lengths)):
