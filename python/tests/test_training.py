@@ -116,6 +116,7 @@ def _small_mixer(
         segment_seconds=1.0,
         enrollment_seconds=1.0,
         target_present_prob=target_present_prob,
+        transition_prob=0.0,
         # Disable reverb/noise to keep tests fast and deterministic enough
         apply_reverb=False,
         apply_noise=False,
@@ -141,9 +142,33 @@ def test_training_config_defaults() -> None:
     assert cfg.learning_rate == pytest.approx(5e-4)
     assert cfg.arcface_scale == pytest.approx(30.0)
     assert cfg.arcface_margin == pytest.approx(0.2)
+    assert cfg.transition_prob == pytest.approx(0.20)
+    assert cfg.transition_min_fraction == pytest.approx(0.25)
     assert cfg.use_plateau_scheduler is True
     assert cfg.plateau_patience == 5
     assert cfg.early_stopping_patience == 20
+
+
+def test_build_dataset_disables_transitions_for_validation(tmp_path: Path) -> None:
+    aishell_root = _build_aishell1_tree(
+        tmp_path / "aishell1_cfg", num_speakers=4, utts_per_speaker=3, seconds=2.0,
+    )
+    cfg = TrainingConfig(
+        aishell1_root=aishell_root,
+        segment_seconds=1.0,
+        enrollment_seconds=1.0,
+        samples_per_epoch=4,
+        val_samples=2,
+        num_workers=0,
+        device="cpu",
+        transition_prob=0.35,
+        noise_prob=0.0,
+        reverb_prob=0.0,
+    )
+
+    train_ds, val_ds = build_dataset(cfg)
+    assert train_ds.cfg.transition_prob == pytest.approx(0.35)
+    assert val_ds.cfg.transition_prob == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------

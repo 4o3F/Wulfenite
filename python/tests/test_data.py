@@ -284,7 +284,12 @@ def test_add_noise_at_snr_matches_request() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_mixer(tmp_path: Path, with_noise: bool = True) -> WulfeniteMixer:
+def _build_mixer(
+    tmp_path: Path,
+    with_noise: bool = True,
+    *,
+    transition_prob: float = 0.0,
+) -> WulfeniteMixer:
     a1 = _build_fake_aishell1(tmp_path / "a1", num_speakers=4,
                               utts_per_speaker=4)
     a3 = _build_fake_aishell3(tmp_path / "a3", num_speakers=4,
@@ -300,6 +305,7 @@ def _build_mixer(tmp_path: Path, with_noise: bool = True) -> WulfeniteMixer:
         segment_seconds=1.0,
         enrollment_seconds=1.0,
         target_present_prob=0.75,
+        transition_prob=transition_prob,
     )
     return WulfeniteMixer(
         speakers=speakers,
@@ -407,3 +413,62 @@ def test_mixer_without_noise_pool(tmp_path: Path) -> None:
     mixer = _build_mixer(tmp_path, with_noise=False)
     s = mixer[0]
     assert torch.isfinite(s["mixture"]).all()
+
+
+@pytest.mark.parametrize(
+    ("roll", "expect_prefix_zero"),
+    [
+        (0.05, True),   # absent_to_present
+        (0.85, False),  # present_to_absent
+    ],
+)
+def test_mixer_transition_sample_gates_target(
+    tmp_path: Path,
+    roll: float,
+    expect_prefix_zero: bool,
+) -> None:
+    class FixedRandom(random.Random):
+        def __init__(self, fixed_roll: float) -> None:
+            super().__init__(0)
+            self.fixed_roll = fixed_roll
+
+        def random(self) -> float:
+            return self.fixed_roll
+
+    a1 = _build_fake_aishell1(tmp_path / "a1t", num_speakers=4, utts_per_speaker=4)
+    a3 = _build_fake_aishell3(tmp_path / "a3t", num_speakers=4, utts_per_speaker=4)
+    speakers = merge_speaker_dicts(scan_aishell1(a1), scan_aishell3(a3))
+    mixer = WulfeniteMixer(
+        speakers=speakers,
+        noise_pool=None,
+        config=MixerConfig(
+            segment_seconds=1.0,
+            enrollment_seconds=1.0,
+            transition_prob=1.0,
+            transition_min_fraction=0.25,
+            apply_reverb=False,
+            apply_noise=False,
+        ),
+        samples_per_epoch=4,
+        seed=7,
+    )
+
+    sample = mixer._make_transition_sample(FixedRandom(roll))
+    target = sample["target"]
+    assert sample["mixture"].shape == (SR,)
+    assert target.shape == (SR,)
+    assert sample["target_present"].item() == 1.0
+    assert torch.any(target != 0.0)
+
+    nonzero = torch.nonzero(target.abs() > 1e-7, as_tuple=False).squeeze(-1)
+    assert nonzero.numel() > 0
+    first = int(nonzero[0].item())
+    last = int(nonzero[-1].item())
+    min_len = int(0.25 * SR)
+
+    if expect_prefix_zero:
+        assert first >= min_len
+        assert torch.allclose(target[:first], torch.zeros_like(target[:first]))
+    else:
+        assert SR - 1 - last >= min_len
+        assert torch.allclose(target[last + 1:], torch.zeros_like(target[last + 1:]))

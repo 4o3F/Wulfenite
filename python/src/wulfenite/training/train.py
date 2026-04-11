@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import random
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -132,28 +133,31 @@ def build_dataset(cfg: TrainingConfig) -> tuple[WulfeniteMixer, WulfeniteMixer]:
     if cfg.noise_root is not None:
         noise_pool = scan_noise_dir(cfg.noise_root)
 
-    mixer_cfg = MixerConfig(
+    train_mixer_cfg = MixerConfig(
         segment_seconds=cfg.segment_seconds,
         enrollment_seconds=cfg.enrollment_seconds,
         snr_range_db=tuple(cfg.snr_range_db),
         target_present_prob=cfg.target_present_prob,
+        transition_prob=cfg.transition_prob,
+        transition_min_fraction=cfg.transition_min_fraction,
         noise_snr_range_db=tuple(cfg.noise_snr_range_db),
         noise_prob=cfg.noise_prob,
         reverb_prob=cfg.reverb_prob,
         rir_pool_size=cfg.rir_pool_size,
         reverb=ReverbConfig(),
     )
+    val_mixer_cfg = replace(train_mixer_cfg, transition_prob=0.0)
     train_ds = WulfeniteMixer(
         speakers=train_speakers,
         noise_pool=noise_pool,
-        config=mixer_cfg,
+        config=train_mixer_cfg,
         samples_per_epoch=cfg.samples_per_epoch,
         seed=None,  # fresh mixtures per call
     )
     val_ds = WulfeniteMixer(
         speakers=val_speakers,
         noise_pool=noise_pool,
-        config=mixer_cfg,
+        config=val_mixer_cfg,
         samples_per_epoch=cfg.val_samples,
         seed=cfg.seed,  # reproducible validation
     )
@@ -814,7 +818,7 @@ def run_training(
     probe_ds = WulfeniteMixer(
         speakers=train_ds.speakers,
         noise_pool=train_ds.noise_pool,
-        config=train_ds.cfg,
+        config=replace(train_ds.cfg, transition_prob=0.0),
         samples_per_epoch=max(cfg.val_samples, cfg.batch_size * 4),
         seed=cfg.seed + 17,
     )
@@ -998,6 +1002,8 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--enrollment-seconds", type=float, default=4.0)
     parser.add_argument("--snr-range-db", type=float, nargs=2, default=(-5.0, 5.0))
     parser.add_argument("--target-present-prob", type=float, default=0.85)
+    parser.add_argument("--transition-prob", type=float, default=0.20)
+    parser.add_argument("--transition-min-fraction", type=float, default=0.25)
     parser.add_argument("--noise-snr-range-db", type=float, nargs=2, default=(10.0, 25.0))
     parser.add_argument("--noise-prob", type=float, default=0.80)
     parser.add_argument("--reverb-prob", type=float, default=0.85)
@@ -1076,6 +1082,8 @@ def _parse_args() -> TrainingConfig:
         enrollment_seconds=args.enrollment_seconds,
         snr_range_db=tuple(args.snr_range_db),
         target_present_prob=args.target_present_prob,
+        transition_prob=args.transition_prob,
+        transition_min_fraction=args.transition_min_fraction,
         noise_snr_range_db=tuple(args.noise_snr_range_db),
         noise_prob=args.noise_prob,
         reverb_prob=args.reverb_prob,

@@ -32,6 +32,8 @@ class TrainingConfig:
     enrollment_seconds: float = 4.0
     snr_range_db: tuple[float, float] = (-5.0, 5.0)
     target_present_prob: float = 0.85
+    transition_prob: float = 0.20
+    transition_min_fraction: float = 0.25
     noise_snr_range_db: tuple[float, float] = (10.0, 25.0)
     noise_prob: float = 0.80
     reverb_prob: float = 0.85

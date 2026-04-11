@@ -92,6 +92,8 @@ class MixerConfig:
     # --- Mixing ---
     snr_range_db: tuple[float, float] = (-5.0, 5.0)
     target_present_prob: float = 0.85  # fraction of target-present samples
+    transition_prob: float = 0.20
+    transition_min_fraction: float = 0.25
 
     # --- Optional acoustic augmentation ---
     apply_reverb: bool = True
@@ -135,6 +137,16 @@ class MixerConfig:
             raise ValueError(
                 "enrollment_seconds must be positive; got "
                 f"{self.enrollment_seconds}"
+            )
+        if not 0.0 <= self.transition_prob <= 1.0:
+            raise ValueError(
+                "transition_prob must be in [0, 1]; got "
+                f"{self.transition_prob}"
+            )
+        if not 0.0 < self.transition_min_fraction < 0.5:
+            raise ValueError(
+                "transition_min_fraction must be in (0, 0.5); got "
+                f"{self.transition_min_fraction}"
             )
         self.enrollment_seconds_range = (
             float(self.enrollment_seconds),
@@ -203,13 +215,23 @@ def _rescale_to_snr(
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """Scale ``interferer`` so that target-vs-scaled-interferer hits ``snr_db``."""
+    k = _snr_scale_factor(target, interferer, snr_db, eps=eps)
+    return interferer * k
+
+
+def _snr_scale_factor(
+    target: torch.Tensor,
+    interferer: torch.Tensor,
+    snr_db: float,
+    eps: float = 1e-8,
+) -> float:
+    """Return the scalar applied to ``interferer`` to hit ``snr_db``."""
     target_rms = float(_rms(target, eps))
     interf_rms = float(_rms(interferer, eps))
     factor = 10.0 ** (snr_db / 20.0)
     if interf_rms < eps:
-        return interferer
-    k = target_rms / (interf_rms * factor + eps)
-    return interferer * k
+        return 1.0
+    return target_rms / (interf_rms * factor + eps)
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +324,11 @@ class WulfeniteMixer(Dataset):
             return rng.choice(self._rir_pool)
         return synth_room_rir(self.cfg.reverb, rng)
 
-    def _make_present_sample(self, rng: random.Random) -> dict:
+    def _prepare_present_sources(
+        self,
+        rng: random.Random,
+    ) -> tuple[str, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Load present-branch sources with the standard augmentation pipeline."""
         cfg = self.cfg
 
         target_spk, interf_spk = rng.sample(self.speaker_ids, 2)
@@ -335,12 +361,14 @@ class WulfeniteMixer(Dataset):
             interferer = interferer / (_rms(interferer) + 1e-8) * cfg.rms_target
             enrollment = enrollment / (_rms(enrollment) + 1e-8) * cfg.rms_target
 
-        # Mix at a random SNR.
-        snr_db = rng.uniform(*cfg.snr_range_db)
-        interferer_scaled = _rescale_to_snr(target, interferer, snr_db)
-        mixture = target + interferer_scaled
+        return target_spk, target, interferer, enrollment
 
-        # Additive noise on the mixture.
+    def _maybe_add_final_noise(
+        self,
+        mixture: torch.Tensor,
+        rng: random.Random,
+    ) -> torch.Tensor:
+        cfg = self.cfg
         if cfg.apply_noise and rng.random() < cfg.noise_prob:
             noise_snr = rng.uniform(*cfg.noise_snr_range_db)
             if self._has_noise_pool:
@@ -349,17 +377,99 @@ class WulfeniteMixer(Dataset):
                 mixture = add_noise_at_snr(mixture, noise, noise_snr)
             else:
                 mixture = add_gaussian_noise(mixture, noise_snr)
+        return mixture
 
-        # Clip guard.
+    def _clip_present_like_pair(
+        self,
+        mixture: torch.Tensor,
+        target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         peak = float(mixture.abs().max())
-        if peak > cfg.peak_clip:
-            scale = cfg.peak_clip / peak
+        if peak > self.cfg.peak_clip:
+            scale = self.cfg.peak_clip / peak
             mixture = mixture * scale
             target = target * scale
+        return mixture, target
+
+    def _make_present_sample(self, rng: random.Random) -> dict:
+        cfg = self.cfg
+        target_spk, target, interferer, enrollment = self._prepare_present_sources(rng)
+
+        # Mix at a random SNR.
+        snr_db = rng.uniform(*cfg.snr_range_db)
+        interferer_scaled = _rescale_to_snr(target, interferer, snr_db)
+        mixture = target + interferer_scaled
+
+        # Additive noise on the mixture.
+        mixture = self._maybe_add_final_noise(mixture, rng)
+
+        # Clip guard.
+        mixture, target = self._clip_present_like_pair(mixture, target)
 
         return {
             "mixture": mixture,
             "target": target,
+            "enrollment": enrollment,
+            "target_present": torch.tensor(1.0, dtype=torch.float32),
+            "target_speaker_idx": torch.tensor(
+                self.speaker_to_idx[target_spk], dtype=torch.long,
+            ),
+            "snr_db": torch.tensor(snr_db, dtype=torch.float32),
+        }
+
+    def _make_transition_sample(self, rng: random.Random) -> dict:
+        cfg = self.cfg
+        target_spk, target, interferer, enrollment = self._prepare_present_sources(rng)
+
+        align = 160
+        raw_min = int(cfg.transition_min_fraction * self.segment_len)
+        # Align bounds to encoder stride so t0 always lands on a frame edge.
+        min_len = ((raw_min + align - 1) // align) * align
+        max_len = ((self.segment_len - raw_min) // align) * align
+        if min_len > max_len:
+            min_len = max_len
+        t0 = rng.randint(min_len // align, max_len // align) * align
+
+        roll = rng.random()
+        if roll < 0.40:
+            transition_type = "absent_to_present"
+        elif roll < 0.70:
+            transition_type = "silence_to_present"
+        elif roll < 0.90:
+            transition_type = "present_to_absent"
+        else:
+            transition_type = "present_to_silence"
+
+        target_gate = torch.ones(self.segment_len, dtype=target.dtype)
+        interferer_gate = torch.ones(self.segment_len, dtype=interferer.dtype)
+        if transition_type in ("absent_to_present", "silence_to_present"):
+            target_gate[:t0] = 0.0
+            present_slice = slice(t0, self.segment_len)
+        else:
+            target_gate[t0:] = 0.0
+            present_slice = slice(0, t0)
+        if transition_type in ("silence_to_present", "present_to_silence"):
+            if transition_type == "silence_to_present":
+                interferer_gate[:t0] = 0.0
+            else:
+                interferer_gate[t0:] = 0.0
+
+        gated_target = target * target_gate
+        snr_db = rng.uniform(*cfg.snr_range_db)
+        k = _snr_scale_factor(
+            target[present_slice],
+            interferer[present_slice],
+            snr_db,
+        )
+        interferer_scaled = interferer * k * interferer_gate
+        mixture = gated_target + interferer_scaled
+
+        mixture = self._maybe_add_final_noise(mixture, rng)
+        mixture, gated_target = self._clip_present_like_pair(mixture, gated_target)
+
+        return {
+            "mixture": mixture,
+            "target": gated_target,
             "enrollment": enrollment,
             "target_present": torch.tensor(1.0, dtype=torch.float32),
             "target_speaker_idx": torch.tensor(
@@ -427,6 +537,8 @@ class WulfeniteMixer(Dataset):
 
     def __getitem__(self, index: int) -> dict:
         rng = self._rng(index)
+        if rng.random() < self.cfg.transition_prob:
+            return self._make_transition_sample(rng)
         if rng.random() < self.cfg.target_present_prob:
             return self._make_present_sample(rng)
         return self._make_absent_sample(rng)
