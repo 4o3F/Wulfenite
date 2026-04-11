@@ -94,6 +94,7 @@ class MixerConfig:
     target_present_prob: float = 0.85  # fraction of target-present samples
     transition_prob: float = 0.20
     transition_min_fraction: float = 0.25
+    transition_min_target_rms: float = 0.01
 
     # --- Optional acoustic augmentation ---
     apply_reverb: bool = True
@@ -147,6 +148,11 @@ class MixerConfig:
             raise ValueError(
                 "transition_min_fraction must be in (0, 0.5); got "
                 f"{self.transition_min_fraction}"
+            )
+        if self.transition_min_target_rms <= 0.0:
+            raise ValueError(
+                "transition_min_target_rms must be positive; got "
+                f"{self.transition_min_target_rms}"
             )
         self.enrollment_seconds_range = (
             float(self.enrollment_seconds),
@@ -455,6 +461,11 @@ class WulfeniteMixer(Dataset):
                 interferer_gate[t0:] = 0.0
 
         gated_target = target * target_gate
+        # Use epsilon-free RMS so the guard catches truly zero targets
+        # even at very small thresholds (unlike _rms() which floors at 1e-4).
+        gated_rms = float(torch.sqrt(torch.mean(gated_target * gated_target)))
+        if gated_rms < cfg.transition_min_target_rms:
+            return self._make_present_sample(rng)
         snr_db = rng.uniform(*cfg.snr_range_db)
         k = _snr_scale_factor(
             target[present_slice],

@@ -30,6 +30,7 @@ from wulfenite.training.train import (
     build_loss,
     build_optimizer,
     compute_enrollment_shuffle_sdr_drop,
+    effective_transition_prob,
     run_training,
     train_one_epoch,
     validate,
@@ -143,10 +144,46 @@ def test_training_config_defaults() -> None:
     assert cfg.arcface_scale == pytest.approx(30.0)
     assert cfg.arcface_margin == pytest.approx(0.2)
     assert cfg.transition_prob == pytest.approx(0.20)
+    assert cfg.transition_warmup_ratio == pytest.approx(0.5)
+    assert cfg.transition_ramp_ratio == pytest.approx(0.3)
     assert cfg.transition_min_fraction == pytest.approx(0.25)
+    assert cfg.transition_min_target_rms == pytest.approx(0.01)
     assert cfg.use_plateau_scheduler is True
     assert cfg.plateau_patience == 5
     assert cfg.early_stopping_patience == 20
+
+
+def test_effective_transition_prob_warmup_and_ramp() -> None:
+    cfg = TrainingConfig(
+        epochs=100,
+        transition_prob=0.10,
+        transition_warmup_ratio=0.5,
+        transition_ramp_ratio=0.3,
+    )
+    assert effective_transition_prob(0, cfg) == 0.0
+    assert effective_transition_prob(49, cfg) == 0.0
+    assert effective_transition_prob(50, cfg) == pytest.approx(0.0)
+    assert effective_transition_prob(65, cfg) == pytest.approx(0.05)
+    assert effective_transition_prob(80, cfg) == pytest.approx(0.10)
+    assert effective_transition_prob(99, cfg) == pytest.approx(0.10)
+
+
+def test_effective_transition_prob_no_curriculum() -> None:
+    cfg = TrainingConfig(
+        epochs=100,
+        transition_prob=0.10,
+        transition_warmup_ratio=0.0,
+        transition_ramp_ratio=0.0,
+    )
+    assert effective_transition_prob(0, cfg) == pytest.approx(0.10)
+    assert effective_transition_prob(50, cfg) == pytest.approx(0.10)
+
+
+def test_training_config_rejects_invalid_curriculum_ratios() -> None:
+    with pytest.raises(ValueError):
+        TrainingConfig(transition_warmup_ratio=0.7, transition_ramp_ratio=0.5)
+    with pytest.raises(ValueError):
+        TrainingConfig(transition_warmup_ratio=-0.1)
 
 
 def test_build_dataset_disables_transitions_for_validation(tmp_path: Path) -> None:
@@ -162,13 +199,16 @@ def test_build_dataset_disables_transitions_for_validation(tmp_path: Path) -> No
         num_workers=0,
         device="cpu",
         transition_prob=0.35,
+        transition_min_target_rms=0.02,
         noise_prob=0.0,
         reverb_prob=0.0,
     )
 
     train_ds, val_ds = build_dataset(cfg)
     assert train_ds.cfg.transition_prob == pytest.approx(0.35)
+    assert train_ds.cfg.transition_min_target_rms == pytest.approx(0.02)
     assert val_ds.cfg.transition_prob == pytest.approx(0.0)
+    assert val_ds.cfg.transition_min_target_rms == pytest.approx(0.02)
 
 
 # ---------------------------------------------------------------------------

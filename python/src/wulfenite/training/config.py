@@ -33,7 +33,10 @@ class TrainingConfig:
     snr_range_db: tuple[float, float] = (-5.0, 5.0)
     target_present_prob: float = 0.85
     transition_prob: float = 0.20
+    transition_warmup_ratio: float = 0.5
+    transition_ramp_ratio: float = 0.3
     transition_min_fraction: float = 0.25
+    transition_min_target_rms: float = 0.01
     noise_snr_range_db: tuple[float, float] = (10.0, 25.0)
     noise_prob: float = 0.80
     reverb_prob: float = 0.85
@@ -85,3 +88,20 @@ class TrainingConfig:
     device: str = "cuda"
     seed: int = 1234
     encoder_type: str = "learnable"
+
+    def __post_init__(self) -> None:
+        if self.transition_warmup_ratio < 0.0:
+            raise ValueError(
+                "transition_warmup_ratio must be >= 0.0; got "
+                f"{self.transition_warmup_ratio}"
+            )
+        if self.transition_ramp_ratio < 0.0:
+            raise ValueError(
+                "transition_ramp_ratio must be >= 0.0; got "
+                f"{self.transition_ramp_ratio}"
+            )
+        if self.transition_warmup_ratio + self.transition_ramp_ratio > 1.0:
+            raise ValueError(
+                "transition_warmup_ratio + transition_ramp_ratio must be <= 1.0; "
+                f"got {self.transition_warmup_ratio + self.transition_ramp_ratio}"
+            )

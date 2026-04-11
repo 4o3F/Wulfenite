@@ -98,6 +98,23 @@ def _split_speakers_for_val(
     return train_speakers, val_speakers
 
 
+def effective_transition_prob(epoch_idx: int, cfg: TrainingConfig) -> float:
+    """Curriculum-adjusted transition probability for a zero-based epoch."""
+    if cfg.transition_prob <= 0.0:
+        return 0.0
+    warmup_end = int(cfg.epochs * cfg.transition_warmup_ratio)
+    ramp_end = warmup_end + int(cfg.epochs * cfg.transition_ramp_ratio)
+    if epoch_idx < warmup_end:
+        return 0.0
+    if epoch_idx >= ramp_end:
+        return cfg.transition_prob
+    ramp_len = ramp_end - warmup_end
+    if ramp_len <= 0:
+        return cfg.transition_prob
+    progress = (epoch_idx - warmup_end) / ramp_len
+    return progress * cfg.transition_prob
+
+
 def build_dataset(cfg: TrainingConfig) -> tuple[WulfeniteMixer, WulfeniteMixer]:
     """Scan datasets, split speakers, and assemble train + val mixers."""
     speakers: dict = {}
@@ -140,6 +157,7 @@ def build_dataset(cfg: TrainingConfig) -> tuple[WulfeniteMixer, WulfeniteMixer]:
         target_present_prob=cfg.target_present_prob,
         transition_prob=cfg.transition_prob,
         transition_min_fraction=cfg.transition_min_fraction,
+        transition_min_target_rms=cfg.transition_min_target_rms,
         noise_snr_range_db=tuple(cfg.noise_snr_range_db),
         noise_prob=cfg.noise_prob,
         reverb_prob=cfg.reverb_prob,
@@ -755,13 +773,16 @@ def run_training(
     train_ds, val_ds = build_dataset(cfg)
 
     pin_memory = device.type == "cuda"
+    curriculum_active = cfg.transition_prob > 0.0 and (
+        cfg.transition_warmup_ratio > 0.0 or cfg.transition_ramp_ratio > 0.0
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
         shuffle=False,  # virtual epoch
         num_workers=cfg.num_workers,
         collate_fn=collate_mixer_batch,
-        persistent_workers=cfg.num_workers > 0,
+        persistent_workers=cfg.num_workers > 0 and not curriculum_active,
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         pin_memory=pin_memory,
         drop_last=True,
@@ -860,6 +881,9 @@ def run_training(
         dynamic_ncols=True,
     )
     for epoch in epoch_iter:
+        epoch_idx = epoch - 1
+        eff_prob = effective_transition_prob(epoch_idx, cfg)
+        train_ds.cfg.transition_prob = eff_prob
         epoch_t0 = time.time()
         train_loss, global_step = train_one_epoch(
             model,
@@ -932,7 +956,8 @@ def run_training(
         )
 
         log(
-            f"epoch {epoch} train_loss={train_loss:+.4f} val_loss={val_loss:+.4f} "
+            f"epoch {epoch} transition_prob={eff_prob:.3f} "
+            f"train_loss={train_loss:+.4f} val_loss={val_loss:+.4f} "
             f"val_sdr_db={val_parts['sdr_db']:+.3f} "
             f"val_sdri_db={val_parts['sdri_db']:+.3f} "
             f"val_stft={val_parts['mr_stft']:.4f} "
@@ -1003,7 +1028,10 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--snr-range-db", type=float, nargs=2, default=(-5.0, 5.0))
     parser.add_argument("--target-present-prob", type=float, default=0.85)
     parser.add_argument("--transition-prob", type=float, default=0.20)
+    parser.add_argument("--transition-warmup-ratio", type=float, default=0.5)
+    parser.add_argument("--transition-ramp-ratio", type=float, default=0.3)
     parser.add_argument("--transition-min-fraction", type=float, default=0.25)
+    parser.add_argument("--transition-min-target-rms", type=float, default=0.01)
     parser.add_argument("--noise-snr-range-db", type=float, nargs=2, default=(10.0, 25.0))
     parser.add_argument("--noise-prob", type=float, default=0.80)
     parser.add_argument("--reverb-prob", type=float, default=0.85)
@@ -1083,7 +1111,10 @@ def _parse_args() -> TrainingConfig:
         snr_range_db=tuple(args.snr_range_db),
         target_present_prob=args.target_present_prob,
         transition_prob=args.transition_prob,
+        transition_warmup_ratio=args.transition_warmup_ratio,
+        transition_ramp_ratio=args.transition_ramp_ratio,
         transition_min_fraction=args.transition_min_fraction,
+        transition_min_target_rms=args.transition_min_target_rms,
         noise_snr_range_db=tuple(args.noise_snr_range_db),
         noise_prob=args.noise_prob,
         reverb_prob=args.reverb_prob,

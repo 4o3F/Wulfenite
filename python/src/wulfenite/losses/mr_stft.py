@@ -109,7 +109,7 @@ class STFTLoss(nn.Module):
         # Spectral convergence: ||est - tgt||_F / ||tgt||_F, batched.
         diff_norm = torch.norm(est_mag - tgt_mag, p="fro", dim=(-2, -1))
         tgt_norm = torch.norm(tgt_mag, p="fro", dim=(-2, -1)) + self.eps
-        sc_loss = (diff_norm / tgt_norm).mean()
+        sc_loss = (diff_norm / tgt_norm).clamp(max=5.0).mean()
 
         # Log magnitude L1.
         log_est = torch.log(est_mag + self.eps)

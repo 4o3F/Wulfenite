@@ -472,3 +472,66 @@ def test_mixer_transition_sample_gates_target(
     else:
         assert SR - 1 - last >= min_len
         assert torch.allclose(target[last + 1:], torch.zeros_like(target[last + 1:]))
+
+
+def test_mixer_transition_falls_back_on_low_energy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FixedRandom(random.Random):
+        def random(self) -> float:
+            return 0.05  # absent_to_present
+
+    a1 = _build_fake_aishell1(tmp_path / "a1g", num_speakers=4, utts_per_speaker=4)
+    a3 = _build_fake_aishell3(tmp_path / "a3g", num_speakers=4, utts_per_speaker=4)
+    speakers = merge_speaker_dicts(scan_aishell1(a1), scan_aishell3(a3))
+    mixer = WulfeniteMixer(
+        speakers=speakers,
+        noise_pool=None,
+        config=MixerConfig(
+            segment_seconds=1.0,
+            enrollment_seconds=1.0,
+            transition_prob=1.0,
+            transition_min_fraction=0.25,
+            transition_min_target_rms=0.01,
+            apply_reverb=False,
+            apply_noise=False,
+        ),
+        samples_per_epoch=4,
+        seed=7,
+    )
+
+    cutoff = int(0.25 * SR)
+    target = torch.zeros(SR, dtype=torch.float32)
+    target[:cutoff] = 0.1
+    interferer = torch.full((SR,), 0.1, dtype=torch.float32)
+    enrollment = torch.full((SR,), 0.1, dtype=torch.float32)
+
+    def fake_prepare_present_sources(
+        rng: random.Random,
+    ) -> tuple[str, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return mixer.speaker_ids[0], target.clone(), interferer.clone(), enrollment.clone()
+
+    seen_rng: list[random.Random] = []
+
+    def fake_make_present_sample(rng: random.Random) -> dict:
+        seen_rng.append(rng)
+        return {
+            "mixture": torch.ones(SR, dtype=torch.float32),
+            "target": torch.ones(SR, dtype=torch.float32),
+            "enrollment": torch.ones(SR, dtype=torch.float32),
+            "target_present": torch.tensor(1.0, dtype=torch.float32),
+            "target_speaker_idx": torch.tensor(0, dtype=torch.long),
+            "snr_db": torch.tensor(0.0, dtype=torch.float32),
+        }
+
+    monkeypatch.setattr(mixer, "_prepare_present_sources", fake_prepare_present_sources)
+    monkeypatch.setattr(mixer, "_make_present_sample", fake_make_present_sample)
+
+    rng = FixedRandom(0)
+    sample = mixer._make_transition_sample(rng)
+
+    assert seen_rng == [rng]
+    assert torch.allclose(sample["target"], torch.ones(SR))
+    assert torch.allclose(sample["mixture"], torch.ones(SR))
+    assert sample["target_present"].item() == 1.0

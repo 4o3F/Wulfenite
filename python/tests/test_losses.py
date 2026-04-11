@@ -115,6 +115,22 @@ def test_stft_loss_perfect_is_near_zero() -> None:
     assert lm.item() < 1e-5, f"log_mag on identical signals {lm.item():.3e}"
 
 
+def test_stft_sc_clamp() -> None:
+    torch.manual_seed(1)
+    good = torch.randn(16000)
+    loud = torch.randn(16000) * 10.0
+    zero = torch.zeros(16000)
+
+    estimate = torch.stack([good, loud], dim=0)
+    target = torch.stack([good, zero], dim=0)
+
+    loss_fn = STFTLoss(n_fft=512, hop_length=128, win_length=512)
+    sc, _ = loss_fn(estimate, target)
+
+    assert torch.isfinite(sc)
+    assert 2.4 <= sc.item() <= 2.6
+
+
 def test_mr_stft_loss_runs_and_is_positive() -> None:
     torch.manual_seed(2)
     est = torch.randn(2, 16000)
