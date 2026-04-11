@@ -6,6 +6,7 @@ always receives an L2-normalized embedding in bottleneck space.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -29,6 +30,78 @@ class SpeakerEncoderOutput:
     speaker_logits: torch.Tensor | None
 
 
+class ArcFaceClassifier(nn.Module):
+    """ArcFace/AAM-Softmax classifier operating on unit speaker embeddings."""
+
+    def __init__(
+        self,
+        emb_dim: int,
+        num_classes: int,
+        scale: float = 30.0,
+        margin: float = 0.2,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_classes, emb_dim))
+        nn.init.xavier_uniform_(self.weight)
+        self.scale = float(scale)
+        self.margin = float(margin)
+
+    @property
+    def out_features(self) -> int:
+        return self.weight.size(0)
+
+    @property
+    def in_features(self) -> int:
+        return self.weight.size(1)
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict,
+        prefix: str,
+        local_metadata: dict,
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        # Older checkpoints stored an nn.Linear classifier with a bias term.
+        state_dict.pop(prefix + "bias", None)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def forward(
+        self,
+        embedding: torch.Tensor,
+        labels: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        emb = F.normalize(embedding, p=2, dim=-1)
+        weight = F.normalize(self.weight, p=2, dim=-1)
+        cosine = F.linear(emb, weight).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+        if labels is None:
+            return cosine * self.scale
+
+        labels = labels.to(device=cosine.device, dtype=torch.long).reshape(-1)
+        if labels.shape[0] != cosine.shape[0]:
+            raise ValueError(
+                "labels must have shape [B]; got "
+                f"{tuple(labels.shape)} for cosine {tuple(cosine.shape)}"
+            )
+
+        cos_m = math.cos(self.margin)
+        sin_m = math.sin(self.margin)
+        sine = torch.sqrt((1.0 - cosine * cosine).clamp_min(0.0))
+        phi = cosine * cos_m - sine * sin_m
+        one_hot = F.one_hot(labels, num_classes=self.out_features).to(cosine.dtype)
+        return ((one_hot * phi) + ((1.0 - one_hot) * cosine)) * self.scale
+
+
 class CampPlusSpeakerEncoder(nn.Module):
     """Adapter that projects CAM++ embeddings into separator space."""
 
@@ -43,6 +116,8 @@ class CampPlusSpeakerEncoder(nn.Module):
         num_speakers: int | None = None,
         projection_type: str = "mlp",
         projection_hidden_dim: int = 384,
+        arcface_scale: float = 30.0,
+        arcface_margin: float = 0.2,
     ) -> None:
         super().__init__()
         self.backbone = backbone
@@ -62,7 +137,12 @@ class CampPlusSpeakerEncoder(nn.Module):
         else:
             raise ValueError(f"Unsupported projection_type: {projection_type}")
         self.classifier = (
-            nn.Linear(bottleneck_dim, num_speakers)
+            ArcFaceClassifier(
+                bottleneck_dim,
+                num_speakers,
+                scale=arcface_scale,
+                margin=arcface_margin,
+            )
             if num_speakers is not None else None
         )
         self.supports_classifier = self.classifier is not None
@@ -97,6 +177,7 @@ class CampPlusSpeakerEncoder(nn.Module):
         self,
         waveform: torch.Tensor | None = None,
         fbank: torch.Tensor | None = None,
+        speaker_labels: torch.Tensor | None = None,
     ) -> SpeakerEncoderOutput:
         """Encode waveform or pre-computed FBank into speaker embeddings."""
         if fbank is None:
@@ -109,7 +190,10 @@ class CampPlusSpeakerEncoder(nn.Module):
         norm = F.normalize(raw, p=2, dim=-1)
         projected = self.to_separator(norm)
         sep_emb = F.normalize(projected, p=2, dim=-1)
-        logits = self.classifier(projected) if self.classifier is not None else None
+        logits = (
+            self.classifier(sep_emb, speaker_labels)
+            if self.classifier is not None else None
+        )
         return SpeakerEncoderOutput(
             separator_embedding=sep_emb,
             native_embedding=norm.detach(),

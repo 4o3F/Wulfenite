@@ -30,16 +30,21 @@ for feeding into :class:`wulfenite.losses.combined.WulfeniteLoss`.
 
 ### Returned dict
 
-Every call yields a dict with:
+Every ``__getitem__`` call yields a dict with:
 
 - ``"mixture"``: ``[T]`` float tensor, 16 kHz mono input to the model
 - ``"target"``: ``[T]`` float tensor, loss reference (zeros for absent)
-- ``"enrollment"``: ``[T_enr]`` float tensor, fed to the speaker encoder
-- ``"enrollment_fbank"``: ``[T_frames, 80]`` float tensor computed in
-  the data worker for the enrollment encoder path
+- ``"enrollment"``: ``[T_enr_max]`` float tensor, fed to the speaker
+  encoder and optionally cropped batch-wise at collation time
+- ``"enrollment_speech_len"``: scalar ``long`` tensor with the number
+  of non-padding enrollment samples before any batch-wise crop
 - ``"target_present"``: scalar tensor, 1.0 or 0.0
 - ``"target_speaker_idx"``: scalar ``long`` tensor, stable speaker id
 - ``"snr_db"``: scalar tensor for logging
+
+The default collate function computes ``"enrollment_fbank"`` after the
+final enrollment tensor is chosen, so the features always match any
+batch-wise crop.
 """
 
 from __future__ import annotations
@@ -83,7 +88,7 @@ class MixerConfig:
 
     sample_rate: int = SAMPLE_RATE
     segment_seconds: float = 4.0
-    enrollment_seconds: float = 4.0
+    enrollment_seconds_range: tuple[float, float] = (1.5, 6.0)
 
     # --- Mixing ---
     snr_range_db: tuple[float, float] = (-5.0, 5.0)
@@ -100,6 +105,8 @@ class MixerConfig:
     apply_noise: bool = True
     noise_prob: float = 0.80
     noise_snr_range_db: tuple[float, float] = (10.0, 25.0)
+    enrollment_noise_prob: float = 0.5
+    enrollment_noise_snr_range_db: tuple[float, float] = (15.0, 30.0)
     # If True and a noise_pool is provided, sample real noise files;
     # otherwise (or if disabled here) fall back to synthetic Gaussian
     # noise. Accepts any corpus that can be scanned by
@@ -121,11 +128,6 @@ class MixerConfig:
 
 def _rms(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return torch.sqrt(torch.mean(x * x) + eps)
-
-
-def _compute_enrollment_fbank(enrollment: torch.Tensor) -> torch.Tensor:
-    """Compute one enrollment FBank feature matrix on CPU."""
-    return compute_fbank_batch(enrollment).squeeze(0)
 
 
 def _load_chunk(
@@ -220,7 +222,13 @@ class WulfeniteMixer(Dataset):
         self.cfg = cfg
         self.samples_per_epoch = samples_per_epoch
         self.segment_len = int(cfg.segment_seconds * cfg.sample_rate)
-        self.enrollment_len = int(cfg.enrollment_seconds * cfg.sample_rate)
+        lo, hi = cfg.enrollment_seconds_range
+        if lo <= 0.0 or hi <= 0.0 or lo > hi:
+            raise ValueError(
+                "enrollment_seconds_range must satisfy 0 < lo <= hi; got "
+                f"{cfg.enrollment_seconds_range}"
+            )
+        self.enrollment_len = int(hi * cfg.sample_rate)
 
         # Drop speakers with < 2 utterances (present branch needs two;
         # absent branch needs one but we unify the requirement).
@@ -254,7 +262,8 @@ class WulfeniteMixer(Dataset):
             f"[WulfeniteMixer] speakers={len(self.speaker_ids)} "
             f"utterances={total_utts} noise_files={len(self.noise_pool)} "
             f"rir_pool={len(self._rir_pool)} "
-            f"epoch={samples_per_epoch} target_present_prob={cfg.target_present_prob}"
+            f"epoch={samples_per_epoch} target_present_prob={cfg.target_present_prob} "
+            f"enrollment_seconds_range={cfg.enrollment_seconds_range}"
         )
 
     def __len__(self) -> int:
@@ -274,6 +283,25 @@ class WulfeniteMixer(Dataset):
             return rng.choice(self._rir_pool)
         return synth_room_rir(self.cfg.reverb, rng)
 
+    def _maybe_add_enrollment_noise(
+        self,
+        enrollment: torch.Tensor,
+        rng: random.Random,
+    ) -> torch.Tensor:
+        cfg = self.cfg
+        if (
+            cfg.enrollment_noise_prob <= 0.0
+            or rng.random() >= cfg.enrollment_noise_prob
+        ):
+            return enrollment
+
+        noise_snr = rng.uniform(*cfg.enrollment_noise_snr_range_db)
+        if self._has_noise_pool:
+            noise_entry = rng.choice(self.noise_pool)
+            noise = _load_noise_chunk(noise_entry, enrollment.shape[-1], rng)
+            return add_noise_at_snr(enrollment, noise, noise_snr)
+        return add_gaussian_noise(enrollment, noise_snr)
+
     def _make_present_sample(self, rng: random.Random) -> dict:
         cfg = self.cfg
 
@@ -287,6 +315,7 @@ class WulfeniteMixer(Dataset):
         target = _load_chunk(target_entry, self.segment_len, rng)
         interferer = _load_chunk(interf_entry, self.segment_len, rng)
         enrollment = _load_chunk(enroll_entry, self.enrollment_len, rng)
+        enrollment_speech_len = min(enroll_entry.num_frames, self.enrollment_len)
 
         # Normalize each source to the target RMS.
         target = target / (_rms(target) + 1e-8) * cfg.rms_target
@@ -306,6 +335,8 @@ class WulfeniteMixer(Dataset):
             target = target / (_rms(target) + 1e-8) * cfg.rms_target
             interferer = interferer / (_rms(interferer) + 1e-8) * cfg.rms_target
             enrollment = enrollment / (_rms(enrollment) + 1e-8) * cfg.rms_target
+
+        enrollment = self._maybe_add_enrollment_noise(enrollment, rng)
 
         # Mix at a random SNR.
         snr_db = rng.uniform(*cfg.snr_range_db)
@@ -329,12 +360,13 @@ class WulfeniteMixer(Dataset):
             mixture = mixture * scale
             target = target * scale
 
-        enrollment_fbank = _compute_enrollment_fbank(enrollment)
         return {
             "mixture": mixture,
             "target": target,
             "enrollment": enrollment,
-            "enrollment_fbank": enrollment_fbank,
+            "enrollment_speech_len": torch.tensor(
+                enrollment_speech_len, dtype=torch.long
+            ),
             "target_present": torch.tensor(1.0, dtype=torch.float32),
             "target_speaker_idx": torch.tensor(
                 self.speaker_to_idx[target_spk], dtype=torch.long,
@@ -358,6 +390,7 @@ class WulfeniteMixer(Dataset):
 
         enrollment = _load_chunk(enroll_entry, self.enrollment_len, rng)
         mixture_source = _load_chunk(interf_entry, self.segment_len, rng)
+        enrollment_speech_len = min(enroll_entry.num_frames, self.enrollment_len)
 
         enrollment = enrollment / (_rms(enrollment) + 1e-8) * cfg.rms_target
         mixture_source = mixture_source / (_rms(mixture_source) + 1e-8) * cfg.rms_target
@@ -371,6 +404,8 @@ class WulfeniteMixer(Dataset):
                 rir_e = self._sample_rir(rng)
                 enrollment = apply_rir(enrollment, rir_e)
                 enrollment = enrollment / (_rms(enrollment) + 1e-8) * cfg.rms_target
+
+        enrollment = self._maybe_add_enrollment_noise(enrollment, rng)
 
         mixture = mixture_source
 
@@ -387,12 +422,13 @@ class WulfeniteMixer(Dataset):
         if peak > cfg.peak_clip:
             mixture = mixture * (cfg.peak_clip / peak)
 
-        enrollment_fbank = _compute_enrollment_fbank(enrollment)
         return {
             "mixture": mixture,
             "target": torch.zeros(self.segment_len, dtype=torch.float32),
             "enrollment": enrollment,
-            "enrollment_fbank": enrollment_fbank,
+            "enrollment_speech_len": torch.tensor(
+                enrollment_speech_len, dtype=torch.long
+            ),
             "target_present": torch.tensor(0.0, dtype=torch.float32),
             "target_speaker_idx": torch.tensor(
                 self.speaker_to_idx[target_spk], dtype=torch.long,
@@ -413,18 +449,51 @@ class WulfeniteMixer(Dataset):
 # ---------------------------------------------------------------------------
 
 
-def collate_mixer_batch(batch: Sequence[dict]) -> dict:
+def collate_mixer_batch(
+    batch: Sequence[dict],
+    enrollment_seconds_range: tuple[float, float] | None = None,
+    sample_rate: int = SAMPLE_RATE,
+) -> dict:
     """Default DataLoader collate for :class:`WulfeniteMixer` samples.
 
     Stacks per-field into ``[B, *]`` tensors. Assumes all samples in
     the batch share the same segment / enrollment length, which is
     the case for a single ``WulfeniteMixer`` instance.
     """
+    if enrollment_seconds_range is None:
+        enrollment = torch.stack([b["enrollment"] for b in batch], dim=0)
+    else:
+        lo, hi = enrollment_seconds_range
+        if lo <= 0.0 or hi <= 0.0 or lo > hi:
+            raise ValueError(
+                "enrollment_seconds_range must satisfy 0 < lo <= hi; got "
+                f"{enrollment_seconds_range}"
+            )
+        min_len = int(lo * sample_rate)
+        max_len = int(hi * sample_rate)
+        target_len = random.randint(min_len, max_len)
+        enrollment_items: list[torch.Tensor] = []
+        for sample in batch:
+            wav = sample["enrollment"]
+            speech_len = int(sample["enrollment_speech_len"].item())
+            max_start = max(0, speech_len - target_len)
+            start = random.randint(0, max_start) if max_start > 0 else 0
+            if wav.numel() > target_len:
+                wav = wav[start:start + target_len]
+            if wav.numel() < target_len:
+                wav = F.pad(wav, (0, target_len - wav.numel()))
+            enrollment_items.append(wav)
+        enrollment = torch.stack(enrollment_items, dim=0)
+    enrollment_fbank = compute_fbank_batch(enrollment)
+
     return {
         "mixture": torch.stack([b["mixture"] for b in batch], dim=0),
         "target": torch.stack([b["target"] for b in batch], dim=0),
-        "enrollment": torch.stack([b["enrollment"] for b in batch], dim=0),
-        "enrollment_fbank": torch.stack([b["enrollment_fbank"] for b in batch], dim=0),
+        "enrollment": enrollment,
+        "enrollment_fbank": enrollment_fbank,
+        "enrollment_speech_len": torch.stack(
+            [b["enrollment_speech_len"] for b in batch], dim=0
+        ),
         "target_present": torch.stack([b["target_present"] for b in batch], dim=0),
         "target_speaker_idx": torch.stack(
             [b["target_speaker_idx"] for b in batch], dim=0,

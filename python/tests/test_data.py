@@ -9,6 +9,7 @@ the tests exercise the actual scan paths.
 from __future__ import annotations
 
 import math
+import random
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +34,7 @@ from wulfenite.data import (
     synth_room_rir,
 )
 from wulfenite.data.augmentation import ReverbConfig
+from wulfenite.models import compute_fbank_batch
 
 
 SR = 16000
@@ -296,7 +298,7 @@ def _build_mixer(tmp_path: Path, with_noise: bool = True) -> WulfeniteMixer:
         noise_pool = scan_noise_dir(noise_root)
     cfg = MixerConfig(
         segment_seconds=1.0,
-        enrollment_seconds=1.0,
+        enrollment_seconds_range=(1.0, 1.0),
         target_present_prob=0.75,
     )
     return WulfeniteMixer(
@@ -315,6 +317,7 @@ def test_mixer_sample_shapes(tmp_path: Path) -> None:
     assert sample["mixture"].shape == (expected_len,)
     assert sample["target"].shape == (expected_len,)
     assert sample["enrollment"].shape == (expected_len,)
+    assert sample["enrollment_speech_len"].shape == ()
     assert sample["target_present"].shape == ()
     assert sample["target_speaker_idx"].shape == ()
     assert sample["target_present"].item() in (0.0, 1.0)
@@ -374,8 +377,51 @@ def test_mixer_collate(tmp_path: Path) -> None:
     assert collated["mixture"].shape == (4, int(1.0 * SR))
     assert collated["target"].shape == (4, int(1.0 * SR))
     assert collated["enrollment"].shape == (4, int(1.0 * SR))
+    assert collated["enrollment_speech_len"].shape == (4,)
     assert collated["target_present"].shape == (4,)
     assert collated["target_speaker_idx"].shape == (4,)
+
+
+def test_mixer_collate_with_enrollment_range_recomputes_fbank(
+    tmp_path: Path,
+) -> None:
+    mixer = _build_mixer(tmp_path)
+    batch = [mixer[i] for i in range(4)]
+    random.seed(0)
+
+    collated = collate_mixer_batch(
+        batch,
+        enrollment_seconds_range=(0.5, 0.5),
+        sample_rate=SR,
+    )
+
+    assert collated["enrollment"].shape == (4, int(0.5 * SR))
+    assert collated["enrollment_fbank"].shape[0] == 4
+    expected_fbank = compute_fbank_batch(collated["enrollment"])
+    assert torch.allclose(collated["enrollment_fbank"], expected_fbank, atol=1e-6)
+
+
+def test_mixer_collate_crop_starts_within_speech_len() -> None:
+    batch = [
+        {
+            "mixture": torch.zeros(SR),
+            "target": torch.zeros(SR),
+            "enrollment": torch.cat([torch.ones(2000), torch.zeros(6000)]),
+            "enrollment_speech_len": torch.tensor(2000, dtype=torch.long),
+            "target_present": torch.tensor(1.0),
+            "target_speaker_idx": torch.tensor(0, dtype=torch.long),
+            "snr_db": torch.tensor(0.0),
+        }
+    ]
+    random.seed(0)
+
+    collated = collate_mixer_batch(
+        batch,
+        enrollment_seconds_range=(0.125, 0.125),
+        sample_rate=SR,
+    )
+
+    assert torch.all(collated["enrollment"][0] == 1.0)
 
 
 def test_mixer_without_noise_pool(tmp_path: Path) -> None:

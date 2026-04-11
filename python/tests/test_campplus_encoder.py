@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from wulfenite.models.campplus import CAMPPlus
-from wulfenite.models.campplus_encoder import CampPlusSpeakerEncoder
+from wulfenite.models.campplus_encoder import (
+    ArcFaceClassifier,
+    CampPlusSpeakerEncoder,
+)
 from wulfenite.training.config import TrainingConfig
 
 
@@ -27,11 +31,14 @@ def test_campplus_frozen_backbone_projection_and_classifier_get_grad() -> None:
         bottleneck_dim=16,
         freeze_backbone=True,
         num_speakers=5,
+        arcface_scale=24.0,
+        arcface_margin=0.15,
     )
     encoder.train()
     waveform = torch.randn(2, 8000)
+    labels = torch.tensor([0, 1])
 
-    output = encoder(waveform)
+    output = encoder(waveform, speaker_labels=labels)
     assert output.speaker_logits is not None
     loss = output.separator_embedding[:, 0].sum() + output.speaker_logits[:, 0].sum()
     loss.backward()
@@ -54,11 +61,14 @@ def test_campplus_finetune_backbone_projection_and_classifier_get_grad() -> None
         bottleneck_dim=16,
         freeze_backbone=False,
         num_speakers=6,
+        arcface_scale=28.0,
+        arcface_margin=0.25,
     )
     encoder.train()
     waveform = torch.randn(2, 8000)
+    labels = torch.tensor([1, 2])
 
-    output = encoder(waveform)
+    output = encoder(waveform, speaker_labels=labels)
     assert output.speaker_logits is not None
     loss = output.separator_embedding[:, 0].sum() + output.speaker_logits[:, 0].sum()
     loss.backward()
@@ -96,10 +106,13 @@ def test_campplus_forward_output_shape() -> None:
         bottleneck_dim=24,
         freeze_backbone=True,
         num_speakers=7,
+        arcface_scale=32.0,
+        arcface_margin=0.1,
     ).eval()
     waveform = torch.randn(2, 8000)
+    labels = torch.tensor([1, 3])
 
-    output = encoder(waveform)
+    output = encoder(waveform, speaker_labels=labels)
 
     assert output.separator_embedding.shape == (2, 24)
     assert output.native_embedding.shape == (2, 192)
@@ -185,6 +198,8 @@ def test_campplus_optimizer_groups_include_classifier_and_scaled_backbone() -> N
         bottleneck_dim=16,
         freeze_backbone=False,
         num_speakers=8,
+        arcface_scale=26.0,
+        arcface_margin=0.22,
     )
     cfg = TrainingConfig(learning_rate=1e-3, encoder_lr_scale=0.1)
 
@@ -199,3 +214,79 @@ def test_campplus_optimizer_groups_include_classifier_and_scaled_backbone() -> N
     assert groups[1]["lr"] == 2e-4
     assert groups[2]["lr"] == 2e-4
     assert all(group["params"] for group in groups)
+
+
+def test_arcface_classifier_forward_and_grad() -> None:
+    torch.manual_seed(6)
+    classifier = ArcFaceClassifier(
+        emb_dim=8,
+        num_classes=4,
+        scale=16.0,
+        margin=0.3,
+    )
+    embedding = torch.randn(3, 8, requires_grad=True)
+    labels = torch.tensor([0, 2, 1])
+
+    plain_logits = classifier(embedding)
+    margin_logits = classifier(embedding, labels)
+
+    assert plain_logits.shape == (3, 4)
+    assert margin_logits.shape == (3, 4)
+    assert not torch.allclose(plain_logits, margin_logits)
+
+    loss = plain_logits.sum() + margin_logits.sum()
+    loss.backward()
+
+    assert embedding.grad is not None
+    assert torch.isfinite(embedding.grad).all()
+    assert classifier.weight.grad is not None
+    assert torch.isfinite(classifier.weight.grad).all()
+
+
+def test_campplus_classifier_receives_separator_embedding() -> None:
+    class SpyClassifier(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.last_embedding: torch.Tensor | None = None
+            self.last_labels: torch.Tensor | None = None
+
+        def forward(
+            self,
+            embedding: torch.Tensor,
+            labels: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            self.last_embedding = embedding.detach().clone()
+            self.last_labels = None if labels is None else labels.detach().clone()
+            return embedding[:, :2]
+
+    torch.manual_seed(7)
+    encoder = CampPlusSpeakerEncoder(
+        backbone=_small_backbone(),
+        bottleneck_dim=4,
+        freeze_backbone=True,
+        num_speakers=2,
+        projection_type="linear",
+        arcface_scale=18.0,
+        arcface_margin=0.2,
+    ).eval()
+    with torch.no_grad():
+        encoder.to_separator.weight.zero_()
+        encoder.to_separator.weight[:, :4] = 3.0 * torch.eye(4)
+    spy = SpyClassifier()
+    encoder.classifier = spy
+    waveform = torch.randn(2, 8000)
+    labels = torch.tensor([0, 1])
+
+    output = encoder(waveform, speaker_labels=labels)
+    projected = encoder.to_separator(output.native_embedding)
+
+    assert spy.last_embedding is not None
+    assert spy.last_labels is not None
+    assert torch.equal(spy.last_labels, labels)
+    assert torch.allclose(spy.last_embedding, output.separator_embedding, atol=1e-6)
+    assert torch.allclose(
+        spy.last_embedding,
+        F.normalize(projected, p=2, dim=-1),
+        atol=1e-6,
+    )
+    assert not torch.allclose(spy.last_embedding, projected, atol=1e-4)

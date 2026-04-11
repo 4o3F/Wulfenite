@@ -26,6 +26,8 @@ from __future__ import annotations
 import argparse
 import random
 import time
+from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import Callable
 
@@ -63,6 +65,13 @@ from .checkpoint import save_checkpoint
 from .config import TrainingConfig
 
 SchedulerT = torch.optim.lr_scheduler.ReduceLROnPlateau | None
+
+
+def _fixed_enrollment_range(
+    seconds_range: tuple[float, float],
+) -> tuple[float, float]:
+    seconds = float(max(seconds_range))
+    return seconds, seconds
 
 
 # ---------------------------------------------------------------------------
@@ -132,28 +141,37 @@ def build_dataset(cfg: TrainingConfig) -> tuple[WulfeniteMixer, WulfeniteMixer]:
     if cfg.noise_root is not None:
         noise_pool = scan_noise_dir(cfg.noise_root)
 
-    mixer_cfg = MixerConfig(
+    train_mixer_cfg = MixerConfig(
         segment_seconds=cfg.segment_seconds,
-        enrollment_seconds=cfg.enrollment_seconds,
+        enrollment_seconds_range=tuple(cfg.enrollment_seconds_range),
         snr_range_db=tuple(cfg.snr_range_db),
         target_present_prob=cfg.target_present_prob,
         noise_snr_range_db=tuple(cfg.noise_snr_range_db),
         noise_prob=cfg.noise_prob,
+        enrollment_noise_prob=cfg.enrollment_noise_prob,
+        enrollment_noise_snr_range_db=tuple(cfg.enrollment_noise_snr_range_db),
         reverb_prob=cfg.reverb_prob,
         rir_pool_size=cfg.rir_pool_size,
         reverb=ReverbConfig(),
     )
+    val_mixer_cfg = replace(
+        train_mixer_cfg,
+        enrollment_seconds_range=_fixed_enrollment_range(
+            tuple(cfg.enrollment_seconds_range)
+        ),
+        enrollment_noise_prob=0.0,
+    )
     train_ds = WulfeniteMixer(
         speakers=train_speakers,
         noise_pool=noise_pool,
-        config=mixer_cfg,
+        config=train_mixer_cfg,
         samples_per_epoch=cfg.samples_per_epoch,
         seed=None,  # fresh mixtures per call
     )
     val_ds = WulfeniteMixer(
         speakers=val_speakers,
         noise_pool=noise_pool,
-        config=mixer_cfg,
+        config=val_mixer_cfg,
         samples_per_epoch=cfg.val_samples,
         seed=cfg.seed,  # reproducible validation
     )
@@ -198,6 +216,8 @@ def build_model(
             num_speakers=num_speakers,
             projection_type=cfg.campplus_projection_type,
             projection_hidden_dim=cfg.campplus_projection_hidden_dim,
+            arcface_scale=cfg.arcface_scale,
+            arcface_margin=cfg.arcface_margin,
         )
 
     if cfg.encoder_type == "campplus-finetune":
@@ -212,6 +232,8 @@ def build_model(
             num_speakers=num_speakers,
             projection_type=cfg.campplus_projection_type,
             projection_hidden_dim=cfg.campplus_projection_hidden_dim,
+            arcface_scale=cfg.arcface_scale,
+            arcface_margin=cfg.arcface_margin,
         )
 
     raise ValueError(f"Unsupported encoder_type: {cfg.encoder_type}")
@@ -288,6 +310,7 @@ def _move_batch(batch: dict, device: torch.device, non_blocking: bool) -> dict:
 def _speaker_encoder_outputs(
     model: WulfeniteTSE,
     batch: dict,
+    speaker_labels: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Return raw embedding, separator embedding, and optional logits."""
     fbank = batch.get("enrollment_fbank")
@@ -299,6 +322,7 @@ def _speaker_encoder_outputs(
     encoder_out = model.speaker_encoder(
         batch["enrollment"],
         fbank=fbank,
+        speaker_labels=speaker_labels,
     )
     if not isinstance(encoder_out, SpeakerEncoderOutput):
         raise TypeError(
@@ -365,7 +389,11 @@ def compute_speaker_top1_accuracy(
     correct = 0
     for i, batch in enumerate(loader):
         batch = _move_batch(batch, device, non_blocking=pin)
-        _, _, logits = _speaker_encoder_outputs(model, batch)
+        _, _, logits = _speaker_encoder_outputs(
+            model,
+            batch,
+            speaker_labels=None,
+        )
         if logits is None:
             raise RuntimeError("Training diagnostics require a classifier head.")
         pred = logits.argmax(dim=-1)
@@ -505,6 +533,7 @@ def train_one_epoch(
             batch["mixture"],
             batch["enrollment"],
             batch.get("enrollment_fbank"),
+            target_speaker_idx=None,
         )
         loss, parts = criterion(
             clean=outputs["clean"],
@@ -589,6 +618,7 @@ def validate(
             batch["mixture"],
             batch["enrollment"],
             batch.get("enrollment_fbank"),
+            target_speaker_idx=batch.get("target_speaker_idx"),
         )
         _, parts = criterion(
             clean=outputs["clean"],
@@ -673,7 +703,11 @@ def run_encoder_pretrain(
         )
         for batch in pbar:
             batch = _move_batch(batch, device, non_blocking=pin)
-            _, _, logits = _speaker_encoder_outputs(model, batch)
+            _, _, logits = _speaker_encoder_outputs(
+                model,
+                batch,
+                speaker_labels=batch["target_speaker_idx"],
+            )
             if logits is None:
                 raise RuntimeError(
                     "Speaker-encoder pretrain requires a classifier head."
@@ -735,12 +769,17 @@ def run_training(
     train_ds, val_ds = build_dataset(cfg)
 
     pin_memory = device.type == "cuda"
+    train_collate = partial(
+        collate_mixer_batch,
+        enrollment_seconds_range=cfg.enrollment_seconds_range,
+        sample_rate=train_ds.cfg.sample_rate,
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
         shuffle=False,  # virtual epoch
         num_workers=cfg.num_workers,
-        collate_fn=collate_mixer_batch,
+        collate_fn=train_collate,
         persistent_workers=cfg.num_workers > 0,
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         pin_memory=pin_memory,
@@ -798,7 +837,13 @@ def run_training(
     probe_ds = WulfeniteMixer(
         speakers=train_ds.speakers,
         noise_pool=train_ds.noise_pool,
-        config=train_ds.cfg,
+        config=replace(
+            train_ds.cfg,
+            enrollment_seconds_range=_fixed_enrollment_range(
+                train_ds.cfg.enrollment_seconds_range
+            ),
+            enrollment_noise_prob=0.0,
+        ),
         samples_per_epoch=max(cfg.val_samples, cfg.batch_size * 4),
         seed=cfg.seed + 17,
     )
@@ -970,6 +1015,7 @@ def run_training(
 
 
 def _parse_args() -> TrainingConfig:
+    defaults = TrainingConfig()
     parser = argparse.ArgumentParser(description="Train Wulfenite SpeakerBeam-SS")
     # Data
     parser.add_argument("--aishell1-root", type=Path, default=None)
@@ -979,11 +1025,29 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--noise-root", type=Path, default=None)
     # Mixer
     parser.add_argument("--segment-seconds", type=float, default=4.0)
-    parser.add_argument("--enrollment-seconds", type=float, default=4.0)
+    parser.add_argument(
+        "--enrollment-seconds",
+        type=float,
+        default=None,
+        help="Deprecated. Sets both enrollment range endpoints when used.",
+    )
+    parser.add_argument(
+        "--enrollment-seconds-range",
+        type=float,
+        nargs=2,
+        default=None,
+    )
     parser.add_argument("--snr-range-db", type=float, nargs=2, default=(-5.0, 5.0))
     parser.add_argument("--target-present-prob", type=float, default=0.85)
     parser.add_argument("--noise-snr-range-db", type=float, nargs=2, default=(10.0, 25.0))
     parser.add_argument("--noise-prob", type=float, default=0.80)
+    parser.add_argument("--enrollment-noise-prob", type=float, default=0.5)
+    parser.add_argument(
+        "--enrollment-noise-snr-range-db",
+        type=float,
+        nargs=2,
+        default=(15.0, 30.0),
+    )
     parser.add_argument("--reverb-prob", type=float, default=0.85)
     parser.add_argument("--rir-pool-size", type=int, default=1000)
     parser.add_argument("--val-speaker-ratio", type=float, default=0.2)
@@ -1017,6 +1081,8 @@ def _parse_args() -> TrainingConfig:
         type=int,
         default=384,
     )
+    parser.add_argument("--arcface-scale", type=float, default=30.0)
+    parser.add_argument("--arcface-margin", type=float, default=0.2)
     parser.add_argument("--enc-channels", type=int, default=4096)
     parser.add_argument("--bottleneck-channels", type=int, default=256)
     parser.add_argument("--hidden-channels", type=int, default=512)
@@ -1042,6 +1108,14 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--seed", type=int, default=1234)
 
     args = parser.parse_args()
+    if args.enrollment_seconds_range is not None:
+        enrollment_seconds_range = tuple(args.enrollment_seconds_range)
+    elif args.enrollment_seconds is not None:
+        enrollment_seconds = float(args.enrollment_seconds)
+        enrollment_seconds_range = (enrollment_seconds, enrollment_seconds)
+    else:
+        enrollment_seconds_range = defaults.enrollment_seconds_range
+
     return TrainingConfig(
         aishell1_root=args.aishell1_root,
         aishell3_root=args.aishell3_root,
@@ -1051,12 +1125,18 @@ def _parse_args() -> TrainingConfig:
         campplus_checkpoint=args.campplus_checkpoint,
         campplus_projection_type=args.campplus_projection_type,
         campplus_projection_hidden_dim=args.campplus_projection_hidden_dim,
+        arcface_scale=args.arcface_scale,
+        arcface_margin=args.arcface_margin,
         segment_seconds=args.segment_seconds,
-        enrollment_seconds=args.enrollment_seconds,
+        enrollment_seconds_range=enrollment_seconds_range,
         snr_range_db=tuple(args.snr_range_db),
         target_present_prob=args.target_present_prob,
         noise_snr_range_db=tuple(args.noise_snr_range_db),
         noise_prob=args.noise_prob,
+        enrollment_noise_prob=args.enrollment_noise_prob,
+        enrollment_noise_snr_range_db=tuple(
+            args.enrollment_noise_snr_range_db
+        ),
         reverb_prob=args.reverb_prob,
         rir_pool_size=args.rir_pool_size,
         batch_size=args.batch_size,

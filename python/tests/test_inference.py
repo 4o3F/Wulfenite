@@ -88,6 +88,8 @@ def _tiny_campplus_tse(
     num_speakers: int | None = None,
     projection_type: str = "mlp",
     projection_hidden_dim: int = 384,
+    arcface_scale: float = 30.0,
+    arcface_margin: float = 0.2,
 ) -> WulfeniteTSE:
     return WulfeniteTSE.from_campplus(
         campplus_checkpoint=None,
@@ -96,6 +98,8 @@ def _tiny_campplus_tse(
         num_speakers=num_speakers,
         projection_type=projection_type,
         projection_hidden_dim=projection_hidden_dim,
+        arcface_scale=arcface_scale,
+        arcface_margin=arcface_margin,
     ).eval()
 
 
@@ -276,6 +280,71 @@ def test_build_model_from_checkpoint_campplus_mlp_classifier_roundtrip(
     assert torch.allclose(before, after, atol=1e-6), (
         "CAM++ MLP inference output diverged after classifier stripping"
     )
+
+
+def test_campplus_arcface_checkpoint_roundtrip_absorbs_legacy_linear_bias(
+    tmp_path: Path,
+) -> None:
+    """Legacy linear-classifier checkpoints should load into ArcFace models."""
+    torch.manual_seed(42)
+    tse = _tiny_campplus_tse(
+        freeze=True,
+        num_speakers=4,
+        projection_type="mlp",
+        projection_hidden_dim=48,
+        arcface_scale=18.0,
+        arcface_margin=0.35,
+    )
+    T = 4 * tse.separator.config.enc_stride
+    mixture = torch.randn(1, T)
+    enrollment = torch.randn(SR)
+    labels = torch.tensor([1])
+
+    with torch.no_grad():
+        before = tse(
+            mixture,
+            enrollment,
+            target_speaker_idx=labels,
+        )
+
+    ckpt_path = tmp_path / "campplus_arcface_legacy_bias.pt"
+    save_checkpoint(
+        ckpt_path,
+        model=tse,
+        config=_separator_checkpoint_config(
+            tse.separator.config,
+            encoder_type="campplus-frozen",
+            campplus_projection_type="mlp",
+            campplus_projection_hidden_dim=48,
+        ),
+    )
+
+    payload = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    payload["model_state_dict"]["speaker_encoder.classifier.bias"] = torch.randn(4)
+    torch.save(payload, ckpt_path)
+
+    loaded = _tiny_campplus_tse(
+        freeze=True,
+        num_speakers=4,
+        projection_type="mlp",
+        projection_hidden_dim=48,
+        arcface_scale=18.0,
+        arcface_margin=0.35,
+    )
+    load_checkpoint(ckpt_path, model=loaded)
+    loaded.eval()
+
+    with torch.no_grad():
+        after = loaded(
+            mixture,
+            enrollment,
+            target_speaker_idx=labels,
+        )
+
+    assert torch.allclose(before["clean"], after["clean"], atol=1e-6)
+    assert before["speaker_logits"] is not None
+    assert after["speaker_logits"] is not None
+    assert torch.allclose(before["speaker_logits"], after["speaker_logits"], atol=1e-6)
 
 
 def test_build_model_from_checkpoint_campplus_legacy_linear_checkpoint(

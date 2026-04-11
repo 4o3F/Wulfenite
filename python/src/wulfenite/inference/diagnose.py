@@ -39,6 +39,7 @@ from ..data import (
     scan_cnceleb,
     scan_magicdata,
 )
+from ..models.dvector import compute_fbank_batch
 from ..losses.sdr import compute_sdr_db
 from .utils import build_model_from_checkpoint
 
@@ -224,9 +225,14 @@ def _mixer_config_from_checkpoint(checkpoint_cfg: dict[str, Any]) -> MixerConfig
     would make attenuation analysis harder to interpret.
     """
     reverb_prob = float(checkpoint_cfg.get("reverb_prob", 0.85))
+    if "enrollment_seconds_range" in checkpoint_cfg:
+        seconds_range = tuple(checkpoint_cfg["enrollment_seconds_range"])
+        enrollment_seconds = float(max(seconds_range))
+    else:
+        enrollment_seconds = float(checkpoint_cfg.get("enrollment_seconds", 4.0))
     return MixerConfig(
         segment_seconds=float(checkpoint_cfg.get("segment_seconds", 4.0)),
-        enrollment_seconds=float(checkpoint_cfg.get("enrollment_seconds", 4.0)),
+        enrollment_seconds_range=(enrollment_seconds, enrollment_seconds),
         snr_range_db=tuple(checkpoint_cfg.get("snr_range_db", (-5.0, 5.0))),
         target_present_prob=float(checkpoint_cfg.get("target_present_prob", 0.85)),
         apply_reverb=reverb_prob > 0.0,
@@ -419,7 +425,7 @@ def _build_report(
         (
             "mixer="
             f"segment_seconds={mixer_cfg.segment_seconds} "
-            f"enrollment_seconds={mixer_cfg.enrollment_seconds} "
+            f"enrollment_seconds_range={mixer_cfg.enrollment_seconds_range} "
             f"snr_range_db={mixer_cfg.snr_range_db} "
             f"target_present_prob={mixer_cfg.target_present_prob} "
             f"apply_reverb={mixer_cfg.apply_reverb} "
@@ -562,7 +568,7 @@ def run_diagnostic(
                 mixture = sample["mixture"].unsqueeze(0).to(dev)
                 target = sample["target"].unsqueeze(0).to(dev)
                 enrollment = sample["enrollment"].unsqueeze(0).to(dev)
-                enrollment_fbank = sample["enrollment_fbank"].unsqueeze(0).to(dev)
+                enrollment_fbank = compute_fbank_batch(enrollment)
 
                 outputs = model(
                     mixture,

@@ -91,6 +91,8 @@ class WulfeniteTSE(nn.Module):
         num_speakers: int | None = None,
         projection_type: str = "mlp",
         projection_hidden_dim: int = 384,
+        arcface_scale: float = 30.0,
+        arcface_margin: float = 0.2,
     ) -> "WulfeniteTSE":
         """Build a TSE model with a CAM++ speaker encoder."""
         separator = SpeakerBeamSS(separator_config)
@@ -108,6 +110,8 @@ class WulfeniteTSE(nn.Module):
             num_speakers=num_speakers,
             projection_type=projection_type,
             projection_hidden_dim=projection_hidden_dim,
+            arcface_scale=arcface_scale,
+            arcface_margin=arcface_margin,
         )
         return cls(
             speaker_encoder=encoder,
@@ -167,6 +171,7 @@ class WulfeniteTSE(nn.Module):
         mixture: torch.Tensor,
         enrollment: torch.Tensor,
         enrollment_fbank: torch.Tensor | None = None,
+        target_speaker_idx: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Convenience forward for training.
 
@@ -176,6 +181,8 @@ class WulfeniteTSE(nn.Module):
                 broadcast across the batch.
             enrollment_fbank: optional pre-computed enrollment FBank
                 ``[B, T, F]`` or ``[T, F]``.
+            target_speaker_idx: optional speaker labels for auxiliary
+                classifier heads that require them during training.
 
         Returns:
             Separator output dict plus cached speaker-encoder outputs.
@@ -196,6 +203,7 @@ class WulfeniteTSE(nn.Module):
             encoder_out = self.speaker_encoder(
                 enrollment,
                 fbank=enrollment_fbank,
+                speaker_labels=target_speaker_idx,
             )
             if not isinstance(encoder_out, SpeakerEncoderOutput):
                 raise TypeError(
