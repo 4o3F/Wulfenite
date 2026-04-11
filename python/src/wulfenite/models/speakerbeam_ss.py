@@ -616,5 +616,11 @@ class SpeakerBeamSS(nn.Module):
             "encoder_buffer": new_encoder_buffer,
             "block_states": new_block_states,
             "decoder_overlap": new_decoder_overlap,
+            # Lightweight mask diagnostics — always computed (one
+            # float each, negligible cost) so callers can inspect
+            # mask behavior without changing the API.
+            "mask_mean": float(mask.mean().item()),
+            "mask_max": float(mask.max().item()),
+            "mask_min": float(mask.min().item()),
         }
         return committed.squeeze(1), new_state

@@ -63,6 +63,7 @@ def run_streaming(
     output: Path,
     chunk_ms: float = 20.0,
     device: str = "cpu",
+    debug_mask: bool = False,
 ) -> dict:
     """Run streaming inference and write the clean wav.
 
@@ -123,7 +124,17 @@ def run_streaming(
             latencies_ms.append(latency)
             clean_pieces.append(clean_chunk.cpu())
             pbar.update(1)
-            if i % 10 == 0:
+            if debug_mask:
+                t_sec = (start + chunk_size) / SAMPLE_RATE
+                out_rms = float((clean_chunk ** 2).mean().sqrt().item())
+                print(
+                    f"[mask] t={t_sec:6.2f}s "
+                    f"mean={state['mask_mean']:.4f} "
+                    f"max={state['mask_max']:.4f} "
+                    f"min={state['mask_min']:.4f} "
+                    f"out_rms={out_rms:.6f}"
+                )
+            elif i % 10 == 0:
                 pbar.set_postfix(
                     ms=f"{latency:.1f}",
                     refresh=False,
@@ -197,6 +208,8 @@ def _parse_args() -> argparse.Namespace:
                         help="Chunk size in milliseconds. Must be a positive "
                              "multiple of 10 ms (enc_stride).")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--debug-mask", action="store_true",
+                        help="Print per-chunk mask statistics for diagnostics.")
     return parser.parse_args()
 
 
@@ -209,6 +222,7 @@ def main() -> None:
         output=args.output,
         chunk_ms=args.chunk_ms,
         device=args.device,
+        debug_mask=args.debug_mask,
     )
 
 
