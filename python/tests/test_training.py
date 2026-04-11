@@ -114,7 +114,7 @@ def _small_mixer(
     speakers = scan_aishell1(root)
     cfg = MixerConfig(
         segment_seconds=1.0,
-        enrollment_seconds_range=(1.0, 1.0),
+        enrollment_seconds=1.0,
         target_present_prob=target_present_prob,
         # Disable reverb/noise to keep tests fast and deterministic enough
         apply_reverb=False,
@@ -135,7 +135,7 @@ def test_training_config_defaults() -> None:
     cfg = TrainingConfig()
     assert cfg.batch_size > 0
     assert cfg.segment_seconds == 4.0
-    assert cfg.enrollment_seconds_range == (1.5, 6.0)
+    assert cfg.enrollment_seconds == 4.0
     assert cfg.loss_sdr == 1.0
     assert cfg.loss_speaker_cls == 0.2
     assert cfg.learning_rate == pytest.approx(5e-4)
@@ -271,7 +271,7 @@ def test_run_training_one_epoch_writes_checkpoint(tmp_path: Path) -> None:
         aishell3_root=None,
         noise_root=None,
         segment_seconds=1.0,
-        enrollment_seconds_range=(1.0, 1.0),
+        enrollment_seconds=1.0,
         batch_size=2,
         epochs=1,
         samples_per_epoch=6,
@@ -321,7 +321,7 @@ def test_run_training_one_epoch_with_pretrain_writes_checkpoint(
         aishell3_root=None,
         noise_root=None,
         segment_seconds=1.0,
-        enrollment_seconds_range=(1.0, 1.0),
+        enrollment_seconds=1.0,
         batch_size=2,
         epochs=1,
         samples_per_epoch=4,

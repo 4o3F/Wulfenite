@@ -29,13 +29,11 @@ class TrainingConfig:
 
     # --- Mixer ---
     segment_seconds: float = 4.0
-    enrollment_seconds_range: tuple[float, float] = (1.5, 6.0)
+    enrollment_seconds: float = 4.0
     snr_range_db: tuple[float, float] = (-5.0, 5.0)
     target_present_prob: float = 0.85
     noise_snr_range_db: tuple[float, float] = (10.0, 25.0)
     noise_prob: float = 0.80
-    enrollment_noise_prob: float = 0.5
-    enrollment_noise_snr_range_db: tuple[float, float] = (15.0, 30.0)
     reverb_prob: float = 0.85
     rir_pool_size: int = 1000
 
