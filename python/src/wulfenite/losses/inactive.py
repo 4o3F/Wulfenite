@@ -17,7 +17,10 @@ def target_inactive_loss(
     """Penalize output energy on frames where the target is silent.
 
     The penalty is the estimate-to-mixture energy ratio on the frames
-    marked inactive by the mixer:
+    marked inactive by the mixer. Near-silent mixture frames
+    (``mix_energy <= 1e-4``) are excluded, and each per-frame ratio is
+    clamped to ``4.0`` to prevent a few outliers from dominating the
+    mean:
 
     .. math::
 
@@ -30,7 +33,7 @@ def target_inactive_loss(
             does not match the derived frame count for ``frame_size``,
             it is downsampled by logical OR.
         frame_size: samples per energy frame.
-        eps: stabilizer.
+        eps: stabilizer for the ratio computation.
         reduction: ``"mean"``, ``"sum"``, or ``"none"``.
 
     Returns:
@@ -64,12 +67,13 @@ def target_inactive_loss(
 
     est_energy = (est * est).sum(dim=-1)
     mix_energy = (mix * mix).sum(dim=-1)
-    # Exclude near-silent mixture frames to avoid division instability
-    # on BACKGROUND_ONLY events where both energies approach zero.
-    audible = mix_energy > eps
+    # Exclude near-silent mixture frames and clamp per-frame ratios so a
+    # few low-energy outliers cannot dominate the loss.
+    audible = mix_energy > 1e-4
     masked = mask.float() * audible.float()
     denom = masked.sum(dim=-1).clamp(min=1.0)
-    per_sample = ((est_energy / (mix_energy + eps)) * masked).sum(dim=-1) / denom
+    ratio = torch.clamp(est_energy / (mix_energy + eps), max=4.0)
+    per_sample = (ratio * masked).sum(dim=-1) / denom
 
     if reduction == "mean":
         return per_sample.mean()

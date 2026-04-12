@@ -113,8 +113,15 @@ class WulfeniteLoss(nn.Module):
                     active_frames=active_frames,
                     floor=self.recall_floor,
                 )
-            if self.weights.inactive > 0.0 and target_active_frames is not None:
-                inactive_frames = ~target_active_frames[present_mask].bool()
+            if (
+                self.weights.inactive > 0.0
+                and target_active_frames is not None
+                and nontarget_active_frames is not None
+            ):
+                inactive_frames = (
+                    nontarget_active_frames[present_mask].bool()
+                    & ~target_active_frames[present_mask].bool()
+                )
                 if bool(inactive_frames.any().item()):
                     l_inactive = target_inactive_loss(
                         clean[present_mask],

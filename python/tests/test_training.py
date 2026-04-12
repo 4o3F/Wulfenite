@@ -15,6 +15,7 @@ from wulfenite.models import SpeakerBeamSSConfig, WulfeniteTSE
 from wulfenite.training.checkpoint import load_checkpoint, save_checkpoint
 from wulfenite.training.config import TrainingConfig
 from wulfenite.training.train import (
+    _should_update_best_checkpoint,
     build_dataset,
     build_loss,
     build_optimizer,
@@ -475,3 +476,24 @@ def test_training_step_with_composer_labels(tmp_path: Path) -> None:
         overlap_frames=batch["overlap_frames"],
     )
     assert torch.isfinite(loss)
+
+
+def test_checkpoint_lexicographic_selection() -> None:
+    assert _should_update_best_checkpoint(
+        1.20,
+        0.50,
+        best_sdri=1.00,
+        best_inactive=0.20,
+    )
+    assert _should_update_best_checkpoint(
+        1.03,
+        0.10,
+        best_sdri=1.00,
+        best_inactive=0.20,
+    )
+    assert not _should_update_best_checkpoint(
+        1.03,
+        0.30,
+        best_sdri=1.00,
+        best_inactive=0.20,
+    )

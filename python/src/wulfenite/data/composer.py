@@ -53,6 +53,19 @@ __all__ = [
     "ClipRenderer",
 ]
 
+
+def _masked_rms(
+    signal: torch.Tensor,
+    mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> float:
+    """Return RMS computed only over the samples selected by ``mask``."""
+    masked = signal[mask.to(signal.device).bool()]
+    if masked.numel() == 0:
+        return eps
+    return float(torch.sqrt(torch.mean(masked * masked) + eps))
+
+
 _ChoiceT = TypeVar("_ChoiceT")
 
 
@@ -712,9 +725,24 @@ class ClipRenderer:
                 nontarget_track = nontarget_track + track
 
         if plan.target_present and nontarget_track.abs().max() > 0:
-            nontarget_track = _rescale_to_snr(
-                target_track, nontarget_track, plan.snr_db
-            )
+            # Scale the interferer on overlap samples so configured SNR
+            # matches the actual target-vs-interferer ratio where both speak.
+            overlap_sample_mask = plan.overlap_frames.repeat_interleave(
+                plan.stride_samples
+            )[:plan.segment_samples]
+            if bool(overlap_sample_mask.any().item()):
+                target_rms_val = _masked_rms(target_track, overlap_sample_mask)
+                nontarget_rms_val = _masked_rms(
+                    nontarget_track, overlap_sample_mask
+                )
+                factor = 10.0 ** (plan.snr_db / 20.0)
+                if nontarget_rms_val > 1e-8:
+                    scale = target_rms_val / (nontarget_rms_val * factor + 1e-8)
+                    nontarget_track = nontarget_track * scale
+            else:
+                nontarget_track = _rescale_to_snr(
+                    target_track, nontarget_track, plan.snr_db
+                )
         else:
             target_track = torch.zeros_like(target_track)
 

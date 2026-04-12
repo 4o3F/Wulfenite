@@ -272,6 +272,36 @@ def test_inactive_loss_zero_when_output_silent() -> None:
     assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
 
+def test_inactive_loss_excludes_low_energy_frames() -> None:
+    estimate = torch.tensor([[10.0, 10.0, 1.0, 1.0]])
+    mixture = torch.tensor([[1e-3, 1e-3, 1.0, 1.0]])
+    inactive_frames = torch.tensor([[True, True]])
+
+    loss = target_inactive_loss(
+        estimate,
+        mixture,
+        inactive_frames=inactive_frames,
+        frame_size=2,
+    )
+
+    assert loss.item() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_inactive_loss_ratio_clamp() -> None:
+    estimate = torch.ones(1, 2)
+    mixture = torch.full((1, 2), 0.008)
+    inactive_frames = torch.tensor([[True]])
+
+    loss = target_inactive_loss(
+        estimate,
+        mixture,
+        inactive_frames=inactive_frames,
+        frame_size=2,
+    )
+
+    assert loss.item() == pytest.approx(4.0, abs=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # presence
 # ---------------------------------------------------------------------------
@@ -398,6 +428,45 @@ def test_combined_loss_without_presence_head() -> None:
     assert parts.inactive == 0.0
     total.backward()
     assert clean.grad is not None
+
+
+def test_combined_loss_inactive_uses_nontarget_mask() -> None:
+    frame = 160
+    clean = torch.zeros(1, frame * 3)
+    mixture = torch.ones(1, frame * 3)
+    target = torch.zeros(1, frame * 3)
+    present = torch.ones(1)
+
+    clean[:, frame:2 * frame] = 1.0
+    clean[:, 2 * frame:] = 2.0
+    target[:, :frame] = 1.0
+    target_active = torch.tensor([[True, False, False]])
+    nontarget_active = torch.tensor([[False, True, False]])
+
+    total, parts = WulfeniteLoss(
+        weights=LossWeights(
+            sdr=0.0,
+            mr_stft=0.0,
+            absent=0.0,
+            presence=0.0,
+            recall=0.0,
+            inactive=1.0,
+        ),
+        mr_stft_loss=MultiResolutionSTFTLoss(
+            fft_sizes=(256,), hop_sizes=(64,), win_lengths=(256,),
+        ),
+    )(
+        clean,
+        target,
+        mixture,
+        present,
+        presence_logit=None,
+        target_active_frames=target_active,
+        nontarget_active_frames=nontarget_active,
+    )
+
+    assert total.item() == pytest.approx(1.0, abs=1e-6)
+    assert parts.inactive == pytest.approx(1.0, abs=1e-6)
 
 
 def test_loss_dataclasses_no_longer_expose_speaker_cls() -> None:

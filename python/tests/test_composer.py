@@ -14,8 +14,11 @@ import torch
 from wulfenite.data import MixerConfig, scan_aishell1
 from wulfenite.data.composer import (
     ClipFamily,
+    ClipPlan,
     ClipPlanner,
     ClipRenderer,
+    EventSlot,
+    EventType,
     SpeakerCast,
 )
 
@@ -168,3 +171,83 @@ def test_renderer_finite_values(tmp_path: Path) -> None:
     assert torch.isfinite(sample["mixture"]).all()
     assert torch.isfinite(sample["target"]).all()
     assert torch.isfinite(sample["enrollment"]).all()
+
+
+def test_renderer_overlap_snr_accuracy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, renderer, cast = _renderer_and_cast(tmp_path)
+    renderer.composer.crossfade_samples = 0
+    total_frames = renderer.composer.total_frames
+    overlap_start = total_frames // 4
+    overlap_end = (3 * total_frames) // 4
+    target_active = torch.ones(total_frames, dtype=torch.bool)
+    nontarget_active = torch.zeros(total_frames, dtype=torch.bool)
+    nontarget_active[overlap_start:overlap_end] = True
+    overlap_frames = target_active & nontarget_active
+    plan = ClipPlan(
+        family=ClipFamily.MULTI_TURN_TARGET_PRESENT,
+        slots=(
+            EventSlot(
+                index=0,
+                event_type=EventType.TARGET_ONLY,
+                start_frame=0,
+                end_frame=overlap_start,
+                active_roles=("A",),
+            ),
+            EventSlot(
+                index=1,
+                event_type=EventType.OVERLAP,
+                start_frame=overlap_start,
+                end_frame=overlap_end,
+                active_roles=("A", "B"),
+                nontarget_role="B",
+            ),
+            EventSlot(
+                index=2,
+                event_type=EventType.TARGET_ONLY,
+                start_frame=overlap_end,
+                end_frame=total_frames,
+                active_roles=("A",),
+            ),
+        ),
+        total_frames=total_frames,
+        stride_samples=renderer.composer.stride_samples,
+        segment_samples=renderer.composer.segment_samples,
+        use_third_speaker=False,
+        target_present=True,
+        snr_db=6.0,
+        noise_snr_db=20.0,
+        target_active_frames=target_active,
+        nontarget_active_frames=nontarget_active,
+        overlap_frames=overlap_frames,
+    )
+
+    monkeypatch.setattr(
+        renderer,
+        "_load_role_stems",
+        lambda plan_, cast_, rng_: {
+            "A": torch.full((plan_.segment_samples,), 0.25, dtype=torch.float32),
+            "B": torch.full((plan_.segment_samples,), 0.50, dtype=torch.float32),
+        },
+    )
+
+    sample = renderer.render(
+        plan,
+        cast,
+        {"S0000": 0, "S0001": 1, "S0002": 2},
+        random.Random(8),
+    )
+    overlap_mask = plan.overlap_frames.repeat_interleave(plan.stride_samples)[
+        :plan.segment_samples
+    ]
+    target_overlap = sample["target"][overlap_mask]
+    nontarget_overlap = (sample["mixture"] - sample["target"])[overlap_mask]
+    target_rms = float(torch.sqrt(torch.mean(target_overlap * target_overlap)))
+    nontarget_rms = float(
+        torch.sqrt(torch.mean(nontarget_overlap * nontarget_overlap))
+    )
+    measured_snr_db = 20.0 * math.log10(target_rms / (nontarget_rms + 1e-12))
+
+    assert measured_snr_db == pytest.approx(plan.snr_db, abs=1.0)

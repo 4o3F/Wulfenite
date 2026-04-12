@@ -287,6 +287,21 @@ def _format_lr(optimizer: torch.optim.Optimizer) -> str:
     return " ".join(parts)
 
 
+def _should_update_best_checkpoint(
+    sdri: float,
+    inactive: float,
+    *,
+    best_sdri: float,
+    best_inactive: float,
+    sdri_tolerance: float = 0.05,
+) -> bool:
+    """Return whether ``(sdri, inactive)`` beats the current best tuple."""
+    sdri_improved = sdri > best_sdri + sdri_tolerance
+    sdri_tied = abs(sdri - best_sdri) <= sdri_tolerance
+    inactive_improved = inactive < best_inactive
+    return sdri_improved or (sdri_tied and inactive_improved)
+
+
 @torch.no_grad()
 def compute_val_sdri_present(
     estimate: torch.Tensor,
@@ -667,6 +682,7 @@ def run_training(
     optimizer, scheduler = build_optimizer(model, cfg)
 
     best_sdri = float("-inf")
+    best_inactive = float("inf")
     epochs_without_improvement = 0
     global_step = 0
     epoch_iter = tqdm(
@@ -769,8 +785,16 @@ def run_training(
                 config=cfg,
                 metrics=metrics,
             )
-        if val_parts["sdri_db"] > best_sdri:
-            best_sdri = val_parts["sdri_db"]
+        sdri = val_parts["sdri_db"]
+        inactive_val = val_parts["inactive"]
+        if _should_update_best_checkpoint(
+            sdri,
+            inactive_val,
+            best_sdri=best_sdri,
+            best_inactive=best_inactive,
+        ):
+            best_sdri = max(best_sdri, sdri)
+            best_inactive = inactive_val
             epochs_without_improvement = 0
             save_checkpoint(
                 out_dir / "best.pt",
@@ -782,7 +806,10 @@ def run_training(
                 config=cfg,
                 metrics=metrics,
             )
-            log(f"[best] val_sdri_db improved to {best_sdri:+.4f} -> saved best.pt")
+            log(
+                f"[best] val_sdri_db={sdri:+.4f} "
+                f"val_inactive={inactive_val:.4f} -> saved best.pt"
+            )
         else:
             epochs_without_improvement += 1
 
