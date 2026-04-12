@@ -46,7 +46,8 @@ batch enrollment tensor is stacked.
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import dataclass, field, replace
 from typing import Sequence
 
 import soundfile as sf
@@ -67,6 +68,12 @@ from .noise import NoiseEntry
 
 
 SAMPLE_RATE = 16000
+
+
+def _default_composer_config() -> "ComposerConfig":
+    from .composer import ComposerConfig
+
+    return ComposerConfig()
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +98,8 @@ class MixerConfig:
 
     # --- Mixing ---
     snr_range_db: tuple[float, float] = (-5.0, 5.0)
+    composition_mode: str = "clip_composer"
+    composer: "ComposerConfig" = field(default_factory=_default_composer_config)
     target_present_prob: float = 0.85  # fraction of target-present samples
     transition_prob: float = 0.0
     transition_min_fraction: float = 0.25
@@ -154,10 +163,21 @@ class MixerConfig:
                 "transition_min_target_rms must be positive; got "
                 f"{self.transition_min_target_rms}"
             )
+        if self.composition_mode not in ("clip_composer", "legacy_branch"):
+            raise ValueError(
+                "composition_mode must be 'clip_composer' or 'legacy_branch'; got "
+                f"{self.composition_mode!r}"
+            )
         self.enrollment_seconds_range = (
             float(self.enrollment_seconds),
             float(self.enrollment_seconds),
         )
+        if self.composition_mode == "clip_composer":
+            self.composer = replace(
+                self.composer,
+                sample_rate=self.sample_rate,
+                segment_seconds=self.segment_seconds,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -304,13 +324,55 @@ class WulfeniteMixer(Dataset):
             synth_room_rir(cfg.reverb, pool_rng)
             for _ in range(pool_size)
         ] if build_pool else []
+        self._speaker_mean_frames = {
+            sid: sum(entry.num_frames for entry in entries) / len(entries)
+            for sid, entries in self.speakers.items()
+        }
+        self._speaker_primary_dataset = {
+            sid: max(
+                {entry.dataset for entry in entries},
+                key=lambda dataset: sum(
+                    1 for entry in entries if entry.dataset == dataset
+                ),
+            )
+            for sid, entries in self.speakers.items()
+        }
+        self._planner = None
+        self._renderer = None
+        if cfg.composition_mode == "clip_composer":
+            from .composer import ClipPlanner, ClipRenderer
+
+            if cfg.transition_prob > 0.0:
+                warnings.warn(
+                    "transition_prob is deprecated in clip_composer mode and will "
+                    "be ignored",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            if abs(cfg.target_present_prob - 0.85) > 1e-6:
+                warnings.warn(
+                    "target_present_prob is ignored in clip_composer mode; use "
+                    "family_*_weight in ComposerConfig instead",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            self._planner = ClipPlanner(
+                cfg.composer,
+                allow_third_speaker=len(self.speaker_ids) >= 3,
+            )
+            self._renderer = ClipRenderer(
+                cfg,
+                noise_pool=self.noise_pool,
+                rir_pool=self._rir_pool,
+            )
 
         total_utts = sum(len(v) for v in self.speakers.values())
         print(
             f"[WulfeniteMixer] speakers={len(self.speaker_ids)} "
             f"utterances={total_utts} noise_files={len(self.noise_pool)} "
             f"rir_pool={len(self._rir_pool)} "
-            f"epoch={samples_per_epoch} target_present_prob={cfg.target_present_prob}"
+            f"epoch={samples_per_epoch} composition_mode={cfg.composition_mode} "
+            f"target_present_prob={cfg.target_present_prob}"
         )
 
     def __len__(self) -> int:
@@ -329,6 +391,76 @@ class WulfeniteMixer(Dataset):
         if self._rir_pool:
             return rng.choice(self._rir_pool)
         return synth_room_rir(self.cfg.reverb, rng)
+
+    def _sample_interferer_speaker(
+        self,
+        target_spk: str,
+        used: set[str],
+        rng: random.Random,
+    ) -> str:
+        candidates = [sid for sid in self.speaker_ids if sid not in used]
+        if not candidates:
+            raise RuntimeError("Need at least one unused interferer speaker.")
+        target_dataset = self._speaker_primary_dataset[target_spk]
+        same_dataset = [
+            sid for sid in candidates
+            if self._speaker_primary_dataset[sid] == target_dataset
+        ]
+        pool = same_dataset or candidates
+        target_mean = self._speaker_mean_frames[target_spk]
+        pool = sorted(
+            pool,
+            key=lambda sid: abs(self._speaker_mean_frames[sid] - target_mean),
+        )
+        head = pool[:max(1, min(len(pool), 8))]
+        return rng.choice(head)
+
+    def _sample_speaker_cast(
+        self,
+        plan: "ClipPlan",
+        rng: random.Random,
+    ) -> "SpeakerCast":
+        from .composer import SpeakerCast
+
+        target_spk = rng.choice(self.speaker_ids)
+        target_entry, enroll_entry = rng.sample(self.speakers[target_spk], 2)
+        used = {target_spk}
+        interferer_ids: list[str] = []
+        interferer_entries: dict[str, AudioEntry] = {}
+        roles = ("B", "C") if plan.use_third_speaker else ("B",)
+        for role in roles:
+            spk_id = self._sample_interferer_speaker(target_spk, used, rng)
+            used.add(spk_id)
+            interferer_ids.append(spk_id)
+            interferer_entries[role] = rng.choice(self.speakers[spk_id])
+        return SpeakerCast(
+            target_speaker_id=target_spk,
+            interferer_speaker_ids=tuple(interferer_ids),
+            target_entry=target_entry,
+            enrollment_entry=enroll_entry,
+            interferer_entries=interferer_entries,
+        )
+
+    def _attach_legacy_frame_labels(self, sample: dict) -> dict:
+        stride = self.cfg.composer.stride_samples
+        target = sample["target"]
+        n_frames = target.shape[-1] // stride
+        usable = n_frames * stride
+        target_active = (
+            target[:usable]
+            .reshape(n_frames, stride)
+            .abs()
+            .amax(dim=-1)
+            .gt(1e-7)
+        )
+        if bool(sample["target_present"].item() >= 0.5):
+            nontarget_active = torch.ones(n_frames, dtype=torch.bool)
+        else:
+            nontarget_active = torch.zeros(n_frames, dtype=torch.bool)
+        sample["target_active_frames"] = target_active
+        sample["nontarget_active_frames"] = nontarget_active
+        sample["overlap_frames"] = target_active & nontarget_active
+        return sample
 
     def _prepare_present_sources(
         self,
@@ -548,11 +680,17 @@ class WulfeniteMixer(Dataset):
 
     def __getitem__(self, index: int) -> dict:
         rng = self._rng(index)
+        if self.cfg.composition_mode == "clip_composer":
+            if self._planner is None or self._renderer is None:
+                raise RuntimeError("clip_composer mode requires planner + renderer")
+            plan = self._planner.plan(rng=rng)
+            cast = self._sample_speaker_cast(plan, rng)
+            return self._renderer.render(plan, cast, self.speaker_to_idx, rng)
         if rng.random() < self.cfg.transition_prob:
-            return self._make_transition_sample(rng)
+            return self._attach_legacy_frame_labels(self._make_transition_sample(rng))
         if rng.random() < self.cfg.target_present_prob:
-            return self._make_present_sample(rng)
-        return self._make_absent_sample(rng)
+            return self._attach_legacy_frame_labels(self._make_present_sample(rng))
+        return self._attach_legacy_frame_labels(self._make_absent_sample(rng))
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +708,12 @@ def collate_mixer_batch(batch: Sequence[dict]) -> dict:
     enrollment = torch.stack([b["enrollment"] for b in batch], dim=0)
     enrollment_fbank = compute_fbank_batch(enrollment)
 
+    def _stack_frame_labels(key: str) -> torch.Tensor:
+        labels = [b[key] for b in batch]
+        if any(torch.is_floating_point(v) for v in labels):
+            return torch.stack([v.to(torch.float32) for v in labels], dim=0)
+        return torch.stack([v.to(torch.bool) for v in labels], dim=0)
+
     return {
         "mixture": torch.stack([b["mixture"] for b in batch], dim=0),
         "target": torch.stack([b["target"] for b in batch], dim=0),
@@ -580,4 +724,7 @@ def collate_mixer_batch(batch: Sequence[dict]) -> dict:
             [b["target_speaker_idx"] for b in batch], dim=0,
         ),
         "snr_db": torch.stack([b["snr_db"] for b in batch], dim=0),
+        "target_active_frames": _stack_frame_labels("target_active_frames"),
+        "nontarget_active_frames": _stack_frame_labels("nontarget_active_frames"),
+        "overlap_frames": _stack_frame_labels("overlap_frames"),
     }

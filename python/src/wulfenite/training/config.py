@@ -22,6 +22,17 @@ class TrainingConfig:
     segment_seconds: float = 4.0
     enrollment_seconds: float = 4.0
     snr_range_db: tuple[float, float] = (-5.0, 5.0)
+    composition_mode: str = "clip_composer"
+    family_multiturn_weight: float = 0.60
+    family_overlap_heavy_weight: float = 0.25
+    family_hard_negative_weight: float = 0.15
+    min_events: int = 4
+    max_events: int = 8
+    min_event_seconds: float = 0.30
+    max_event_seconds: float = 1.20
+    crossfade_ms: float = 5.0
+    optional_third_speaker_prob: float = 0.35
+    gain_drift_db_range: tuple[float, float] = (-1.5, 1.5)
     target_present_prob: float = 0.85
     transition_prob: float = 0.0
     transition_warmup_ratio: float = 0.0
@@ -65,6 +76,7 @@ class TrainingConfig:
     loss_absent: float = 0.5
     loss_presence: float = 0.1
     loss_recall: float = 0.5
+    loss_inactive: float = 0.25
     recall_floor: float = 0.3
     recall_frame_size: int = 320
 
@@ -83,6 +95,25 @@ class TrainingConfig:
     seed: int = 1234
 
     def __post_init__(self) -> None:
+        if self.composition_mode not in ("clip_composer", "legacy_branch"):
+            raise ValueError(
+                "composition_mode must be 'clip_composer' or 'legacy_branch'; got "
+                f"{self.composition_mode!r}"
+            )
+        if self.min_events <= 0 or self.max_events < self.min_events:
+            raise ValueError(
+                f"event bounds must satisfy 0 < min <= max; got "
+                f"{self.min_events}, {self.max_events}"
+            )
+        if self.min_event_seconds <= 0.0 or self.max_event_seconds < self.min_event_seconds:
+            raise ValueError(
+                "event duration bounds must satisfy 0 < min <= max; got "
+                f"{self.min_event_seconds}, {self.max_event_seconds}"
+            )
+        if self.crossfade_ms < 0.0:
+            raise ValueError(
+                f"crossfade_ms must be non-negative; got {self.crossfade_ms}"
+            )
         if self.transition_warmup_ratio < 0.0:
             raise ValueError(
                 "transition_warmup_ratio must be >= 0.0; got "

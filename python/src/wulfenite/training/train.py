@@ -14,6 +14,8 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from ..data import (
+    ClipFamily,
+    ComposerConfig,
     MixerConfig,
     ReverbConfig,
     WulfeniteMixer,
@@ -115,10 +117,34 @@ def build_dataset(cfg: TrainingConfig) -> tuple[WulfeniteMixer, WulfeniteMixer]:
     if cfg.noise_root is not None:
         noise_pool = scan_noise_dir(cfg.noise_root)
 
+    if cfg.composition_mode == "clip_composer":
+        composer_cfg = ComposerConfig(
+            sample_rate=16000,
+            segment_seconds=cfg.segment_seconds,
+            family_weights={
+                ClipFamily.MULTI_TURN_TARGET_PRESENT: cfg.family_multiturn_weight,
+                ClipFamily.OVERLAP_HEAVY: cfg.family_overlap_heavy_weight,
+                ClipFamily.HARD_NEGATIVE_ABSENT: cfg.family_hard_negative_weight,
+            },
+            min_events=cfg.min_events,
+            max_events=cfg.max_events,
+            min_event_frames=max(1, int(round(cfg.min_event_seconds * 100))),
+            max_event_frames=max(1, int(round(cfg.max_event_seconds * 100))),
+            crossfade_samples=max(0, int(round(cfg.crossfade_ms * 16))),
+            optional_third_speaker_prob=cfg.optional_third_speaker_prob,
+            gain_drift_db_range=tuple(cfg.gain_drift_db_range),
+            snr_range_db=tuple(cfg.snr_range_db),
+            noise_snr_range_db=tuple(cfg.noise_snr_range_db),
+        )
+    else:
+        composer_cfg = ComposerConfig()
+
     train_mixer_cfg = MixerConfig(
         segment_seconds=cfg.segment_seconds,
         enrollment_seconds=cfg.enrollment_seconds,
         snr_range_db=tuple(cfg.snr_range_db),
+        composition_mode=cfg.composition_mode,
+        composer=composer_cfg,
         target_present_prob=cfg.target_present_prob,
         transition_prob=cfg.transition_prob,
         transition_min_fraction=cfg.transition_min_fraction,
@@ -176,6 +202,7 @@ def build_loss(cfg: TrainingConfig) -> WulfeniteLoss:
             absent=cfg.loss_absent,
             presence=cfg.loss_presence,
             recall=cfg.loss_recall,
+            inactive=cfg.loss_inactive,
         ),
         recall_frame_size=cfg.recall_frame_size,
         recall_floor=cfg.recall_floor,
@@ -425,6 +452,9 @@ def train_one_epoch(
             mixture=batch["mixture"],
             target_present=batch["target_present"],
             presence_logit=outputs.get("presence_logit"),
+            target_active_frames=batch.get("target_active_frames"),
+            nontarget_active_frames=batch.get("nontarget_active_frames"),
+            overlap_frames=batch.get("overlap_frames"),
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -445,6 +475,7 @@ def train_one_epoch(
             "sdr": f"{parts.sdr:+.2f}",
             "stft": f"{parts.mr_stft:.3f}",
             "recall": f"{parts.recall:.3f}",
+            "inactive": f"{parts.inactive:.3f}",
             "lr_s": f"{optimizer.param_groups[-1]['lr']:.1e}",
         }
         pbar.set_postfix(refresh=False, **postfix)
@@ -454,6 +485,7 @@ def train_one_epoch(
                 f"epoch {epoch} step {step + 1}/{len(loader)} "
                 f"loss={parts.total:+.4f} sdr={parts.sdr:+.3f} "
                 f"stft={parts.mr_stft:.4f} recall={parts.recall:.4f} "
+                f"inactive={parts.inactive:.4f} "
                 f"absent={parts.absent:.4f} "
                 f"presence={parts.presence:.4f} "
                 f"present={parts.n_present}/{parts.n_present + parts.n_absent} "
@@ -480,6 +512,7 @@ def validate(
     sdr_loss_sum = 0.0
     stft_sum = 0.0
     recall_sum = 0.0
+    inactive_sum = 0.0
     absent_sum = 0.0
     presence_sum = 0.0
     sdr_db_sum = 0.0
@@ -509,11 +542,15 @@ def validate(
             mixture=batch["mixture"],
             target_present=batch["target_present"],
             presence_logit=outputs.get("presence_logit"),
+            target_active_frames=batch.get("target_active_frames"),
+            nontarget_active_frames=batch.get("nontarget_active_frames"),
+            overlap_frames=batch.get("overlap_frames"),
         )
         total += parts.total
         sdr_loss_sum += parts.sdr
         stft_sum += parts.mr_stft
         recall_sum += parts.recall
+        inactive_sum += parts.inactive
         absent_sum += parts.absent
         presence_sum += parts.presence
         batch_sdr_db, batch_sdri_db, batch_n_present = compute_val_sdri_present(
@@ -533,6 +570,7 @@ def validate(
         "sdr_loss": sdr_loss_sum / n_safe,
         "mr_stft": stft_sum / n_safe,
         "recall": recall_sum / n_safe,
+        "inactive": inactive_sum / n_safe,
         "absent": absent_sum / n_safe,
         "presence": presence_sum / n_safe,
         "sdr_db": sdr_db_sum / n_present_safe,
@@ -714,6 +752,7 @@ def run_training(
             f"val_sdri_db={val_parts['sdri_db']:+.3f} "
             f"val_stft={val_parts['mr_stft']:.4f} "
             f"val_recall={val_parts['recall']:.4f} "
+            f"val_inactive={val_parts['inactive']:.4f} "
             f"val_absent={val_parts['absent']:.4f} time={train_time:.1f}s "
             f"shuffle_drop={shuffle_drop:.3f} "
             f"same_cos={same:.3f} diff_cos={diff:.3f} cos_gap={gap:.3f}"
@@ -774,6 +813,23 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--segment-seconds", type=float, default=4.0)
     parser.add_argument("--enrollment-seconds", type=float, default=4.0)
     parser.add_argument("--snr-range-db", type=float, nargs=2, default=(-5.0, 5.0))
+    parser.add_argument(
+        "--composition-mode",
+        choices=("clip_composer", "legacy_branch"),
+        default="clip_composer",
+    )
+    parser.add_argument("--family-multiturn-weight", type=float, default=0.60)
+    parser.add_argument("--family-overlap-heavy-weight", type=float, default=0.25)
+    parser.add_argument("--family-hard-negative-weight", type=float, default=0.15)
+    parser.add_argument("--min-events", type=int, default=4)
+    parser.add_argument("--max-events", type=int, default=8)
+    parser.add_argument("--min-event-seconds", type=float, default=0.30)
+    parser.add_argument("--max-event-seconds", type=float, default=1.20)
+    parser.add_argument("--crossfade-ms", type=float, default=5.0)
+    parser.add_argument("--optional-third-speaker-prob", type=float, default=0.35)
+    parser.add_argument(
+        "--gain-drift-db-range", type=float, nargs=2, default=(-1.5, 1.5),
+    )
     parser.add_argument("--target-present-prob", type=float, default=0.85)
     parser.add_argument("--transition-prob", type=float, default=0.0)
     parser.add_argument("--transition-warmup-ratio", type=float, default=0.0)
@@ -815,6 +871,7 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--loss-absent", type=float, default=0.5)
     parser.add_argument("--loss-presence", type=float, default=0.1)
     parser.add_argument("--loss-recall", type=float, default=0.5)
+    parser.add_argument("--loss-inactive", type=float, default=0.25)
     parser.add_argument("--recall-floor", type=float, default=0.3)
     parser.add_argument("--recall-frame-size", type=int, default=320)
 
@@ -840,6 +897,17 @@ def _parse_args() -> TrainingConfig:
         segment_seconds=args.segment_seconds,
         enrollment_seconds=args.enrollment_seconds,
         snr_range_db=tuple(args.snr_range_db),
+        composition_mode=args.composition_mode,
+        family_multiturn_weight=args.family_multiturn_weight,
+        family_overlap_heavy_weight=args.family_overlap_heavy_weight,
+        family_hard_negative_weight=args.family_hard_negative_weight,
+        min_events=args.min_events,
+        max_events=args.max_events,
+        min_event_seconds=args.min_event_seconds,
+        max_event_seconds=args.max_event_seconds,
+        crossfade_ms=args.crossfade_ms,
+        optional_third_speaker_prob=args.optional_third_speaker_prob,
+        gain_drift_db_range=tuple(args.gain_drift_db_range),
         target_present_prob=args.target_present_prob,
         transition_prob=args.transition_prob,
         transition_warmup_ratio=args.transition_warmup_ratio,
@@ -877,6 +945,7 @@ def _parse_args() -> TrainingConfig:
         loss_absent=args.loss_absent,
         loss_presence=args.loss_presence,
         loss_recall=args.loss_recall,
+        loss_inactive=args.loss_inactive,
         recall_floor=args.recall_floor,
         recall_frame_size=args.recall_frame_size,
         num_workers=args.num_workers,

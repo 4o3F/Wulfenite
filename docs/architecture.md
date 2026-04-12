@@ -198,12 +198,18 @@ interface so Rust-side code can use it for optional VAD-style gating.
 - **MAGICDATA** (~755 h, 1080 spk) — large clean Mandarin speaker expansion
 - **MUSAN noise** (~3.6 GB subset) — additive non-speech noise augmentation
 
-On-the-fly 2-speaker mixer produces training samples:
+On-the-fly clip composer produces training samples:
 
-- 4-second segments of target + interferer from distinct AISHELL speakers
-- SNR drawn from [-5, +5] dB
-- ~15 % of samples swap target for silence (target-absent branch)
-- Additive DNS4 noise at 10-25 dB SNR on the final mixture
+- 4-second clips built from 4-8 frame-aligned conversational events
+- Three clip families: multi-turn target-present, overlap-heavy, and
+  hard-negative target-absent
+- Event types: target-only, nontarget-only, overlap, and background-only
+- Clip-level acoustic consistency: one room / RIR choice per mixture,
+  one background-noise bed, and slow gain drift instead of abrupt
+  per-source level jumps
+- Framewise labels at the encoder stride (10 ms / 160 samples):
+  `target_active_frames`, `nontarget_active_frames`, and `overlap_frames`
+- Additive noise at 10-25 dB SNR on the final mixture
 - Optional room reverb (synthetic RIRs, RT60 0.08-0.25 s)
 
 CN-Celeb and WenetSpeech remain optional later expansions if AISHELL +

@@ -20,6 +20,7 @@ from wulfenite.losses import (
     compute_sdri_db,
     presence_loss,
     sdr_loss,
+    target_inactive_loss,
     target_recall_loss,
     target_absent_loss,
 )
@@ -199,6 +200,22 @@ def test_recall_loss_no_penalty_above_floor() -> None:
     assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
 
+def test_recall_loss_with_ground_truth_active_frames() -> None:
+    target = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+    estimate = torch.zeros_like(target)
+    active_frames = torch.tensor([[True, False]])
+
+    loss = target_recall_loss(
+        estimate,
+        target,
+        frame_size=2,
+        active_frames=active_frames,
+        floor=0.3,
+    )
+
+    assert loss.item() == pytest.approx(0.3, abs=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # silence / absent
 # ---------------------------------------------------------------------------
@@ -223,6 +240,36 @@ def test_target_absent_larger_than_mixture_is_penalized() -> None:
     loud = mixture * 3.0
     loss = target_absent_loss(loud, mixture)
     assert loss.item() > 8.5, f"expected > 8.5, got {loss.item()}"
+
+
+def test_inactive_loss_penalizes_output_on_silent_frames() -> None:
+    estimate = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+    mixture = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+    inactive_frames = torch.tensor([[True, False]])
+
+    loss = target_inactive_loss(
+        estimate,
+        mixture,
+        inactive_frames=inactive_frames,
+        frame_size=2,
+    )
+
+    assert loss.item() > 0.0
+
+
+def test_inactive_loss_zero_when_output_silent() -> None:
+    estimate = torch.zeros(1, 4)
+    mixture = torch.ones(1, 4)
+    inactive_frames = torch.tensor([[True, True]])
+
+    loss = target_inactive_loss(
+        estimate,
+        mixture,
+        inactive_frames=inactive_frames,
+        frame_size=2,
+    )
+
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +318,7 @@ def test_combined_loss_all_present() -> None:
     assert parts.n_absent == 0
     assert parts.absent == 0.0
     assert parts.recall >= 0.0
+    assert parts.inactive >= 0.0
     assert torch.isfinite(total)
     total.backward()
     assert clean.grad is not None and torch.isfinite(clean.grad).all()
@@ -297,6 +345,7 @@ def test_combined_loss_all_absent() -> None:
     assert parts.sdr == 0.0
     assert parts.mr_stft == 0.0
     assert parts.recall == 0.0
+    assert parts.inactive == 0.0
     assert parts.absent > 0.0
     total.backward()
     assert clean.grad is not None and torch.isfinite(clean.grad).all()
@@ -324,6 +373,7 @@ def test_combined_loss_mixed_batch() -> None:
     assert parts.n_absent == 2
     assert parts.sdr != 0.0  # present branch active
     assert parts.recall >= 0.0
+    assert parts.inactive >= 0.0
     assert parts.absent > 0.0
     total.backward()
     assert clean.grad is not None and torch.isfinite(clean.grad).all()
@@ -345,6 +395,7 @@ def test_combined_loss_without_presence_head() -> None:
     )
     total, parts = loss_fn(clean, target, mixture, present, presence_logit=None)
     assert parts.presence == 0.0
+    assert parts.inactive == 0.0
     total.backward()
     assert clean.grad is not None
 

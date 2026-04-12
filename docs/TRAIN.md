@@ -396,6 +396,13 @@ uv run --directory python python -m wulfenite.training.train \
     --aishell3-root ../assets/aishell3 \
     --noise-root ../assets/musan/noise \
     --out-dir ../assets/checkpoints/smoke_test \
+    --composition-mode clip_composer \
+    --family-multiturn-weight 0.60 \
+    --family-overlap-heavy-weight 0.25 \
+    --family-hard-negative-weight 0.15 \
+    --min-events 4 \
+    --max-events 8 \
+    --crossfade-ms 5.0 \
     --batch-size 4 \
     --epochs 1 \
     --samples-per-epoch 100 \
@@ -410,11 +417,15 @@ Key design points of the training loop (from `docs/architecture.md`):
   ``streaming_step`` deployment path is numerically equivalent to
   the same forward pass, verified by
   ``tests/test_speakerbeam_ss.py::test_speakerbeam_streaming_matches_forward``.
+- **Clip composer** — the default mixer path builds 4-second clips
+  from multi-turn target-present, overlap-heavy, and hard-negative
+  templates rather than the older branch-specific recipes.
 - **`WulfeniteLoss` combined loss** — direct SDR + MR-STFT + target-
-  absent energy penalty + presence BCE.
-- **Mixture-aware silence** — `target_present_prob` defaults to
-  0.85, so ~15 % of batches teach the "target is not talking →
-  output silence" behavior.
+  absent energy penalty + presence BCE, plus framewise inactive-region
+  supervision when the mixer provides labels.
+- **Mixture-aware silence** — hard-negative clips and framewise target-
+  inactive labels teach the "target is not talking → output silence"
+  behavior explicitly.
 - **Speaker encoder is fine-tuned** — the CAM++ encoder is optimized
   jointly with the separator at a lower learning rate (`--encoder-lr`,
   default 1e-5) to preserve pretrained speaker discrimination.

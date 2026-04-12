@@ -289,6 +289,8 @@ def _build_mixer(
     with_noise: bool = True,
     *,
     transition_prob: float = 0.0,
+    composition_mode: str = "legacy_branch",
+    segment_seconds: float = 1.0,
 ) -> WulfeniteMixer:
     a1 = _build_fake_aishell1(tmp_path / "a1", num_speakers=4,
                               utts_per_speaker=4)
@@ -302,8 +304,9 @@ def _build_mixer(
         _build_fake_noise_dir(noise_root, num_files=3, seconds=3.0)
         noise_pool = scan_noise_dir(noise_root)
     cfg = MixerConfig(
-        segment_seconds=1.0,
-        enrollment_seconds=1.0,
+        segment_seconds=segment_seconds,
+        enrollment_seconds=segment_seconds,
+        composition_mode=composition_mode,
         target_present_prob=0.75,
         transition_prob=transition_prob,
     )
@@ -326,6 +329,33 @@ def test_mixer_sample_shapes(tmp_path: Path) -> None:
     assert sample["target_present"].shape == ()
     assert sample["target_speaker_idx"].shape == ()
     assert sample["target_present"].item() in (0.0, 1.0)
+
+
+def test_mixer_composer_sample_shapes(tmp_path: Path) -> None:
+    mixer = _build_mixer(
+        tmp_path,
+        composition_mode="clip_composer",
+        segment_seconds=4.0,
+    )
+    sample = mixer[0]
+    expected_len = int(4.0 * SR)
+    expected_frames = expected_len // 160
+    assert sample["mixture"].shape == (expected_len,)
+    assert sample["target"].shape == (expected_len,)
+    assert sample["enrollment"].shape == (expected_len,)
+    assert sample["target_active_frames"].shape == (expected_frames,)
+    assert sample["nontarget_active_frames"].shape == (expected_frames,)
+    assert sample["overlap_frames"].shape == (expected_frames,)
+    assert sample["target_active_frames"].dtype == torch.bool
+
+
+def test_mixer_legacy_mode_backward_compat(tmp_path: Path) -> None:
+    mixer = _build_mixer(tmp_path, composition_mode="legacy_branch")
+    sample = mixer[0]
+    assert "target_active_frames" in sample
+    assert "nontarget_active_frames" in sample
+    assert "overlap_frames" in sample
+    assert sample["target_active_frames"].ndim == 1
 
 
 def test_mixer_emits_target_speaker_idx(tmp_path: Path) -> None:
@@ -387,6 +417,19 @@ def test_mixer_collate(tmp_path: Path) -> None:
     assert collated["target_speaker_idx"].shape == (4,)
 
 
+def test_mixer_composer_collate_framewise(tmp_path: Path) -> None:
+    mixer = _build_mixer(
+        tmp_path,
+        composition_mode="clip_composer",
+        segment_seconds=4.0,
+    )
+    batch = [mixer[i] for i in range(2)]
+    collated = collate_mixer_batch(batch)
+    assert collated["target_active_frames"].shape == (2, int(4.0 * SR) // 160)
+    assert collated["nontarget_active_frames"].shape == (2, int(4.0 * SR) // 160)
+    assert collated["overlap_frames"].shape == (2, int(4.0 * SR) // 160)
+
+
 def test_mixer_collate_recomputes_fbank(tmp_path: Path) -> None:
     mixer = _build_mixer(tmp_path)
     batch = [mixer[i] for i in range(4)]
@@ -444,6 +487,7 @@ def test_mixer_transition_sample_gates_target(
         config=MixerConfig(
             segment_seconds=1.0,
             enrollment_seconds=1.0,
+            composition_mode="legacy_branch",
             transition_prob=1.0,
             transition_min_fraction=0.25,
             apply_reverb=False,
@@ -491,6 +535,7 @@ def test_mixer_transition_falls_back_on_low_energy(
         config=MixerConfig(
             segment_seconds=1.0,
             enrollment_seconds=1.0,
+            composition_mode="legacy_branch",
             transition_prob=1.0,
             transition_min_fraction=0.25,
             transition_min_target_rms=0.01,

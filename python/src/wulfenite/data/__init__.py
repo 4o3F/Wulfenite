@@ -26,6 +26,7 @@ from .augmentation import (
     apply_rir,
     synth_room_rir,
 )
+from .composer import ClipFamily, ComposerConfig, EventType
 from .mixer import MixerConfig, WulfeniteMixer, collate_mixer_batch
 from .noise import NoiseEntry, scan_noise_dir
 
@@ -41,6 +42,9 @@ __all__ = [
     "add_noise_at_snr",
     "apply_rir",
     "synth_room_rir",
+    "ClipFamily",
+    "ComposerConfig",
+    "EventType",
     "NoiseEntry",
     "scan_noise_dir",
     "MixerConfig",

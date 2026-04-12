@@ -76,7 +76,9 @@ def _small_tse(device: torch.device | str = "cpu") -> WulfeniteTSE:
 
 def _small_loss() -> WulfeniteLoss:
     return WulfeniteLoss(
-        weights=LossWeights(sdr=1.0, mr_stft=0.5, absent=1.0, presence=0.1),
+        weights=LossWeights(
+            sdr=1.0, mr_stft=0.5, absent=1.0, presence=0.1, inactive=0.25,
+        ),
         mr_stft_loss=MultiResolutionSTFTLoss(
             fft_sizes=(256,), hop_sizes=(64,), win_lengths=(256,),
         ),
@@ -87,12 +89,16 @@ def _small_mixer(
     tmp_path: Path,
     samples: int = 8,
     target_present_prob: float = 0.75,
+    *,
+    composition_mode: str = "legacy_branch",
+    segment_seconds: float = 1.0,
 ) -> WulfeniteMixer:
     root = _build_aishell1_tree(tmp_path / "aishell1")
     speakers = scan_aishell1(root)
     cfg = MixerConfig(
-        segment_seconds=1.0,
-        enrollment_seconds=1.0,
+        segment_seconds=segment_seconds,
+        enrollment_seconds=segment_seconds,
+        composition_mode=composition_mode,
         target_present_prob=target_present_prob,
         transition_prob=0.0,
         apply_reverb=False,
@@ -112,7 +118,19 @@ def test_training_config_defaults() -> None:
     assert cfg.batch_size > 0
     assert cfg.segment_seconds == 4.0
     assert cfg.enrollment_seconds == 4.0
+    assert cfg.composition_mode == "clip_composer"
+    assert cfg.family_multiturn_weight == pytest.approx(0.60)
+    assert cfg.family_overlap_heavy_weight == pytest.approx(0.25)
+    assert cfg.family_hard_negative_weight == pytest.approx(0.15)
+    assert cfg.min_events == 4
+    assert cfg.max_events == 8
+    assert cfg.min_event_seconds == pytest.approx(0.30)
+    assert cfg.max_event_seconds == pytest.approx(1.20)
+    assert cfg.crossfade_ms == pytest.approx(5.0)
+    assert cfg.optional_third_speaker_prob == pytest.approx(0.35)
+    assert cfg.gain_drift_db_range == pytest.approx((-1.5, 1.5))
     assert cfg.loss_sdr == 1.0
+    assert cfg.loss_inactive == pytest.approx(0.25)
     assert cfg.learning_rate == pytest.approx(5e-4)
     assert cfg.encoder_lr == pytest.approx(3e-5)
     assert cfg.film_lr_scale == pytest.approx(2.0)
@@ -177,6 +195,7 @@ def test_build_dataset_disables_transitions_for_validation(tmp_path: Path) -> No
         val_samples=2,
         num_workers=0,
         device="cpu",
+        composition_mode="legacy_branch",
         transition_prob=0.35,
         transition_min_target_rms=0.02,
         noise_prob=0.0,
@@ -292,6 +311,7 @@ def test_run_training_one_epoch_writes_checkpoint(tmp_path: Path) -> None:
         noise_root=None,
         segment_seconds=1.0,
         enrollment_seconds=1.0,
+        composition_mode="legacy_branch",
         batch_size=2,
         epochs=1,
         samples_per_epoch=6,
@@ -380,6 +400,7 @@ def test_build_loss_matches_config_weights() -> None:
         loss_absent=0.9,
         loss_presence=0.05,
         loss_recall=0.6,
+        loss_inactive=0.4,
         recall_floor=0.4,
         recall_frame_size=160,
     )
@@ -392,6 +413,7 @@ def test_build_loss_matches_config_weights() -> None:
         absent=0.9,
         presence=0.05,
         recall=0.6,
+        inactive=0.4,
     )
     assert loss.recall_floor == pytest.approx(0.4)
     assert loss.recall_frame_size == 160
@@ -425,3 +447,31 @@ def test_train_one_epoch_runs(tmp_path: Path) -> None:
 
     assert isinstance(loss, float)
     assert global_step == len(loader)
+
+
+def test_training_step_with_composer_labels(tmp_path: Path) -> None:
+    torch.manual_seed(6)
+    mixer = _small_mixer(
+        tmp_path,
+        samples=2,
+        composition_mode="clip_composer",
+        segment_seconds=4.0,
+    )
+    model = _small_tse()
+    criterion = _small_loss()
+
+    from wulfenite.data import collate_mixer_batch
+
+    batch = collate_mixer_batch([mixer[i] for i in range(2)])
+    outputs = model(batch["mixture"], batch["enrollment"], batch["enrollment_fbank"])
+    loss, _ = criterion(
+        clean=outputs["clean"],
+        target=batch["target"],
+        mixture=batch["mixture"],
+        target_present=batch["target_present"],
+        presence_logit=outputs.get("presence_logit"),
+        target_active_frames=batch["target_active_frames"],
+        nontarget_active_frames=batch["nontarget_active_frames"],
+        overlap_frames=batch["overlap_frames"],
+    )
+    assert torch.isfinite(loss)

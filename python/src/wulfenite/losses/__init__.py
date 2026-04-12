@@ -7,11 +7,13 @@ Public entry points:
 - :class:`MultiResolutionSTFTLoss` / :class:`STFTLoss` — frequency
   supervision.
 - :func:`target_recall_loss` — anti-suppression floor on target-active frames.
+- :func:`target_inactive_loss` — energy penalty on target-inactive frames.
 - :func:`target_absent_loss` — energy penalty for silent-target samples.
 - :func:`presence_loss` — BCE on the target-presence head.
 """
 
 from .combined import LossParts, LossWeights, WulfeniteLoss
+from .inactive import target_inactive_loss
 from .mr_stft import MultiResolutionSTFTLoss, STFTLoss
 from .presence import presence_loss
 from .recall import target_recall_loss
@@ -26,6 +28,7 @@ __all__ = [
     "STFTLoss",
     "presence_loss",
     "target_recall_loss",
+    "target_inactive_loss",
     "compute_sdr_db",
     "compute_sdri_db",
     "sdr_loss",

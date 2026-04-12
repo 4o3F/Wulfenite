@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+from .inactive import target_inactive_loss
 from .mr_stft import MultiResolutionSTFTLoss
 from .presence import presence_loss
 from .recall import target_recall_loss
@@ -23,6 +24,7 @@ class LossWeights:
     absent: float = 0.5
     presence: float = 0.1
     recall: float = 0.5
+    inactive: float = 0.25
 
 
 @dataclass
@@ -33,6 +35,7 @@ class LossParts:
     sdr: float
     mr_stft: float
     recall: float
+    inactive: float
     absent: float
     presence: float
     n_present: int
@@ -62,6 +65,9 @@ class WulfeniteLoss(nn.Module):
         mixture: torch.Tensor,
         target_present: torch.Tensor,
         presence_logit: torch.Tensor | None = None,
+        target_active_frames: torch.Tensor | None = None,
+        nontarget_active_frames: torch.Tensor | None = None,
+        overlap_frames: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, LossParts]:
         """Compute the full training loss."""
         if clean.shape != target.shape or clean.shape != mixture.shape:
@@ -88,6 +94,7 @@ class WulfeniteLoss(nn.Module):
         l_sdr = zero
         l_stft = zero
         l_recall = zero
+        l_inactive = zero
         if n_present > 0:
             l_sdr = sdr_loss(
                 clean[present_mask], target[present_mask]
@@ -96,12 +103,24 @@ class WulfeniteLoss(nn.Module):
                 clean[present_mask], target[present_mask]
             )
             if self.weights.recall > 0.0:
+                active_frames = None
+                if target_active_frames is not None:
+                    active_frames = target_active_frames[present_mask]
                 l_recall = target_recall_loss(
                     clean[present_mask],
                     target[present_mask],
                     frame_size=self.recall_frame_size,
+                    active_frames=active_frames,
                     floor=self.recall_floor,
                 )
+            if self.weights.inactive > 0.0 and target_active_frames is not None:
+                inactive_frames = ~target_active_frames[present_mask].bool()
+                if bool(inactive_frames.any().item()):
+                    l_inactive = target_inactive_loss(
+                        clean[present_mask],
+                        mixture[present_mask],
+                        inactive_frames=inactive_frames,
+                    )
 
         l_absent = zero
         if n_absent > 0:
@@ -120,6 +139,7 @@ class WulfeniteLoss(nn.Module):
             w.sdr * l_sdr
             + w.mr_stft * l_stft
             + w.recall * l_recall
+            + w.inactive * l_inactive
             + w.absent * l_absent
             + w.presence * l_presence
         )
@@ -129,6 +149,7 @@ class WulfeniteLoss(nn.Module):
             sdr=float(l_sdr.detach()),
             mr_stft=float(l_stft.detach()),
             recall=float(l_recall.detach()),
+            inactive=float(l_inactive.detach()),
             absent=float(l_absent.detach()),
             presence=float(l_presence.detach()),
             n_present=n_present,

@@ -230,10 +230,16 @@ def _mixer_config_from_checkpoint(checkpoint_cfg: dict[str, Any]) -> MixerConfig
         enrollment_seconds = float(max(seconds_range))
     else:
         enrollment_seconds = float(checkpoint_cfg.get("enrollment_seconds", 4.0))
+    # Old checkpoints lack composition_mode; default to legacy_branch
+    # for diagnostic consistency with how the checkpoint was trained.
+    composition_mode = str(
+        checkpoint_cfg.get("composition_mode", "legacy_branch")
+    )
     return MixerConfig(
         segment_seconds=float(checkpoint_cfg.get("segment_seconds", 4.0)),
         enrollment_seconds_range=(enrollment_seconds, enrollment_seconds),
         snr_range_db=tuple(checkpoint_cfg.get("snr_range_db", (-5.0, 5.0))),
+        composition_mode=composition_mode,
         target_present_prob=float(checkpoint_cfg.get("target_present_prob", 0.85)),
         apply_reverb=reverb_prob > 0.0,
         reverb_prob=reverb_prob,
