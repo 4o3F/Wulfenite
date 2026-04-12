@@ -8,8 +8,7 @@ comments in each test for the exact invariant being checked.
 
 from __future__ import annotations
 
-import math
-
+import pytest
 import torch
 
 from wulfenite.losses import (
@@ -21,6 +20,7 @@ from wulfenite.losses import (
     compute_sdri_db,
     presence_loss,
     sdr_loss,
+    target_recall_loss,
     target_absent_loss,
 )
 
@@ -149,6 +149,57 @@ def test_mr_stft_buffers_move_with_device() -> None:
 
 
 # ---------------------------------------------------------------------------
+# recall
+# ---------------------------------------------------------------------------
+
+
+def test_recall_loss_penalizes_under_estimation() -> None:
+    target = torch.ones(2, 8)
+    estimate = torch.stack([target[0].clone(), torch.zeros_like(target[1])], dim=0)
+
+    per_sample = target_recall_loss(
+        estimate,
+        target,
+        frame_size=4,
+        floor=0.3,
+        reduction="none",
+    )
+
+    assert per_sample.shape == (2,)
+    assert per_sample.mean().item() > 0.0
+    assert per_sample[0].item() < 1e-6
+    assert per_sample[1].item() > per_sample[0].item()
+
+
+def test_recall_loss_ignores_silent_frames() -> None:
+    target = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+    estimate = torch.zeros_like(target)
+
+    loss = target_recall_loss(
+        estimate,
+        target,
+        frame_size=2,
+        floor=0.3,
+    )
+
+    assert loss.item() == pytest.approx(0.3, abs=1e-6)
+
+
+def test_recall_loss_no_penalty_above_floor() -> None:
+    target = torch.ones(1, 8)
+    estimate = target * 0.7
+
+    loss = target_recall_loss(
+        estimate,
+        target,
+        frame_size=4,
+        floor=0.3,
+    )
+
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
 # silence / absent
 # ---------------------------------------------------------------------------
 
@@ -219,6 +270,7 @@ def test_combined_loss_all_present() -> None:
     assert parts.n_present == B
     assert parts.n_absent == 0
     assert parts.absent == 0.0
+    assert parts.recall >= 0.0
     assert torch.isfinite(total)
     total.backward()
     assert clean.grad is not None and torch.isfinite(clean.grad).all()
@@ -244,6 +296,7 @@ def test_combined_loss_all_absent() -> None:
     assert parts.n_absent == B
     assert parts.sdr == 0.0
     assert parts.mr_stft == 0.0
+    assert parts.recall == 0.0
     assert parts.absent > 0.0
     total.backward()
     assert clean.grad is not None and torch.isfinite(clean.grad).all()
@@ -270,6 +323,7 @@ def test_combined_loss_mixed_batch() -> None:
     assert parts.n_present == 2
     assert parts.n_absent == 2
     assert parts.sdr != 0.0  # present branch active
+    assert parts.recall >= 0.0
     assert parts.absent > 0.0
     total.backward()
     assert clean.grad is not None and torch.isfinite(clean.grad).all()

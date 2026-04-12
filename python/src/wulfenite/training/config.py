@@ -39,13 +39,15 @@ class TrainingConfig:
     samples_per_epoch: int = 20000
     val_samples: int = 500
     learning_rate: float = 5e-4
-    encoder_lr: float = 1e-5
+    encoder_lr: float = 3e-5
+    film_lr_scale: float = 2.0
     weight_decay: float = 0.0
     use_plateau_scheduler: bool = True
     plateau_patience: int = 5
     plateau_factor: float = 0.5
     early_stopping_patience: int = 20
     grad_clip: float = 5.0
+    absent_warmup_epochs: int = 10
 
     # --- Separator architecture ---
     enc_channels: int = 4096
@@ -62,6 +64,9 @@ class TrainingConfig:
     loss_mr_stft: float = 1.0
     loss_absent: float = 0.5
     loss_presence: float = 0.1
+    loss_recall: float = 0.5
+    recall_floor: float = 0.3
+    recall_frame_size: int = 320
 
     # --- DataLoader ---
     num_workers: int = 8

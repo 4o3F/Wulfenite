@@ -175,7 +175,10 @@ def build_loss(cfg: TrainingConfig) -> WulfeniteLoss:
             mr_stft=cfg.loss_mr_stft,
             absent=cfg.loss_absent,
             presence=cfg.loss_presence,
+            recall=cfg.loss_recall,
         ),
+        recall_frame_size=cfg.recall_frame_size,
+        recall_floor=cfg.recall_floor,
     )
 
 
@@ -205,7 +208,7 @@ def build_optimizer(
         {
             "name": "separator_film",
             "params": film_params,
-            "lr": cfg.learning_rate,
+            "lr": cfg.learning_rate * cfg.film_lr_scale,
         }
     )
     param_groups.append(
@@ -441,6 +444,7 @@ def train_one_epoch(
             "loss": f"{parts.total:+.3f}",
             "sdr": f"{parts.sdr:+.2f}",
             "stft": f"{parts.mr_stft:.3f}",
+            "recall": f"{parts.recall:.3f}",
             "lr_s": f"{optimizer.param_groups[-1]['lr']:.1e}",
         }
         pbar.set_postfix(refresh=False, **postfix)
@@ -449,7 +453,8 @@ def train_one_epoch(
             log_fn(
                 f"epoch {epoch} step {step + 1}/{len(loader)} "
                 f"loss={parts.total:+.4f} sdr={parts.sdr:+.3f} "
-                f"stft={parts.mr_stft:.4f} absent={parts.absent:.4f} "
+                f"stft={parts.mr_stft:.4f} recall={parts.recall:.4f} "
+                f"absent={parts.absent:.4f} "
                 f"presence={parts.presence:.4f} "
                 f"present={parts.n_present}/{parts.n_present + parts.n_absent} "
                 f"{_format_lr(optimizer)}"
@@ -474,6 +479,7 @@ def validate(
     total = 0.0
     sdr_loss_sum = 0.0
     stft_sum = 0.0
+    recall_sum = 0.0
     absent_sum = 0.0
     presence_sum = 0.0
     sdr_db_sum = 0.0
@@ -507,6 +513,7 @@ def validate(
         total += parts.total
         sdr_loss_sum += parts.sdr
         stft_sum += parts.mr_stft
+        recall_sum += parts.recall
         absent_sum += parts.absent
         presence_sum += parts.presence
         batch_sdr_db, batch_sdri_db, batch_n_present = compute_val_sdri_present(
@@ -525,6 +532,7 @@ def validate(
     return total / n_safe, {
         "sdr_loss": sdr_loss_sum / n_safe,
         "mr_stft": stft_sum / n_safe,
+        "recall": recall_sum / n_safe,
         "absent": absent_sum / n_safe,
         "presence": presence_sum / n_safe,
         "sdr_db": sdr_db_sum / n_present_safe,
@@ -634,6 +642,13 @@ def run_training(
         epoch_idx = epoch - 1
         eff_prob = effective_transition_prob(epoch_idx, cfg)
         train_ds.cfg.transition_prob = eff_prob
+        if cfg.absent_warmup_epochs > 0 and epoch <= cfg.absent_warmup_epochs:
+            eff_absent_weight = cfg.loss_absent * (
+                epoch / cfg.absent_warmup_epochs
+            )
+        else:
+            eff_absent_weight = cfg.loss_absent
+        criterion.weights.absent = eff_absent_weight
         epoch_t0 = time.time()
         train_loss, global_step = train_one_epoch(
             model,
@@ -663,6 +678,7 @@ def run_training(
             "train_loss": train_loss,
             "val_loss": val_loss,
             "train_num_speakers": len(train_ds.speaker_ids),
+            "absent_weight": eff_absent_weight,
             **{f"val_{k}": v for k, v in val_parts.items()},
         }
 
@@ -692,10 +708,12 @@ def run_training(
 
         log(
             f"epoch {epoch} transition_prob={eff_prob:.3f} "
+            f"absent_weight={eff_absent_weight:.4f} "
             f"train_loss={train_loss:+.4f} val_loss={val_loss:+.4f} "
             f"val_sdr_db={val_parts['sdr_db']:+.3f} "
             f"val_sdri_db={val_parts['sdri_db']:+.3f} "
             f"val_stft={val_parts['mr_stft']:.4f} "
+            f"val_recall={val_parts['recall']:.4f} "
             f"val_absent={val_parts['absent']:.4f} time={train_time:.1f}s "
             f"shuffle_drop={shuffle_drop:.3f} "
             f"same_cos={same:.3f} diff_cos={diff:.3f} cos_gap={gap:.3f}"
@@ -773,12 +791,14 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--samples-per-epoch", type=int, default=20000)
     parser.add_argument("--val-samples", type=int, default=500)
     parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--encoder-lr", type=float, default=1e-5)
+    parser.add_argument("--encoder-lr", type=float, default=3e-5)
+    parser.add_argument("--film-lr-scale", type=float, default=2.0)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--plateau-patience", type=int, default=5)
     parser.add_argument("--plateau-factor", type=float, default=0.5)
     parser.add_argument("--early-stopping-patience", type=int, default=20)
     parser.add_argument("--grad-clip", type=float, default=5.0)
+    parser.add_argument("--absent-warmup-epochs", type=int, default=10)
 
     parser.add_argument("--campplus-checkpoint", type=Path, default=None)
     parser.add_argument("--enc-channels", type=int, default=4096)
@@ -794,6 +814,9 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--loss-mr-stft", type=float, default=1.0)
     parser.add_argument("--loss-absent", type=float, default=0.5)
     parser.add_argument("--loss-presence", type=float, default=0.1)
+    parser.add_argument("--loss-recall", type=float, default=0.5)
+    parser.add_argument("--recall-floor", type=float, default=0.3)
+    parser.add_argument("--recall-frame-size", type=int, default=320)
 
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--prefetch-factor", type=int, default=4)
@@ -833,12 +856,14 @@ def _parse_args() -> TrainingConfig:
         val_samples=args.val_samples,
         learning_rate=args.lr,
         encoder_lr=args.encoder_lr,
+        film_lr_scale=args.film_lr_scale,
         weight_decay=args.weight_decay,
         use_plateau_scheduler=True,
         plateau_patience=args.plateau_patience,
         plateau_factor=args.plateau_factor,
         early_stopping_patience=args.early_stopping_patience,
         grad_clip=args.grad_clip,
+        absent_warmup_epochs=args.absent_warmup_epochs,
         enc_channels=args.enc_channels,
         bottleneck_channels=args.bottleneck_channels,
         speaker_embed_dim=args.speaker_embed_dim,
@@ -851,6 +876,9 @@ def _parse_args() -> TrainingConfig:
         loss_mr_stft=args.loss_mr_stft,
         loss_absent=args.loss_absent,
         loss_presence=args.loss_presence,
+        loss_recall=args.loss_recall,
+        recall_floor=args.recall_floor,
+        recall_frame_size=args.recall_frame_size,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         val_speaker_ratio=args.val_speaker_ratio,

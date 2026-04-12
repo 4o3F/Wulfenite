@@ -114,13 +114,18 @@ def test_training_config_defaults() -> None:
     assert cfg.enrollment_seconds == 4.0
     assert cfg.loss_sdr == 1.0
     assert cfg.learning_rate == pytest.approx(5e-4)
-    assert cfg.encoder_lr == pytest.approx(1e-5)
+    assert cfg.encoder_lr == pytest.approx(3e-5)
+    assert cfg.film_lr_scale == pytest.approx(2.0)
+    assert cfg.absent_warmup_epochs == 10
     assert cfg.speaker_embed_dim == 192
     assert cfg.transition_prob == pytest.approx(0.0)
     assert cfg.transition_warmup_ratio == pytest.approx(0.0)
     assert cfg.transition_ramp_ratio == pytest.approx(0.0)
     assert cfg.transition_min_fraction == pytest.approx(0.25)
     assert cfg.transition_min_target_rms == pytest.approx(0.01)
+    assert cfg.loss_recall == pytest.approx(0.5)
+    assert cfg.recall_floor == pytest.approx(0.3)
+    assert cfg.recall_frame_size == 320
     assert cfg.use_plateau_scheduler is True
     assert cfg.plateau_patience == 5
     assert cfg.early_stopping_patience == 20
@@ -362,7 +367,9 @@ def test_build_optimizer_uses_three_param_groups() -> None:
         "separator_rest",
     ]
     assert optimizer.param_groups[0]["lr"] == pytest.approx(cfg.encoder_lr)
-    assert optimizer.param_groups[1]["lr"] == pytest.approx(cfg.learning_rate)
+    assert optimizer.param_groups[1]["lr"] == pytest.approx(
+        cfg.learning_rate * cfg.film_lr_scale
+    )
     assert optimizer.param_groups[2]["lr"] == pytest.approx(cfg.learning_rate)
 
 
@@ -372,6 +379,9 @@ def test_build_loss_matches_config_weights() -> None:
         loss_mr_stft=0.8,
         loss_absent=0.9,
         loss_presence=0.05,
+        loss_recall=0.6,
+        recall_floor=0.4,
+        recall_frame_size=160,
     )
 
     loss = build_loss(cfg)
@@ -381,7 +391,10 @@ def test_build_loss_matches_config_weights() -> None:
         mr_stft=0.8,
         absent=0.9,
         presence=0.05,
+        recall=0.6,
     )
+    assert loss.recall_floor == pytest.approx(0.4)
+    assert loss.recall_frame_size == 160
 
 
 def test_train_one_epoch_runs(tmp_path: Path) -> None:

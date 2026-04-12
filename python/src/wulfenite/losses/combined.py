@@ -9,6 +9,7 @@ from torch import nn
 
 from .mr_stft import MultiResolutionSTFTLoss
 from .presence import presence_loss
+from .recall import target_recall_loss
 from .sdr import sdr_loss
 from .silence import target_absent_loss
 
@@ -21,6 +22,7 @@ class LossWeights:
     mr_stft: float = 1.0
     absent: float = 0.5
     presence: float = 0.1
+    recall: float = 0.5
 
 
 @dataclass
@@ -30,6 +32,7 @@ class LossParts:
     total: float
     sdr: float
     mr_stft: float
+    recall: float
     absent: float
     presence: float
     n_present: int
@@ -43,10 +46,14 @@ class WulfeniteLoss(nn.Module):
         self,
         weights: LossWeights | None = None,
         mr_stft_loss: MultiResolutionSTFTLoss | None = None,
+        recall_frame_size: int = 320,
+        recall_floor: float = 0.3,
     ) -> None:
         super().__init__()
         self.weights = weights or LossWeights()
         self.mr_stft = mr_stft_loss or MultiResolutionSTFTLoss()
+        self.recall_frame_size = recall_frame_size
+        self.recall_floor = recall_floor
 
     def forward(
         self,
@@ -80,6 +87,7 @@ class WulfeniteLoss(nn.Module):
 
         l_sdr = zero
         l_stft = zero
+        l_recall = zero
         if n_present > 0:
             l_sdr = sdr_loss(
                 clean[present_mask], target[present_mask]
@@ -87,6 +95,13 @@ class WulfeniteLoss(nn.Module):
             l_stft = self.mr_stft(
                 clean[present_mask], target[present_mask]
             )
+            if self.weights.recall > 0.0:
+                l_recall = target_recall_loss(
+                    clean[present_mask],
+                    target[present_mask],
+                    frame_size=self.recall_frame_size,
+                    floor=self.recall_floor,
+                )
 
         l_absent = zero
         if n_absent > 0:
@@ -104,6 +119,7 @@ class WulfeniteLoss(nn.Module):
         total = (
             w.sdr * l_sdr
             + w.mr_stft * l_stft
+            + w.recall * l_recall
             + w.absent * l_absent
             + w.presence * l_presence
         )
@@ -112,6 +128,7 @@ class WulfeniteLoss(nn.Module):
             total=float(total.detach()),
             sdr=float(l_sdr.detach()),
             mr_stft=float(l_stft.detach()),
+            recall=float(l_recall.detach()),
             absent=float(l_absent.detach()),
             presence=float(l_presence.detach()),
             n_present=n_present,
