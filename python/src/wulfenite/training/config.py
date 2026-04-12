@@ -77,7 +77,7 @@ class TrainingConfig:
     loss_mr_stft: float = 1.0
     loss_absent: float = 0.5
     loss_presence: float = 0.1
-    loss_recall: float = 0.5
+    loss_recall: float = 0.0
     loss_inactive: float = 0.25
     recall_floor: float = 0.3
     recall_frame_size: int = 320

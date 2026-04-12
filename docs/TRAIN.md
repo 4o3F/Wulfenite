@@ -420,9 +420,10 @@ Key design points of the training loop (from `docs/architecture.md`):
 - **Clip composer** — the default mixer path builds 4-second clips
   from multi-turn target-present, overlap-heavy, and hard-negative
   templates rather than the older branch-specific recipes.
-- **`WulfeniteLoss` combined loss** — direct SDR + MR-STFT + target-
-  absent energy penalty + presence BCE, plus framewise inactive-region
-  supervision when the mixer provides labels.
+- **`WulfeniteLoss` combined loss** — by default uses direct SDR +
+  MR-STFT + target-absent energy penalty + framewise inactive-region
+  supervision. Presence BCE and recall-floor supervision remain
+  available as opt-in experimental terms.
 - **Mixture-aware silence** — hard-negative clips and framewise target-
   inactive labels teach the "target is not talking → output silence"
   behavior explicitly.

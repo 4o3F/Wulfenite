@@ -133,8 +133,11 @@ are not implemented in the current code path.
 
 ## 5. Training objective
 
-Loss = **SDR (non-scale-invariant) + multi-resolution STFT loss**,
-plus a target-absent energy penalty for mixture-aware silence training.
+Default loss = **SDR (non-scale-invariant) + multi-resolution STFT
+loss**, plus a target-absent energy penalty and framewise
+target-inactive penalty. Recall-style anti-suppression and the
+auxiliary presence BCE remain available as optional experimental terms,
+but are disabled by default.
 
 ### Why not SI-SDR
 
@@ -176,14 +179,18 @@ target-absent branch**:
   mixture = interferer only.
 - **Loss on absent samples**: simple energy penalty
   `L_absent = ‖estimate‖² / (‖mixture‖² + ε)` — drive output toward zero.
-- **Loss on present samples**: `L_sdr + λ · L_mr_stft` as above.
+- **Loss on present samples**: `L_sdr + λ · L_mr_stft`, plus a
+  framewise inactive-region penalty when the mixer marks
+  "nontarget active, target inactive" spans.
 
 The indicator is a **binary, per-sample label** (`target_present`),
 not a continuous random process.
 
-An auxiliary target-presence head remains available as an **optional
-repo extension** for experiments, but it is disabled by default in the
-paper-aligned architecture path.
+An auxiliary target-presence head and an anti-suppression recall floor
+remain available as **optional repo extensions** for experiments, but
+both are disabled by default in the paper-aligned training path. When
+recall is enabled, it is applied only on non-overlap target-active
+frames.
 
 ## 6. Training data
 

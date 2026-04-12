@@ -469,6 +469,43 @@ def test_combined_loss_inactive_uses_nontarget_mask() -> None:
     assert parts.inactive == pytest.approx(1.0, abs=1e-6)
 
 
+def test_combined_loss_recall_excludes_overlap_frames() -> None:
+    frame = 160
+    clean = torch.zeros(1, frame * 2)
+    target = torch.ones(1, frame * 2)
+    mixture = target.clone()
+    present = torch.ones(1)
+    target_active = torch.tensor([[True, True]])
+    overlap = torch.tensor([[False, True]])
+
+    total, parts = WulfeniteLoss(
+        weights=LossWeights(
+            sdr=0.0,
+            mr_stft=0.0,
+            absent=0.0,
+            presence=0.0,
+            recall=1.0,
+            inactive=0.0,
+        ),
+        mr_stft_loss=MultiResolutionSTFTLoss(
+            fft_sizes=(256,), hop_sizes=(64,), win_lengths=(256,),
+        ),
+        recall_frame_size=frame,
+        recall_floor=0.3,
+    )(
+        clean,
+        target,
+        mixture,
+        present,
+        presence_logit=None,
+        target_active_frames=target_active,
+        overlap_frames=overlap,
+    )
+
+    assert total.item() == pytest.approx(0.3, abs=1e-6)
+    assert parts.recall == pytest.approx(0.3, abs=1e-6)
+
+
 def test_loss_dataclasses_no_longer_expose_speaker_cls() -> None:
     weights = LossWeights()
     assert not hasattr(weights, "speaker_cls")

@@ -142,7 +142,7 @@ def test_training_config_defaults() -> None:
     assert cfg.transition_ramp_ratio == pytest.approx(0.0)
     assert cfg.transition_min_fraction == pytest.approx(0.25)
     assert cfg.transition_min_target_rms == pytest.approx(0.01)
-    assert cfg.loss_recall == pytest.approx(0.5)
+    assert cfg.loss_recall == pytest.approx(0.0)
     assert cfg.recall_floor == pytest.approx(0.3)
     assert cfg.recall_frame_size == 320
     assert cfg.use_plateau_scheduler is True

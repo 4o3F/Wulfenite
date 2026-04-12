@@ -1,4 +1,4 @@
-"""Mask-aware combined loss for Wulfenite training."""
+"""Combined separation loss with optional framewise regularizers."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class LossWeights:
     mr_stft: float = 1.0
     absent: float = 0.5
     presence: float = 0.1
-    recall: float = 0.5
+    recall: float = 0.0
     inactive: float = 0.25
 
 
@@ -69,7 +69,19 @@ class WulfeniteLoss(nn.Module):
         nontarget_active_frames: torch.Tensor | None = None,
         overlap_frames: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, LossParts]:
-        """Compute the full training loss."""
+        """Compute the full training loss.
+
+        Default training keeps the objective intentionally small:
+
+        - target-present samples: SDR + MR-STFT + optional inactive-frame penalty
+        - target-absent samples: absent penalty
+
+        The recall and presence terms remain available as opt-in
+        experimental regularizers. When recall is enabled and
+        ``overlap_frames`` is provided, overlap regions are excluded so
+        the anti-suppression term only acts on non-overlap target-active
+        speech.
+        """
         if clean.shape != target.shape or clean.shape != mixture.shape:
             raise ValueError(
                 "clean / target / mixture must all share shape "
@@ -106,6 +118,11 @@ class WulfeniteLoss(nn.Module):
                 active_frames = None
                 if target_active_frames is not None:
                     active_frames = target_active_frames[present_mask]
+                    if overlap_frames is not None:
+                        active_frames = (
+                            active_frames.bool()
+                            & ~overlap_frames[present_mask].bool()
+                        )
                 l_recall = target_recall_loss(
                     clean[present_mask],
                     target[present_mask],

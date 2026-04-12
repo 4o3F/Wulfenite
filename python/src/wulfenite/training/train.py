@@ -905,7 +905,7 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--loss-mr-stft", type=float, default=1.0)
     parser.add_argument("--loss-absent", type=float, default=0.5)
     parser.add_argument("--loss-presence", type=float, default=0.1)
-    parser.add_argument("--loss-recall", type=float, default=0.5)
+    parser.add_argument("--loss-recall", type=float, default=0.0)
     parser.add_argument("--loss-inactive", type=float, default=0.25)
     parser.add_argument("--recall-floor", type=float, default=0.3)
     parser.add_argument("--recall-frame-size", type=int, default=320)
