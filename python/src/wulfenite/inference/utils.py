@@ -25,12 +25,22 @@ def _rebuild_separator_config(
         "speaker_embed_dim": "speaker_embed_dim",
         "hidden_channels": "hidden_channels",
         "s4d_state_dim": "s4d_state_dim",
-        "num_repeats": "num_repeats",
-        "r1_blocks": "r1_blocks",
-        "r2_blocks": "r2_blocks",
+        "r1_repeats": "r1_repeats",
+        "r2_repeats": "r2_repeats",
+        "conv_blocks_per_repeat": "conv_blocks_per_repeat",
+        "s4d_ffn_multiplier": "s4d_ffn_multiplier",
+        "target_presence_head": "target_presence_head",
     }
     for ck_key, cfg_key in field_map.items():
         if ck_key in checkpoint_config:
+            kwargs[cfg_key] = checkpoint_config[ck_key]
+    legacy_stack_map = {
+        "num_repeats": "r1_repeats",
+        "r1_blocks": "conv_blocks_per_repeat",
+        "r2_blocks": "r2_repeats",
+    }
+    for ck_key, cfg_key in legacy_stack_map.items():
+        if cfg_key not in kwargs and ck_key in checkpoint_config:
             kwargs[cfg_key] = checkpoint_config[ck_key]
     if kwargs:
         return SpeakerBeamSSConfig(**kwargs)
@@ -96,7 +106,7 @@ def _load_state_dict_compat(
     unexpected_after_load = list(incompatible.unexpected_keys)
 
     # Keys that were intentionally skipped (legacy adapter/classifier or
-    # shape-incompatible FiLM) are expected to be missing.  Any *other*
+    # shape-incompatible separator parameters) are expected to be missing. Any *other*
     # missing key means the checkpoint is materially incomplete — refuse
     # to return a model with randomly-initialized required weights.
     allowed_missing = {

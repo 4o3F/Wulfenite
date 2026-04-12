@@ -2,7 +2,7 @@
 
 Real-time target speaker extraction for Chinese audio.
 Architecture: SpeakerBeam-SS (Sato et al., Interspeech 2024) — causal
-Conv-TasNet + S4D state-space blocks + a learnable d-vector speaker encoder.
+Conv-TasNet + S4D state-space blocks + a fine-tunable CAM++ speaker encoder.
 
 This package is the research side of the Wulfenite project. It handles
 model definition, training, evaluation, and ONNX export. The engineering

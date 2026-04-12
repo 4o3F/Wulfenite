@@ -59,18 +59,19 @@ ACTIVE_FRAME_DROP_DB = 40.0
 MASK_HISTOGRAM_BINS = 2048
 MASK_NEAR_ZERO = 0.1
 MASK_NEAR_ONE = 0.9
+MASK_HISTOGRAM_HIGH = 4.0
 EPS = 1e-8
 
 
 class MaskValueStats:
-    """Streaming histogram-based mask statistics over values in ``[0, 1]``."""
+    """Streaming histogram-based mask statistics over non-negative values."""
 
     def __init__(
         self,
         *,
         bins: int = MASK_HISTOGRAM_BINS,
         low: float = 0.0,
-        high: float = 1.0,
+        high: float = MASK_HISTOGRAM_HIGH,
         near_zero: float = MASK_NEAR_ZERO,
         near_one: float = MASK_NEAR_ONE,
     ) -> None:
@@ -146,7 +147,7 @@ class MaskValueStats:
 
 
 class MaskCapture:
-    """Forward-hook sink for the separator's post-sigmoid mask tensor."""
+    """Forward-hook sink for the separator's non-negative mask tensor."""
 
     def __init__(self) -> None:
         self.tensor: torch.Tensor | None = None

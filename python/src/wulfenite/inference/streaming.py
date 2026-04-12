@@ -56,6 +56,23 @@ def _load_mono(path: Path) -> torch.Tensor:
     return torch.from_numpy(data)
 
 
+def _reset_s4d_states_only(
+    separator,
+    state: dict,
+    *,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict:
+    """Reset only S4D recurrent states, keeping conv / OLA buffers intact."""
+    return separator.reset_s4d_states_only(
+        state,
+        batch_size=batch_size,
+        device=device,
+        dtype=dtype,
+    )
+
+
 def run_streaming(
     checkpoint: Path,
     mixture: Path,
@@ -64,7 +81,8 @@ def run_streaming(
     chunk_ms: float = 20.0,
     device: str = "cpu",
     debug_mask: bool = False,
-    s4d_decay: float = 0.995,
+    s4d_decay: float = 1.0,
+    s4d_reset_seconds: float | None = None,
 ) -> dict:
     """Run streaming inference and write the clean wav.
 
@@ -91,6 +109,14 @@ def run_streaming(
             f"positive multiple of enc_stride={stride} "
             f"({stride * 1000 / SAMPLE_RATE:.0f} ms). Try 10, 20, 40, 80 ms."
         )
+    reset_every_chunks: int | None = None
+    effective_reset_seconds: float | None = None
+    if s4d_reset_seconds is not None:
+        if s4d_reset_seconds <= 0:
+            raise ValueError("--s4d-reset-seconds must be positive when provided")
+        reset_samples = int(round(s4d_reset_seconds * SAMPLE_RATE))
+        reset_every_chunks = max(1, math.ceil(reset_samples / chunk_size))
+        effective_reset_seconds = reset_every_chunks * chunk_size / SAMPLE_RATE
 
     mix_wav = _load_mono(mixture)
     enr_wav = _load_mono(enrollment).unsqueeze(0).to(dev)
@@ -110,11 +136,25 @@ def run_streaming(
     n_chunks = mix_wav.shape[-1] // chunk_size
     latencies_ms: list[float] = []
     clean_pieces = []
+    s4d_resets = 0
 
     with torch.no_grad(), tqdm(
         total=n_chunks, desc="streaming", unit="chunk", dynamic_ncols=True,
     ) as pbar:
         for i in range(n_chunks):
+            if (
+                reset_every_chunks is not None
+                and i > 0
+                and i % reset_every_chunks == 0
+            ):
+                state = _reset_s4d_states_only(
+                    separator,
+                    state,
+                    batch_size=1,
+                    device=dev,
+                    dtype=mix_wav.dtype,
+                )
+                s4d_resets += 1
             start = i * chunk_size
             chunk = mix_wav[..., start:start + chunk_size]
             t0 = time.perf_counter()
@@ -129,12 +169,20 @@ def run_streaming(
             if debug_mask:
                 t_sec = (start + chunk_size) / SAMPLE_RATE
                 out_rms = float((clean_chunk ** 2).mean().sqrt().item())
+                reset_flag = ""
+                if (
+                    reset_every_chunks is not None
+                    and i > 0
+                    and i % reset_every_chunks == 0
+                ):
+                    reset_flag = " reset_s4d=1"
                 print(
                     f"[mask] t={t_sec:6.2f}s "
                     f"mean={state['mask_mean']:.4f} "
                     f"max={state['mask_max']:.4f} "
                     f"min={state['mask_min']:.4f} "
                     f"out_rms={out_rms:.6f}"
+                    f"{reset_flag}"
                 )
             elif i % 10 == 0:
                 pbar.set_postfix(
@@ -168,6 +216,10 @@ def run_streaming(
         "max_chunk_ms": float(lat.max()),
         "rtf": total_compute_ms / (audio_seconds * 1000.0) if audio_seconds > 0 else 0.0,
         "output": str(output),
+        "s4d_decay": s4d_decay,
+        "s4d_resets": s4d_resets,
+        "s4d_reset_seconds_requested": s4d_reset_seconds,
+        "s4d_reset_seconds_effective": effective_reset_seconds,
     }
 
     print()
@@ -183,6 +235,11 @@ def run_streaming(
     print(f"    p95             : {metrics['p95_chunk_ms']:.2f} ms")
     print(f"    max             : {metrics['max_chunk_ms']:.2f} ms")
     print(f"  aggregate RTF     : {metrics['rtf']:.3f}")
+    if effective_reset_seconds is not None:
+        print(
+            f"  s4d reset         : every {effective_reset_seconds:.3f} s "
+            f"({s4d_resets} resets)"
+        )
     if metrics["p95_chunk_ms"] > hop_ms:
         print(
             f"  ⚠  p95 chunk compute ({metrics['p95_chunk_ms']:.1f} ms) "
@@ -212,9 +269,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--debug-mask", action="store_true",
                         help="Print per-chunk mask statistics for diagnostics.")
-    parser.add_argument("--s4d-decay", type=float, default=0.995,
+    parser.add_argument("--s4d-decay", type=float, default=1.0,
                         help="Per-step decay factor for S4D recurrent state "
-                             "(1.0 = no decay)")
+                             "(1.0 = paper-aligned / no decay; values < 1.0 "
+                             "enable the repo's optional decay heuristic)")
+    parser.add_argument("--s4d-reset-seconds", type=float, default=None,
+                        help="Reset only the S4D recurrent state at this "
+                             "interval in seconds. Encoder, TCN, and decoder "
+                             "overlap states are preserved.")
     return parser.parse_args()
 
 
@@ -229,6 +291,7 @@ def main() -> None:
         device=args.device,
         debug_mask=args.debug_mask,
         s4d_decay=args.s4d_decay,
+        s4d_reset_seconds=args.s4d_reset_seconds,
     )
 
 

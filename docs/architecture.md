@@ -52,19 +52,23 @@ Delcroix — NTT, Interspeech 2024).
 
 - **Backbone**: Conv-TasNet-style time-domain encoder → separator
   stack → decoder.
-- **Paper-faithful defaults**: encoder channels `N = 4096`,
+- **Paper-faithful defaults**: encoder channels `N = 2048`,
   bottleneck `B = 256`, hidden `H = 512`, S4D state `D = 32`.
-- **Separator stack**: `2 × (TCN(d=1), TCN(d=2), TCN(d=4), S4D, TCN(d=8))`.
-  The S4D block uses channel-wise LayerNorm, the S4D core, then an
-  `Linear(B, H) -> activation -> Linear(H, B)` sublayer before the
-  residual add.
+- **Separator stack**:
+  - Initial projection: channel-wise LayerNorm on the encoder features,
+    then `1x1 Conv(N -> B)`.
+  - Pre-fusion stage: `R1 = 3` repetitions.
+  - Post-fusion stage: `R2 = 1` repetitions.
+  - Each repetition contains `X = 2` sequential sub-blocks with
+    exponentially increasing dilation `d = 2^(x - 1)`.
+  - Each sub-block is `TCN(d) -> S4D`.
+- **S4D block**: pre-norm residual structure with two branches:
+  - sequence mixing: `cLN -> S4D -> GELU -> 1x1 Conv(B -> 2B) -> GLU -> residual add`
+  - channel mixing: `cLN -> 1x1 Conv(B -> 4B) -> GELU -> 1x1 Conv(4B -> B) -> residual add`
 - **Frontend**: learned 1-D conv encoder, kernel size 320, hop 160
-  (20 ms at 16 kHz). Over-parameterized relative to the 2 ms kernel
-  of the original TD-SpeakerBeam to compensate for the larger stride.
-- **Parameter count**: ~7.57 M for the current separator implementation.
-  The paper reports ~7.93 M for its reference configuration; the
-  remaining delta is now isolated to the exact block-level accounting,
-  not the gross topology or channel widths.
+  (20 ms at 16 kHz), followed by ReLU.
+- **Mask generator**: `1x1 Conv(B -> N)` followed by ReLU. The resulting
+  non-negative mask is applied to the encoder features before decoding.
 - **Causality**: **causal by default.** Global LayerNorm replaced by
   channel-wise LayerNorm; convolutions are strictly causal. S4D has a
   recurrent form that supports stateful inference across frames.
@@ -72,8 +76,8 @@ Delcroix — NTT, Interspeech 2024).
 **Speaker encoder**:
 
 - **Single path**: a fine-tuned CAM++ encoder whose L2-normalized
-  embedding is native 192-d. The separator's FiLM layers project from
-  192-d to 256-d internally.
+  embedding is native 192-d. The separator projects the 192-d speaker
+  embedding into its 256-d bottleneck space.
 
 The speaker encoder still runs exactly ONCE per session, not per frame.
 TSE's core assumption is that the target speaker is fixed for the
@@ -85,54 +89,47 @@ cached embedding. This keeps the encoder in the setup budget rather than
 the steady-state per-frame budget — see
 `docs/onnx_contract.md` for the concrete two-file split.
 
-### Speaker embedding fusion — design decision
+### Speaker embedding fusion
 
-The separator uses **FiLM speaker adaptation** (feature-wise linear
-modulation) on one of its bottleneck feature tensors. The L2-normalized
-speaker embedding `e` feeds two learnable `Linear(192, 256, bias=False)`
-branches:
+SpeakerBeam-SS modulates the separator **between** the pre-fusion and
+post-fusion stages.
 
-```
-feat ← feat * (1 + gamma(e)) + beta(e)
-```
+1. Run the encoder and bottleneck projection.
+2. Run the `R1` pre-fusion stage.
+3. Project the target-speaker embedding from 192-d into the bottleneck
+   dimension `B = 256`.
+4. Broadcast that projected vector across time and apply element-wise
+   multiplication to the intermediate separator features.
+5. Run the `R2` post-fusion stage and generate the mask.
 
-Both `gamma` and `beta` weight matrices are initialized to zeros, so
-at step 0 the FiLM conditioning is an exact identity/no-op. The
-residual `1 + gamma(e)` formulation ensures the separator starts from
-unmodulated features and gradually learns speaker-dependent modulation.
-See `speakerbeam_ss.py::_apply_speaker_conditioning` for the
-implementation shared between `forward()` and `streaming_step()`.
-
-The separator uses `B = 256` internally, while the CAM++ speaker
-encoder emits 192-d embeddings. The FiLM layers handle the dimension
-adaptation:
+In the current repo this uses the CAM++ enrollment embedding:
 
 ```python
-raw, emb = campplus_encoder(enrollment) # [B, 192]
-emb = F.normalize(emb, p=2, dim=-1)    # [B, 192]
-# FiLM internally: Linear(192, 256) → modulate 256-d features
+raw, emb = campplus_encoder(enrollment)   # [B, 192]
+emb = F.normalize(emb, p=2, dim=-1)      # [B, 192]
+speaker_scale = Linear(192, 256)(emb)    # [B, 256]
+feat = feat * speaker_scale.unsqueeze(-1)
 ```
 
-## 4. Latency target: 40 ms
+The paper's core architectural point is the **position** of this
+speaker modulation: it is applied after the first separator stage, not
+immediately after the encoder bottleneck.
 
-SpeakerBeam-SS ships in three latency variants:
+## 4. Latency target
 
-| Variant | Frame | Lookahead | Algo latency | Relative SDR |
-|---|---|---|---|---|
-| Pure causal | 20 ms | 0 ms | 20 ms | baseline |
-| **Low-latency** ⭐ | 20 ms | 20 ms | **40 ms** | +0.5–1 dB |
-| Mid-latency | 20 ms | 100 ms | 120 ms | +0.8–1.3 dB |
+The paper reports pure-causal and lookahead variants. The current repo
+implementation aligns the **separator topology** to Figure 1 but keeps
+the runtime path **strictly causal**:
 
-Main branch targets the **low-latency (40 ms) variant**. Rationale:
+- frame size: 20 ms
+- encoder hop: 10 ms
+- separator lookahead: 0 ms
+- algorithmic latency from the separator itself: 20 ms plus any caller
+  side buffering
 
-- 40 ms is comfortably below the sub-50 ms budget for voice calls.
-- The +0.5–1 dB quality uplift vs pure causal is worth the extra 20 ms.
-- Going to 120 ms triples latency for only +0.3 dB more.
-
-The 20 ms lookahead is architecturally a one-frame forward buffer: the
-model receives a 20 ms chunk each call and emits a 20 ms clean chunk
-that corresponds to the audio **one frame earlier**. See
-`docs/onnx_contract.md` for the concrete stateful I/O interface.
+The paper's 40 ms and 120 ms lookahead variants require non-causal
+changes in the early convolution blocks. Those lookahead modifications
+are not implemented in the current code path.
 
 ## 5. Training objective
 
@@ -182,14 +179,11 @@ target-absent branch**:
 - **Loss on present samples**: `L_sdr + λ · L_mr_stft` as above.
 
 The indicator is a **binary, per-sample label** (`target_present`),
-not a continuous random process. Combined with a target-presence
-detection head (a small auxiliary classifier on the bottleneck) the
-model learns a clean "extract vs mute" decision rather than a fuzzy
-"output quieter" heuristic.
+not a continuous random process.
 
-The auxiliary presence head uses binary cross-entropy, weight ~0.1
-of the main loss. Its output is also exported through the ONNX
-interface so Rust-side code can use it for optional VAD-style gating.
+An auxiliary target-presence head remains available as an **optional
+repo extension** for experiments, but it is disabled by default in the
+paper-aligned architecture path.
 
 ## 6. Training data
 

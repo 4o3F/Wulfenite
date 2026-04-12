@@ -183,10 +183,12 @@ def build_model(cfg: TrainingConfig) -> WulfeniteTSE:
         bottleneck_channels=cfg.bottleneck_channels,
         speaker_embed_dim=cfg.speaker_embed_dim,
         hidden_channels=cfg.hidden_channels,
-        num_repeats=cfg.num_repeats,
-        r1_blocks=cfg.r1_blocks,
-        r2_blocks=cfg.r2_blocks,
+        r1_repeats=cfg.r1_repeats,
+        r2_repeats=cfg.r2_repeats,
+        conv_blocks_per_repeat=cfg.conv_blocks_per_repeat,
         s4d_state_dim=cfg.s4d_state_dim,
+        s4d_ffn_multiplier=cfg.s4d_ffn_multiplier,
+        target_presence_head=cfg.target_presence_head,
     )
     return WulfeniteTSE.from_campplus(
         cfg.campplus_checkpoint,
@@ -218,24 +220,22 @@ def build_optimizer(
     del total_steps
 
     encoder_groups = model.speaker_encoder.optimizer_groups(cfg)
-    film_params = [
-        p for p in (
-            *model.separator.speaker_gamma.parameters(),
-            *model.separator.speaker_beta.parameters(),
-        )
+    speaker_modulation_params = [
+        p
+        for p in model.separator.speaker_projection.parameters()
         if p.requires_grad
     ]
-    film_param_ids = {id(p) for p in film_params}
+    modulation_param_ids = {id(p) for p in speaker_modulation_params}
     separator_rest = [
         p for p in model.separator.parameters()
-        if p.requires_grad and id(p) not in film_param_ids
+        if p.requires_grad and id(p) not in modulation_param_ids
     ]
     param_groups = [*encoder_groups]
     param_groups.append(
         {
-            "name": "separator_film",
-            "params": film_params,
-            "lr": cfg.learning_rate * cfg.film_lr_scale,
+            "name": "separator_speaker_modulation",
+            "params": speaker_modulation_params,
+            "lr": cfg.learning_rate * cfg.speaker_modulation_lr_scale,
         }
     )
     param_groups.append(
@@ -875,7 +875,13 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--val-samples", type=int, default=500)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--encoder-lr", type=float, default=3e-5)
-    parser.add_argument("--film-lr-scale", type=float, default=2.0)
+    parser.add_argument(
+        "--speaker-modulation-lr-scale",
+        "--film-lr-scale",
+        dest="speaker_modulation_lr_scale",
+        type=float,
+        default=2.0,
+    )
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--plateau-patience", type=int, default=5)
     parser.add_argument("--plateau-factor", type=float, default=0.5)
@@ -884,14 +890,16 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--absent-warmup-epochs", type=int, default=10)
 
     parser.add_argument("--campplus-checkpoint", type=Path, default=None)
-    parser.add_argument("--enc-channels", type=int, default=4096)
+    parser.add_argument("--enc-channels", type=int, default=2048)
     parser.add_argument("--bottleneck-channels", type=int, default=256)
     parser.add_argument("--speaker-embed-dim", type=int, default=192)
     parser.add_argument("--hidden-channels", type=int, default=512)
-    parser.add_argument("--num-repeats", type=int, default=2)
-    parser.add_argument("--r1-blocks", type=int, default=3)
-    parser.add_argument("--r2-blocks", type=int, default=1)
+    parser.add_argument("--r1-repeats", type=int, default=3)
+    parser.add_argument("--r2-repeats", type=int, default=1)
+    parser.add_argument("--conv-blocks-per-repeat", type=int, default=2)
     parser.add_argument("--s4d-state-dim", type=int, default=32)
+    parser.add_argument("--s4d-ffn-multiplier", type=int, default=4)
+    parser.add_argument("--target-presence-head", action="store_true")
 
     parser.add_argument("--loss-sdr", type=float, default=1.0)
     parser.add_argument("--loss-mr-stft", type=float, default=1.0)
@@ -951,7 +959,7 @@ def _parse_args() -> TrainingConfig:
         val_samples=args.val_samples,
         learning_rate=args.lr,
         encoder_lr=args.encoder_lr,
-        film_lr_scale=args.film_lr_scale,
+        speaker_modulation_lr_scale=args.speaker_modulation_lr_scale,
         weight_decay=args.weight_decay,
         use_plateau_scheduler=True,
         plateau_patience=args.plateau_patience,
@@ -963,10 +971,12 @@ def _parse_args() -> TrainingConfig:
         bottleneck_channels=args.bottleneck_channels,
         speaker_embed_dim=args.speaker_embed_dim,
         hidden_channels=args.hidden_channels,
-        num_repeats=args.num_repeats,
-        r1_blocks=args.r1_blocks,
-        r2_blocks=args.r2_blocks,
+        r1_repeats=args.r1_repeats,
+        r2_repeats=args.r2_repeats,
+        conv_blocks_per_repeat=args.conv_blocks_per_repeat,
         s4d_state_dim=args.s4d_state_dim,
+        s4d_ffn_multiplier=args.s4d_ffn_multiplier,
+        target_presence_head=args.target_presence_head,
         loss_sdr=args.loss_sdr,
         loss_mr_stft=args.loss_mr_stft,
         loss_absent=args.loss_absent,

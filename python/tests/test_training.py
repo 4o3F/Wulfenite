@@ -60,9 +60,9 @@ def _small_separator_config() -> SpeakerBeamSSConfig:
         enc_channels=16,
         bottleneck_channels=16,
         speaker_embed_dim=192,
-        num_repeats=1,
-        r1_blocks=1,
-        r2_blocks=1,
+        r1_repeats=1,
+        r2_repeats=1,
+        conv_blocks_per_repeat=1,
         hidden_channels=16,
         s4d_state_dim=8,
     )
@@ -134,7 +134,7 @@ def test_training_config_defaults() -> None:
     assert cfg.loss_inactive == pytest.approx(0.25)
     assert cfg.learning_rate == pytest.approx(5e-4)
     assert cfg.encoder_lr == pytest.approx(3e-5)
-    assert cfg.film_lr_scale == pytest.approx(2.0)
+    assert cfg.speaker_modulation_lr_scale == pytest.approx(2.0)
     assert cfg.absent_warmup_epochs == 10
     assert cfg.speaker_embed_dim == 192
     assert cfg.transition_prob == pytest.approx(0.0)
@@ -384,12 +384,12 @@ def test_build_optimizer_uses_three_param_groups() -> None:
     assert isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)
     assert [group["name"] for group in optimizer.param_groups] == [
         "encoder_backbone",
-        "separator_film",
+        "separator_speaker_modulation",
         "separator_rest",
     ]
     assert optimizer.param_groups[0]["lr"] == pytest.approx(cfg.encoder_lr)
     assert optimizer.param_groups[1]["lr"] == pytest.approx(
-        cfg.learning_rate * cfg.film_lr_scale
+        cfg.learning_rate * cfg.speaker_modulation_lr_scale
     )
     assert optimizer.param_groups[2]["lr"] == pytest.approx(cfg.learning_rate)
 

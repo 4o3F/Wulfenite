@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 
 from wulfenite.models.speakerbeam_ss import (
-    S4DBlock,
     SpeakerBeamSS,
     SpeakerBeamSSConfig,
 )
@@ -17,19 +16,20 @@ def _small_config() -> SpeakerBeamSSConfig:
         enc_channels=32,
         bottleneck_channels=16,
         speaker_embed_dim=192,
-        num_repeats=1,
-        r1_blocks=1,
-        r2_blocks=1,
+        r1_repeats=1,
+        r2_repeats=1,
+        conv_blocks_per_repeat=1,
         hidden_channels=32,
         s4d_state_dim=8,
+        target_presence_head=True,
     )
 
 
 def _s4d_state_norm(model: SpeakerBeamSS, state: dict) -> float:
     total = torch.zeros(())
-    for block, block_state in zip(model.blocks, state["block_states"]):
-        if isinstance(block, S4DBlock):
-            total = total + block_state.pow(2).sum().cpu()
+    for block_state in state["block_states"]:
+        _, s4d_state = block_state
+        total = total + s4d_state.pow(2).sum().cpu()
     return float(total.sqrt().item())
 
 
@@ -53,6 +53,8 @@ def test_speakerbeam_forward_shape() -> None:
     assert abs(clean.size(-1) - t) <= cfg.enc_stride
     assert torch.isfinite(clean).all()
 
+    assert "mask" in out
+    assert torch.all(out["mask"] >= 0)
     assert "presence_logit" in out
     assert out["presence_logit"].shape == (batch,)
 
@@ -61,7 +63,7 @@ def test_speakerbeam_initial_state_shapes() -> None:
     cfg = _small_config()
     model = SpeakerBeamSS(cfg).eval()
     state = model.initial_state(batch_size=1)
-    assert len(state) == len(model.blocks)
+    assert len(state) == len(model._all_blocks())
 
 
 def test_speakerbeam_streaming_matches_forward() -> None:
@@ -87,7 +89,9 @@ def test_speakerbeam_streaming_matches_forward() -> None:
                 chunk = mixture[..., start:start + chunk_size]
                 if chunk.shape[-1] != chunk_size:
                     continue
-                y, state = model.streaming_step(chunk, embedding, state)
+                y, state = model.streaming_step(
+                    chunk, embedding, state, s4d_state_decay=1.0,
+                )
                 pieces.append(y)
             out_stream = torch.cat(pieces, dim=-1)
             assert out_stream.shape == out_whole.shape
@@ -131,7 +135,7 @@ def test_streaming_s4d_decay_bounds_state() -> None:
 
 
 def test_streaming_s4d_decay_default_matches_explicit() -> None:
-    """Default s4d_state_decay=0.995 matches passing it explicitly."""
+    """Default s4d_state_decay=1.0 matches passing it explicitly."""
     torch.manual_seed(3)
     cfg = _small_config()
     model = SpeakerBeamSS(cfg).eval()
@@ -151,25 +155,23 @@ def test_streaming_s4d_decay_default_matches_explicit() -> None:
                 chunk, embedding, default_state,
             )
             explicit_out, explicit_state = model.streaming_step(
-                chunk, embedding, explicit_state, s4d_state_decay=0.995,
+                chunk, embedding, explicit_state, s4d_state_decay=1.0,
             )
             assert torch.equal(default_out, explicit_out)
 
 
-def test_speaker_film_initializes_to_identity() -> None:
+def test_speaker_modulation_initializes_to_identity() -> None:
     cfg = _small_config()
     model = SpeakerBeamSS(cfg).eval()
 
-    expected_gamma = torch.zeros(cfg.bottleneck_channels, cfg.speaker_embed_dim)
-    expected_beta = torch.zeros(cfg.bottleneck_channels, cfg.speaker_embed_dim)
+    expected_weight = torch.zeros(cfg.bottleneck_channels, cfg.speaker_embed_dim)
+    expected_bias = torch.ones(cfg.bottleneck_channels)
 
-    assert torch.allclose(model.speaker_gamma.weight, expected_gamma, atol=1e-8)
-    assert torch.allclose(model.speaker_beta.weight, expected_beta, atol=1e-8)
-    assert model.speaker_gamma.bias is None
-    assert model.speaker_beta.bias is None
+    assert torch.allclose(model.speaker_projection.weight, expected_weight, atol=1e-8)
+    assert torch.allclose(model.speaker_projection.bias, expected_bias, atol=1e-8)
 
 
-def test_speaker_film_helper_is_noop_at_init() -> None:
+def test_speaker_modulation_helper_is_noop_at_init() -> None:
     torch.manual_seed(1)
     cfg = _small_config()
     model = SpeakerBeamSS(cfg).eval()
@@ -181,7 +183,7 @@ def test_speaker_film_helper_is_noop_at_init() -> None:
     )
 
     with torch.no_grad():
-        actual = model._apply_speaker_conditioning(feat, embedding)
+        actual = model._apply_speaker_modulation(feat, embedding)
 
     diff = (actual - feat).abs().max().item()
     assert diff < 1e-6

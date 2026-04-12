@@ -1,4 +1,4 @@
-"""CAM++ zh-cn speaker encoder (frozen).
+"""CAM++ zh-cn speaker encoder backbone used by Wulfenite.
 
 Adapted from 3D-Speaker. The core model is a faithful port of
 ``speakerlab/models/campplus/DTDNN.py`` + ``layers.py`` merged into a
@@ -12,13 +12,14 @@ Sources:
 - License: Apache-2.0 (3D-Speaker, alibaba-damo-academy)
 
 Usage in Wulfenite:
-This module is imported by ``wulfenite.models.tse`` as the frozen
-speaker encoder. Only ``encode_enrollment`` is part of the public
-interface — it takes a raw 16 kHz waveform, computes 80-dim Kaldi
-FBank internally, runs the CAM++ forward pass, and L2-normalizes the
-192-d embedding. Callers should invoke it ONCE per session and cache
-the result for every subsequent separator call. See
-``docs/onnx_contract.md`` for the full pipeline.
+This module is wrapped by ``wulfenite.models.campplus_encoder`` and is
+fine-tuned jointly with the separator during training. At inference
+time only ``encode_enrollment`` is part of the public interface — it
+takes a raw 16 kHz waveform, computes 80-dim Kaldi FBank internally,
+runs the CAM++ forward pass, and L2-normalizes the 192-d embedding.
+Callers should invoke it ONCE per session and cache the result for
+every subsequent separator call. See ``docs/onnx_contract.md`` for the
+full pipeline.
 """
 
 from __future__ import annotations

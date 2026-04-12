@@ -435,7 +435,7 @@ Key design points of the training loop (from `docs/architecture.md`):
 The current recipe uses Adam, `ReduceLROnPlateau(mode="max")` on
 present-only `val_sdri_db`, and early stopping with patience 20. On a
 24 GB GPU, batch size 16 is the first setting to try; if the
-paper-faithful `N = 4096` separator OOMs, drop to 12 or 8.
+paper-aligned `N = 2048` separator still OOMs, drop to 12 or 8.
 
 Checkpoints are written to `--out-dir`:
 
@@ -506,9 +506,10 @@ stride). Common values: 10, 20, 40 ms. The script prints per-chunk
 mean / p50 / p95 / max latency, aggregate RTF, and a real-time
 feasibility verdict (warns when p95 compute exceeds the hop window).
 
-**The two outputs should be bit-for-bit identical** — SpeakerBeam-SS's
-`forward` path is aligned with `streaming_step` via deterministic
-zero-padding and output cropping, verified by
+**The two outputs should be numerically equivalent up to normal
+floating-point rounding** — SpeakerBeam-SS's `forward` path is aligned
+with `streaming_step` via deterministic zero-padding and output
+cropping, verified by
 `tests/test_speakerbeam_ss.py::test_speakerbeam_streaming_matches_forward`
 at three chunk sizes and by `tests/test_inference.py::test_whole_vs_streaming_end_to_end`
 for the full TSE wrapper.

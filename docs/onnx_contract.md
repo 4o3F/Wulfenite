@@ -29,7 +29,7 @@ Expected on disk (under `rust/assets/` or similar at deploy time):
 ```
 <deployment>/
 ├── wulfenite_speaker_encoder.onnx
-└── wulfenite_tse.onnx        # ≈ 8 MB
+└── wulfenite_tse.onnx        # fp32 export, typically tens of MB
 ```
 
 ---
@@ -85,7 +85,7 @@ is pure.
 |---|---|---|
 | Sample rate | 16000 Hz | Inputs/outputs must be 16 kHz |
 | Frame size | **320 samples** (20 ms) | One call processes exactly this many new samples |
-| Algorithmic latency | **40 ms** | Output at call N corresponds to input from call N-1 |
+| Algorithmic latency | **20 ms** | Pure-causal separator; output corresponds to the current call's input |
 | Number of state tensors | **(to be finalized at export time, documented in ONNX metadata `wulfenite_num_states`)** | Opaque; Rust side iterates by name |
 
 ### Inputs
@@ -93,39 +93,41 @@ is pure.
 | Name | dtype | Shape | Description |
 |---|---|---|---|
 | `mixture_chunk` | float32 | `[1, 320]` | The **latest** 20 ms of microphone audio, 16 kHz mono, amplitude `[-1, 1]`. Never shorter, never longer. If the caller has no more audio, pad with zeros to 320 samples and run a final call to flush. |
-| `speaker_embedding` | float32 | `[1, 256]` | Separator-space speaker embedding from `wulfenite_speaker_encoder.onnx`. |
+| `speaker_embedding` | float32 | `[1, 192]` | L2-normalized CAM++ speaker embedding from `wulfenite_speaker_encoder.onnx`. The separator projects it internally into its bottleneck space. |
 | `state_in_0`, `state_in_1`, … | float32 | Various (fixed at export time) | Opaque state tensors. On the first call of a session, pass zero tensors of the correct shape. Shapes are documented in ONNX metadata `wulfenite_state_shape_N` for each N. |
 
 ### Outputs
 
 | Name | dtype | Shape | Description |
 |---|---|---|---|
-| `clean_chunk` | float32 | `[1, 320]` | 20 ms of clean target speaker audio, corresponding to the audio **that was received on the previous call**. For the first call, the output is silence (zeros); for normal operation, feed straight to the speaker. |
+| `clean_chunk` | float32 | `[1, 320]` | 20 ms of clean target speaker audio corresponding to the audio received on the **current** call. |
 | `state_out_0`, `state_out_1`, … | float32 | Match `state_in_N` | Updated state tensors. Store each and pass as `state_in_N` on the next call. |
-| `target_present_logit` | float32 | `[1]` | Pre-sigmoid logit for "target speaker is active in this 20 ms". Apply `sigmoid()` to get a probability in `[0, 1]`. Threshold at 0.5 for a binary decision. Optional — the caller may ignore it. |
 
-### Call semantics — the 40 ms latency pattern
+When the separator is exported with the optional experimental
+target-presence head enabled, the graph may also expose:
 
-Because the model looks one frame ahead, the output of call N
-corresponds to the input of call N-1. Concretely:
+| Name | dtype | Shape | Description |
+|---|---|---|---|
+| `target_present_logit` | float32 | `[1]` | Pre-sigmoid logit for "target speaker is active in this chunk". This head is disabled in the default paper-aligned configuration. |
+
+### Call semantics — pure-causal pattern
+
+The current implementation is strictly causal, so the output of call N
+corresponds to the input of call N:
 
 ```
 Wall time:   0ms      20ms      40ms      60ms      80ms
              │         │         │         │         │
 Call:      call1    call2    call3    call4    call5
 Input:     chunk1   chunk2   chunk3   chunk4   chunk5   (audio captured in previous 20 ms)
-Output:    silence  clean1   clean2   clean3   clean4   (clean version of chunk1, chunk2, ...)
+Output:    clean1   clean2   clean3   clean4   clean5   (clean version of the same chunk)
 ```
 
-- At wall time 0: the caller has 20 ms of audio, calls the model. The
-  output `clean1` is silence (zeros) because the model has not yet
-  accumulated enough future context.
-- At wall time 20 ms: the caller has the next 20 ms (`chunk2`), calls
-  the model. The output is now `clean1` — the cleaned version of the
-  audio from 0–20 ms.
-- Steady state: every 20 ms in, 20 ms out, with a constant 20 ms
-  additional delay on top of the frame size. Total 40 ms latency
-  from audio capture to clean emission.
+- At wall time 0: the caller has 20 ms of audio and calls the model.
+  The output `clean1` is the cleaned version of that same 0–20 ms
+  chunk.
+- Steady state: every 20 ms in, 20 ms out, with no extra lookahead
+  delay beyond the frame itself.
 
 ### State lifetime and shape discovery
 
@@ -150,7 +152,7 @@ inputs. On each call, the returned `state_out_N` replaces the stored
 | Caller mistake | ONNX behavior | Rust caller responsibility |
 |---|---|---|
 | `mixture_chunk` not `[1, 320]` | ORT shape error | Assemble exactly one frame before calling |
-| `speaker_embedding` not `[1, 256]` | ORT shape error | Feed the normalized 256-d encoder output |
+| `speaker_embedding` not `[1, 192]` | ORT shape error | Feed the normalized 192-d encoder output |
 | Wrong sample rate | Silent garbage output | Resample to 16 kHz before the ring buffer |
 | Forgot to pass state | ORT missing-input error | Initialize once, feed back every call |
 | Stale state from previous session | Garbage for first ~100 ms | Reset state to zero on session change |
@@ -175,10 +177,10 @@ the graph, readable from `ort::Session::metadata()` in Rust:
 | `wulfenite_contract_version` | i64 | both | 1 |
 | `wulfenite_sample_rate` | i64 | both | 16000 |
 | `wulfenite_frame_size` | i64 | tse only | 320 |
-| `wulfenite_algorithmic_latency_ms` | f32 | tse only | 40.0 |
+| `wulfenite_algorithmic_latency_ms` | f32 | tse only | 20.0 |
 | `wulfenite_num_states` | i64 | tse only | e.g., 8 |
 | `wulfenite_state_shape_N` | i64[] | tse only, one per state | e.g., [1, 256, 16] |
-| `wulfenite_trained_on` | str | tse only | "AISHELL1+AISHELL3+DNS4" |
+| `wulfenite_trained_on` | str | tse only | "AISHELL1+AISHELL3+MAGICDATA+MUSAN" |
 | `wulfenite_checkpoint_sha256` | str | tse only | 64-char hex |
 | `wulfenite_export_date` | str | both | ISO 8601 date |
 
@@ -229,8 +231,9 @@ loop {
    loses per-tensor shape info, forces packing. Current plan:
    multiple named state tensors. Revisit if Rust allocation gets
    ugly.
-2. **Should `target_present_logit` be a float or skipped entirely?**
-   Current plan: include it as an optional output; caller may ignore.
+2. **Should `target_present_logit` be exported at all?**
+   Current plan: keep it disabled in the default paper-aligned path and
+   enable it only for explicit experimental exports.
 3. **How to handle enrollment drift** (speaker changes tone/volume
    over time)? Out of scope for v1; the ONNX contract pins
    enrollment to session start.

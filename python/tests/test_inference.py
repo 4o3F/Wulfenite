@@ -20,11 +20,12 @@ def _tiny_separator_config() -> SpeakerBeamSSConfig:
         enc_channels=16,
         bottleneck_channels=16,
         speaker_embed_dim=192,
-        num_repeats=1,
-        r1_blocks=1,
-        r2_blocks=1,
+        r1_repeats=1,
+        r2_repeats=1,
+        conv_blocks_per_repeat=1,
         hidden_channels=16,
         s4d_state_dim=8,
+        target_presence_head=True,
     )
 
 
@@ -36,10 +37,12 @@ def _separator_checkpoint_config(
         "bottleneck_channels": separator_config.bottleneck_channels,
         "speaker_embed_dim": separator_config.speaker_embed_dim,
         "hidden_channels": separator_config.hidden_channels,
-        "num_repeats": separator_config.num_repeats,
-        "r1_blocks": separator_config.r1_blocks,
-        "r2_blocks": separator_config.r2_blocks,
+        "r1_repeats": separator_config.r1_repeats,
+        "r2_repeats": separator_config.r2_repeats,
+        "conv_blocks_per_repeat": separator_config.conv_blocks_per_repeat,
         "s4d_state_dim": separator_config.s4d_state_dim,
+        "s4d_ffn_multiplier": separator_config.s4d_ffn_multiplier,
+        "target_presence_head": separator_config.target_presence_head,
     }
 
 
@@ -70,7 +73,9 @@ def test_whole_vs_streaming_end_to_end() -> None:
             chunk = mixture[..., start:start + chunk_size]
             if chunk.shape[-1] != chunk_size:
                 continue
-            out, state = tse.separator.streaming_step(chunk, emb, state)
+            out, state = tse.separator.streaming_step(
+                chunk, emb, state, s4d_state_decay=1.0,
+            )
             pieces.append(out)
         stream_clean = torch.cat(pieces, dim=-1)
 
@@ -199,3 +204,6 @@ def test_streaming_state_initializes_to_zero() -> None:
     for block_state in state["block_states"]:
         if torch.is_tensor(block_state):
             assert torch.all(block_state == 0)
+        elif isinstance(block_state, tuple):
+            for part in block_state:
+                assert torch.all(part == 0)

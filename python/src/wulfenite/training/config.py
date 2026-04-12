@@ -51,7 +51,7 @@ class TrainingConfig:
     val_samples: int = 500
     learning_rate: float = 5e-4
     encoder_lr: float = 3e-5
-    film_lr_scale: float = 2.0
+    speaker_modulation_lr_scale: float = 2.0
     weight_decay: float = 0.0
     use_plateau_scheduler: bool = True
     plateau_patience: int = 5
@@ -61,14 +61,16 @@ class TrainingConfig:
     absent_warmup_epochs: int = 10
 
     # --- Separator architecture ---
-    enc_channels: int = 4096
+    enc_channels: int = 2048
     bottleneck_channels: int = 256
     speaker_embed_dim: int = 192
     hidden_channels: int = 512
-    num_repeats: int = 2
-    r1_blocks: int = 3
-    r2_blocks: int = 1
+    r1_repeats: int = 3
+    r2_repeats: int = 1
+    conv_blocks_per_repeat: int = 2
     s4d_state_dim: int = 32
+    s4d_ffn_multiplier: int = 4
+    target_presence_head: bool = False
 
     # --- Loss weights (matches LossWeights defaults) ---
     loss_sdr: float = 1.0
