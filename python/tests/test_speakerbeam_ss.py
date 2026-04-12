@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import torch
 
-from wulfenite.models.speakerbeam_ss import SpeakerBeamSS, SpeakerBeamSSConfig
+from wulfenite.models.speakerbeam_ss import (
+    S4DBlock,
+    SpeakerBeamSS,
+    SpeakerBeamSSConfig,
+)
 
 
 def _small_config() -> SpeakerBeamSSConfig:
@@ -19,6 +23,14 @@ def _small_config() -> SpeakerBeamSSConfig:
         hidden_channels=32,
         s4d_state_dim=8,
     )
+
+
+def _s4d_state_norm(model: SpeakerBeamSS, state: dict) -> float:
+    total = torch.zeros(())
+    for block, block_state in zip(model.blocks, state["block_states"]):
+        if isinstance(block, S4DBlock):
+            total = total + block_state.pow(2).sum().cpu()
+    return float(total.sqrt().item())
 
 
 def test_speakerbeam_forward_shape() -> None:
@@ -81,6 +93,67 @@ def test_speakerbeam_streaming_matches_forward() -> None:
             assert out_stream.shape == out_whole.shape
             diff = (out_stream - out_whole).abs().max().item()
             assert diff < 1e-4
+
+
+def test_streaming_s4d_decay_bounds_state() -> None:
+    torch.manual_seed(2)
+    cfg = _small_config()
+    model = SpeakerBeamSS(cfg).eval()
+
+    batch = 1
+    steps = 64
+    chunk = torch.randn(batch, cfg.enc_stride)
+    embedding = torch.nn.functional.normalize(
+        torch.randn(batch, cfg.speaker_embed_dim), p=2, dim=-1,
+    )
+    decay_state = model.initial_streaming_state(batch_size=batch)
+    no_decay_state = model.initial_streaming_state(batch_size=batch)
+    decay_norms = []
+    no_decay_norms = []
+
+    with torch.no_grad():
+        for _ in range(steps):
+            _, decay_state = model.streaming_step(
+                chunk, embedding, decay_state, s4d_state_decay=0.99,
+            )
+            _, no_decay_state = model.streaming_step(
+                chunk, embedding, no_decay_state, s4d_state_decay=1.0,
+            )
+            decay_norms.append(_s4d_state_norm(model, decay_state))
+            no_decay_norms.append(_s4d_state_norm(model, no_decay_state))
+
+    decay_norms_t = torch.tensor(decay_norms)
+    no_decay_norms_t = torch.tensor(no_decay_norms)
+
+    assert torch.isfinite(decay_norms_t).all()
+    assert decay_norms_t[-1] < no_decay_norms_t[-1]
+    assert decay_norms_t.max() < no_decay_norms_t.max()
+
+
+def test_streaming_s4d_decay_default_matches_explicit() -> None:
+    """Default s4d_state_decay=0.995 matches passing it explicitly."""
+    torch.manual_seed(3)
+    cfg = _small_config()
+    model = SpeakerBeamSS(cfg).eval()
+
+    batch = 2
+    chunk_size = 2 * cfg.enc_stride
+    chunks = [torch.randn(batch, chunk_size) for _ in range(4)]
+    embedding = torch.nn.functional.normalize(
+        torch.randn(batch, cfg.speaker_embed_dim), p=2, dim=-1,
+    )
+    default_state = model.initial_streaming_state(batch_size=batch)
+    explicit_state = model.initial_streaming_state(batch_size=batch)
+
+    with torch.no_grad():
+        for chunk in chunks:
+            default_out, default_state = model.streaming_step(
+                chunk, embedding, default_state,
+            )
+            explicit_out, explicit_state = model.streaming_step(
+                chunk, embedding, explicit_state, s4d_state_decay=0.995,
+            )
+            assert torch.equal(default_out, explicit_out)
 
 
 def test_speaker_film_initializes_to_identity() -> None:

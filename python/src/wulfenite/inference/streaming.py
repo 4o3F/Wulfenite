@@ -64,6 +64,7 @@ def run_streaming(
     chunk_ms: float = 20.0,
     device: str = "cpu",
     debug_mask: bool = False,
+    s4d_decay: float = 0.995,
 ) -> dict:
     """Run streaming inference and write the clean wav.
 
@@ -119,6 +120,7 @@ def run_streaming(
             t0 = time.perf_counter()
             clean_chunk, state = separator.streaming_step(
                 chunk, speaker_embedding, state,
+                s4d_state_decay=s4d_decay,
             )
             latency = (time.perf_counter() - t0) * 1000.0
             latencies_ms.append(latency)
@@ -210,6 +212,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--debug-mask", action="store_true",
                         help="Print per-chunk mask statistics for diagnostics.")
+    parser.add_argument("--s4d-decay", type=float, default=0.995,
+                        help="Per-step decay factor for S4D recurrent state "
+                             "(1.0 = no decay)")
     return parser.parse_args()
 
 
@@ -223,6 +228,7 @@ def main() -> None:
         chunk_ms=args.chunk_ms,
         device=args.device,
         debug_mask=args.debug_mask,
+        s4d_decay=args.s4d_decay,
     )
 
 

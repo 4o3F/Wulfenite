@@ -522,6 +522,7 @@ class SpeakerBeamSS(nn.Module):
         mixture_chunk: torch.Tensor,
         speaker_embedding: torch.Tensor,
         state: dict,
+        s4d_state_decay: float = 0.995,
     ) -> tuple[torch.Tensor, dict]:
         """Stateful frame-by-frame forward.
 
@@ -533,6 +534,8 @@ class SpeakerBeamSS(nn.Module):
                 speaker embedding, normally computed once per session.
             state: dict from :meth:`initial_streaming_state` or the
                 previous call's second return value.
+            s4d_state_decay: Per-step multiplicative decay for S4D
+                recurrent state. ``1.0`` disables decay.
 
         Returns:
             Tuple of:
@@ -580,6 +583,8 @@ class SpeakerBeamSS(nn.Module):
         new_block_states = []
         for block, block_state in zip(self.blocks, state["block_states"]):
             feat, new_bs = block.forward_step(feat, block_state)
+            if s4d_state_decay < 1.0 and isinstance(block, S4DBlock):
+                new_bs = new_bs * s4d_state_decay
             new_block_states.append(new_bs)
 
         # ---- Mask head ----
