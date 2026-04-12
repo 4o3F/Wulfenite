@@ -1,25 +1,4 @@
-"""Wulfenite training loop.
-
-Ties together :mod:`wulfenite.data`, :mod:`wulfenite.models`, and
-:mod:`wulfenite.losses` into a standard PyTorch training loop with
-whole-utterance forward, Adam + ReduceLROnPlateau, gradient clipping,
-and epoch-level checkpointing.
-
-Call from the command line:
-
-    uv run --directory python python -m wulfenite.training.train \\
-        --aishell1-root ~/datasets/aishell1 \\
-        --aishell3-root ~/datasets/aishell3 \\
-        --noise-root ~/datasets/musan/noise \\
-        --out-dir ./checkpoints/phase1
-
-Or from Python (used by tests):
-
-    from wulfenite.training.train import run_training
-    from wulfenite.training.config import TrainingConfig
-
-    run_training(TrainingConfig(...), model=my_model)  # model optional
-"""
+"""Wulfenite training loop."""
 
 from __future__ import annotations
 
@@ -31,7 +10,6 @@ from pathlib import Path
 from typing import Callable
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -53,22 +31,11 @@ from ..losses import (
     compute_sdr_db,
     compute_sdri_db,
 )
-from ..models import (
-    LearnableDVector,
-    SpeakerEncoderOutput,
-    SpeakerBeamSSConfig,
-    WulfeniteTSE,
-    compute_fbank_batch,
-)
+from ..models import SpeakerBeamSSConfig, WulfeniteTSE
 from .checkpoint import save_checkpoint
 from .config import TrainingConfig
 
 SchedulerT = torch.optim.lr_scheduler.ReduceLROnPlateau | None
-
-
-# ---------------------------------------------------------------------------
-# Builders
-# ---------------------------------------------------------------------------
 
 
 def _split_speakers_for_val(
@@ -119,8 +86,6 @@ def build_dataset(cfg: TrainingConfig) -> tuple[WulfeniteMixer, WulfeniteMixer]:
     """Scan datasets, split speakers, and assemble train + val mixers."""
     speakers: dict = {}
     if cfg.aishell1_root is not None:
-        # Use all splits — our own speaker-disjoint split supersedes
-        # the dataset's original train/dev/test partition.
         speakers = scan_aishell1(cfg.aishell1_root, splits=("train", "dev", "test"))
     if cfg.aishell3_root is not None:
         speakers = merge_speaker_dicts(
@@ -170,77 +135,37 @@ def build_dataset(cfg: TrainingConfig) -> tuple[WulfeniteMixer, WulfeniteMixer]:
         noise_pool=noise_pool,
         config=train_mixer_cfg,
         samples_per_epoch=cfg.samples_per_epoch,
-        seed=None,  # fresh mixtures per call
+        seed=None,
     )
     val_ds = WulfeniteMixer(
         speakers=val_speakers,
         noise_pool=noise_pool,
         config=val_mixer_cfg,
         samples_per_epoch=cfg.val_samples,
-        seed=cfg.seed,  # reproducible validation
+        seed=cfg.seed,
     )
     return train_ds, val_ds
 
 
-def build_model(
-    cfg: TrainingConfig,
-    *,
-    num_speakers: int | None = None,
-) -> WulfeniteTSE:
-    """Build the TSE model for the configured speaker encoder type."""
+def build_model(cfg: TrainingConfig) -> WulfeniteTSE:
+    """Build the Phase 3 fine-tuned CAM++ TSE model."""
+    if cfg.campplus_checkpoint is None:
+        raise RuntimeError("Phase 3 training requires --campplus-checkpoint.")
+
     separator_config = SpeakerBeamSSConfig(
         enc_channels=cfg.enc_channels,
         bottleneck_channels=cfg.bottleneck_channels,
+        speaker_embed_dim=cfg.speaker_embed_dim,
         hidden_channels=cfg.hidden_channels,
         num_repeats=cfg.num_repeats,
         r1_blocks=cfg.r1_blocks,
         r2_blocks=cfg.r2_blocks,
         s4d_state_dim=cfg.s4d_state_dim,
     )
-
-    if cfg.encoder_type == "learnable":
-        if num_speakers is None:
-            raise RuntimeError(
-                "num_speakers must be provided to build the training model."
-            )
-        return WulfeniteTSE.from_learnable_dvector(
-            num_speakers=num_speakers,
-            separator_config=separator_config,
-        )
-
-    if cfg.encoder_type == "campplus-frozen":
-        if cfg.campplus_checkpoint is None:
-            raise RuntimeError(
-                "campplus-frozen requires --campplus-checkpoint."
-            )
-        return WulfeniteTSE.from_campplus(
-            cfg.campplus_checkpoint,
-            separator_config=separator_config,
-            freeze_backbone=True,
-            num_speakers=num_speakers,
-            projection_type=cfg.campplus_projection_type,
-            projection_hidden_dim=cfg.campplus_projection_hidden_dim,
-            arcface_scale=cfg.arcface_scale,
-            arcface_margin=cfg.arcface_margin,
-        )
-
-    if cfg.encoder_type == "campplus-finetune":
-        if cfg.campplus_checkpoint is None:
-            raise RuntimeError(
-                "campplus-finetune requires --campplus-checkpoint."
-            )
-        return WulfeniteTSE.from_campplus(
-            cfg.campplus_checkpoint,
-            separator_config=separator_config,
-            freeze_backbone=False,
-            num_speakers=num_speakers,
-            projection_type=cfg.campplus_projection_type,
-            projection_hidden_dim=cfg.campplus_projection_hidden_dim,
-            arcface_scale=cfg.arcface_scale,
-            arcface_margin=cfg.arcface_margin,
-        )
-
-    raise ValueError(f"Unsupported encoder_type: {cfg.encoder_type}")
+    return WulfeniteTSE.from_campplus(
+        cfg.campplus_checkpoint,
+        separator_config=separator_config,
+    )
 
 
 def build_loss(cfg: TrainingConfig) -> WulfeniteLoss:
@@ -250,7 +175,6 @@ def build_loss(cfg: TrainingConfig) -> WulfeniteLoss:
             mr_stft=cfg.loss_mr_stft,
             absent=cfg.loss_absent,
             presence=cfg.loss_presence,
-            speaker_cls=cfg.loss_speaker_cls,
         ),
     )
 
@@ -261,15 +185,37 @@ def build_optimizer(
     total_steps: int | None = None,
 ) -> tuple[torch.optim.Optimizer, SchedulerT]:
     """Build the optimizer and optional LR scheduler."""
+    del total_steps
+
     encoder_groups = model.speaker_encoder.optimizer_groups(cfg)
+    film_params = [
+        p for p in (
+            *model.separator.speaker_gamma.parameters(),
+            *model.separator.speaker_beta.parameters(),
+        )
+        if p.requires_grad
+    ]
+    film_param_ids = {id(p) for p in film_params}
+    separator_rest = [
+        p for p in model.separator.parameters()
+        if p.requires_grad and id(p) not in film_param_ids
+    ]
     param_groups = [*encoder_groups]
     param_groups.append(
         {
-            "name": "separator",
-            "params": [p for p in model.separator.parameters() if p.requires_grad],
+            "name": "separator_film",
+            "params": film_params,
             "lr": cfg.learning_rate,
         }
     )
+    param_groups.append(
+        {
+            "name": "separator_rest",
+            "params": separator_rest,
+            "lr": cfg.learning_rate,
+        }
+    )
+
     optimizer = torch.optim.Adam(
         param_groups,
         weight_decay=cfg.weight_decay,
@@ -285,25 +231,6 @@ def build_optimizer(
     return optimizer, scheduler
 
 
-def lambda_cls_schedule(
-    epoch: int,
-    total_epochs: int,
-    start: float = 0.2,
-    end: float = 0.2,
-    decay_epochs: int = 25,
-) -> float:
-    """Legacy helper for experiments with speaker-classification schedules."""
-    if decay_epochs <= 0 or epoch >= decay_epochs:
-        return end
-    frac = epoch / decay_epochs
-    return start + (end - start) * frac
-
-
-# ---------------------------------------------------------------------------
-# Train / validate epochs
-# ---------------------------------------------------------------------------
-
-
 def _move_batch(batch: dict, device: torch.device, non_blocking: bool) -> dict:
     return {
         k: (v.to(device, non_blocking=non_blocking) if torch.is_tensor(v) else v)
@@ -311,32 +238,14 @@ def _move_batch(batch: dict, device: torch.device, non_blocking: bool) -> dict:
     }
 
 
-def _speaker_encoder_outputs(
+def _encode_speaker_embeddings(
     model: WulfeniteTSE,
     batch: dict,
-    speaker_labels: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Return raw embedding, separator embedding, and optional logits."""
+) -> tuple[torch.Tensor, torch.Tensor]:
     fbank = batch.get("enrollment_fbank")
-    if isinstance(model.speaker_encoder, LearnableDVector):
-        if fbank is None:
-            fbank = compute_fbank_batch(batch["enrollment"])
-        return model.speaker_encoder(fbank)
-
-    encoder_out = model.speaker_encoder(
+    return model.speaker_encoder(
         batch["enrollment"],
         fbank=fbank,
-        speaker_labels=speaker_labels,
-    )
-    if not isinstance(encoder_out, SpeakerEncoderOutput):
-        raise TypeError(
-            "speaker_encoder must return either the learnable "
-            "d-vector tuple or SpeakerEncoderOutput."
-        )
-    return (
-        encoder_out.native_embedding,
-        encoder_out.separator_embedding,
-        encoder_out.speaker_logits,
     )
 
 
@@ -379,37 +288,6 @@ def compute_val_sdri_present(
 
 
 @torch.no_grad()
-def compute_speaker_top1_accuracy(
-    model: WulfeniteTSE,
-    loader: DataLoader,
-    device: torch.device,
-    *,
-    max_batches: int | None = 8,
-) -> float:
-    """Compute top-1 speaker accuracy on a train-speaker probe set."""
-    model.eval()
-    pin = device.type == "cuda"
-    total = 0
-    correct = 0
-    for i, batch in enumerate(loader):
-        batch = _move_batch(batch, device, non_blocking=pin)
-        _, _, logits = _speaker_encoder_outputs(
-            model,
-            batch,
-            speaker_labels=None,
-        )
-        if logits is None:
-            raise RuntimeError("Training diagnostics require a classifier head.")
-        pred = logits.argmax(dim=-1)
-        target = batch["target_speaker_idx"]
-        correct += int((pred == target).sum().item())
-        total += int(target.numel())
-        if max_batches is not None and i + 1 >= max_batches:
-            break
-    return correct / max(1, total)
-
-
-@torch.no_grad()
 def compute_same_diff_cosine_gap(
     model: WulfeniteTSE,
     loader: DataLoader,
@@ -424,7 +302,7 @@ def compute_same_diff_cosine_gap(
     labels: list[torch.Tensor] = []
     for i, batch in enumerate(loader):
         batch = _move_batch(batch, device, non_blocking=pin)
-        _, norm_emb, _ = _speaker_encoder_outputs(model, batch)
+        _, norm_emb = _encode_speaker_embeddings(model, batch)
         embeddings.append(norm_emb)
         labels.append(batch["target_speaker_idx"])
         if max_batches is not None and i + 1 >= max_batches:
@@ -537,7 +415,6 @@ def train_one_epoch(
             batch["mixture"],
             batch["enrollment"],
             batch.get("enrollment_fbank"),
-            target_speaker_idx=batch.get("target_speaker_idx"),
         )
         loss, parts = criterion(
             clean=outputs["clean"],
@@ -545,8 +422,6 @@ def train_one_epoch(
             mixture=batch["mixture"],
             target_present=batch["target_present"],
             presence_logit=outputs.get("presence_logit"),
-            speaker_logits=outputs.get("speaker_logits"),
-            target_speaker_idx=batch.get("target_speaker_idx"),
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -566,7 +441,6 @@ def train_one_epoch(
             "loss": f"{parts.total:+.3f}",
             "sdr": f"{parts.sdr:+.2f}",
             "stft": f"{parts.mr_stft:.3f}",
-            "cls": f"{parts.speaker_cls:.3f}",
             "lr_s": f"{optimizer.param_groups[-1]['lr']:.1e}",
         }
         pbar.set_postfix(refresh=False, **postfix)
@@ -576,7 +450,7 @@ def train_one_epoch(
                 f"epoch {epoch} step {step + 1}/{len(loader)} "
                 f"loss={parts.total:+.4f} sdr={parts.sdr:+.3f} "
                 f"stft={parts.mr_stft:.4f} absent={parts.absent:.4f} "
-                f"presence={parts.presence:.4f} speaker_cls={parts.speaker_cls:.4f} "
+                f"presence={parts.presence:.4f} "
                 f"present={parts.n_present}/{parts.n_present + parts.n_absent} "
                 f"{_format_lr(optimizer)}"
             )
@@ -622,7 +496,6 @@ def validate(
             batch["mixture"],
             batch["enrollment"],
             batch.get("enrollment_fbank"),
-            target_speaker_idx=batch.get("target_speaker_idx"),
         )
         _, parts = criterion(
             clean=outputs["clean"],
@@ -630,15 +503,6 @@ def validate(
             mixture=batch["mixture"],
             target_present=batch["target_present"],
             presence_logit=outputs.get("presence_logit"),
-            # Validation speakers are disjoint from train speakers, so
-            # the auxiliary classifier is intentionally excluded here.
-            # Speaker discrimination is tracked via the separate probe
-            # loader top-1 / cosine-gap diagnostics instead, and
-            # ``speaker_cls`` is omitted from the returned metrics dict
-            # so it does not appear as a misleading "val_speaker_cls=0"
-            # in logs or checkpoint metadata.
-            speaker_logits=None,
-            target_speaker_idx=None,
         )
         total += parts.total
         sdr_loss_sum += parts.sdr
@@ -669,94 +533,6 @@ def validate(
     }
 
 
-def run_encoder_pretrain(
-    cfg: TrainingConfig,
-    model: WulfeniteTSE,
-    train_loader: DataLoader,
-    probe_loader: DataLoader,
-    device: torch.device,
-    epochs: int,
-    log_fn: Callable[[str], None],
-    *,
-    show_progress: bool = True,
-) -> None:
-    """Phase A: pretrain only the speaker encoder + classifier."""
-    if epochs <= 0:
-        return
-
-    for p in model.separator.parameters():
-        p.requires_grad_(False)
-
-    optimizer = torch.optim.Adam(
-        model.speaker_encoder.optimizer_groups(cfg, base_lr=cfg.encoder_pretrain_lr),
-        weight_decay=cfg.weight_decay,
-    )
-    pin = device.type == "cuda"
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total_loss = 0.0
-        n_batches = 0
-        pbar = tqdm(
-            train_loader,
-            desc=f"pretrain {epoch}",
-            total=len(train_loader),
-            disable=not show_progress,
-            leave=False,
-            dynamic_ncols=True,
-        )
-        for batch in pbar:
-            batch = _move_batch(batch, device, non_blocking=pin)
-            _, _, logits = _speaker_encoder_outputs(
-                model,
-                batch,
-                speaker_labels=batch["target_speaker_idx"],
-            )
-            if logits is None:
-                raise RuntimeError(
-                    "Speaker-encoder pretrain requires a classifier head."
-                )
-            loss = F.cross_entropy(logits, batch["target_speaker_idx"])
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if cfg.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.speaker_encoder.parameters() if p.requires_grad],
-                    max_norm=cfg.grad_clip,
-                )
-            optimizer.step()
-
-            total_loss += float(loss.detach())
-            n_batches += 1
-            pbar.set_postfix(
-                loss=f"{float(loss.detach()):.3f}",
-                lr=f"{optimizer.param_groups[0]['lr']:.1e}",
-                refresh=False,
-            )
-        pbar.close()
-
-        top1 = compute_speaker_top1_accuracy(
-            model, probe_loader, device, max_batches=None
-        )
-        same, diff, gap = compute_same_diff_cosine_gap(
-            model, probe_loader, device, max_batches=None
-        )
-        log_fn(
-            f"[pretrain] epoch {epoch}/{epochs} "
-            f"loss={total_loss / max(1, n_batches):.4f} "
-            f"top1={top1:.3f} same_cos={same:.3f} diff_cos={diff:.3f} gap={gap:.3f}"
-        )
-
-    for p in model.separator.parameters():
-        p.requires_grad_(True)
-
-
-# ---------------------------------------------------------------------------
-# Top-level entrypoint
-# ---------------------------------------------------------------------------
-
-
 def run_training(
     cfg: TrainingConfig,
     *,
@@ -779,7 +555,7 @@ def run_training(
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
-        shuffle=False,  # virtual epoch
+        shuffle=False,
         num_workers=cfg.num_workers,
         collate_fn=collate_mixer_batch,
         persistent_workers=cfg.num_workers > 0 and not curriculum_active,
@@ -800,20 +576,7 @@ def run_training(
     )
 
     if model is None:
-        model = build_model(
-            cfg,
-            num_speakers=len(train_ds.speaker_ids),
-        )
-    elif getattr(model.speaker_encoder, "supports_classifier", False):
-        classifier = getattr(model.speaker_encoder, "classifier", None)
-        if classifier is None:
-            raise ValueError(
-                "Training requires a speaker encoder with a classifier head."
-            )
-        if classifier.out_features != len(train_ds.speaker_ids):
-            raise ValueError(
-                "Provided model classifier size must match the training speaker set."
-            )
+        model = build_model(cfg)
     model = model.to(device)
 
     criterion = build_loss(cfg).to(device)
@@ -854,19 +617,6 @@ def run_training(
         pin_memory=pin_memory,
         drop_last=False,
     )
-    if getattr(model.speaker_encoder, "supports_pretrain", False):
-        run_encoder_pretrain(
-            cfg,
-            model,
-            train_loader,
-            probe_loader,
-            device,
-            cfg.encoder_pretrain_epochs,
-            log,
-            show_progress=show_progress,
-        )
-    elif cfg.encoder_pretrain_epochs > 0:
-        log("[pretrain] skipped: selected speaker encoder does not support it")
 
     optimizer, scheduler = build_optimizer(model, cfg)
 
@@ -916,15 +666,8 @@ def run_training(
             **{f"val_{k}": v for k, v in val_parts.items()},
         }
 
-        diag_parts = []
-        if getattr(model.speaker_encoder, "supports_classifier", False):
-            top1 = compute_speaker_top1_accuracy(
-                model, probe_loader, device, max_batches=None
-            )
-            metrics["speaker_top1"] = top1
-            diag_parts.append(f"top1={top1:.3f}")
         same, diff, gap = compute_same_diff_cosine_gap(
-            model, val_loader, device, max_batches=None
+            model, probe_loader, device, max_batches=None
         )
         shuffle_batch = None
         for candidate in val_loader:
@@ -946,14 +689,6 @@ def run_training(
                 "cosine_gap": gap,
             }
         )
-        diag_parts.extend(
-            [
-                f"shuffle_drop={shuffle_drop:.3f}",
-                f"same_cos={same:.3f}",
-                f"diff_cos={diff:.3f}",
-                f"cos_gap={gap:.3f}",
-            ]
-        )
 
         log(
             f"epoch {epoch} transition_prob={eff_prob:.3f} "
@@ -962,7 +697,8 @@ def run_training(
             f"val_sdri_db={val_parts['sdri_db']:+.3f} "
             f"val_stft={val_parts['mr_stft']:.4f} "
             f"val_absent={val_parts['absent']:.4f} time={train_time:.1f}s "
-            + (" ".join(diag_parts) if diag_parts else "")
+            f"shuffle_drop={shuffle_drop:.3f} "
+            f"same_cos={same:.3f} diff_cos={diff:.3f} cos_gap={gap:.3f}"
         )
 
         if cfg.save_every_epoch:
@@ -1009,27 +745,21 @@ def run_training(
     epoch_iter.close()
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
 def _parse_args() -> TrainingConfig:
     parser = argparse.ArgumentParser(description="Train Wulfenite SpeakerBeam-SS")
-    # Data
     parser.add_argument("--aishell1-root", type=Path, default=None)
     parser.add_argument("--aishell3-root", type=Path, default=None)
     parser.add_argument("--magicdata-root", type=Path, default=None)
     parser.add_argument("--cnceleb-root", type=Path, default=None)
     parser.add_argument("--noise-root", type=Path, default=None)
-    # Mixer
+
     parser.add_argument("--segment-seconds", type=float, default=4.0)
     parser.add_argument("--enrollment-seconds", type=float, default=4.0)
     parser.add_argument("--snr-range-db", type=float, nargs=2, default=(-5.0, 5.0))
     parser.add_argument("--target-present-prob", type=float, default=0.85)
-    parser.add_argument("--transition-prob", type=float, default=0.20)
-    parser.add_argument("--transition-warmup-ratio", type=float, default=0.5)
-    parser.add_argument("--transition-ramp-ratio", type=float, default=0.3)
+    parser.add_argument("--transition-prob", type=float, default=0.0)
+    parser.add_argument("--transition-warmup-ratio", type=float, default=0.0)
+    parser.add_argument("--transition-ramp-ratio", type=float, default=0.0)
     parser.add_argument("--transition-min-fraction", type=float, default=0.25)
     parser.add_argument("--transition-min-target-rms", type=float, default=0.01)
     parser.add_argument("--noise-snr-range-db", type=float, nargs=2, default=(10.0, 25.0))
@@ -1037,59 +767,41 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--reverb-prob", type=float, default=0.85)
     parser.add_argument("--rir-pool-size", type=int, default=1000)
     parser.add_argument("--val-speaker-ratio", type=float, default=0.2)
-    # Optimizer
+
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--samples-per-epoch", type=int, default=20000)
     parser.add_argument("--val-samples", type=int, default=500)
     parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--encoder-lr", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--plateau-patience", type=int, default=5)
     parser.add_argument("--plateau-factor", type=float, default=0.5)
     parser.add_argument("--early-stopping-patience", type=int, default=20)
     parser.add_argument("--grad-clip", type=float, default=5.0)
-    parser.add_argument("--encoder-pretrain-epochs", type=int, default=5)
-    parser.add_argument("--encoder-pretrain-lr", type=float, default=3e-4)
-    parser.add_argument("--encoder-lr-scale", type=float, default=0.25)
-    parser.add_argument(
-        "--encoder-type",
-        choices=("learnable", "campplus-frozen", "campplus-finetune"),
-        default="learnable",
-    )
+
     parser.add_argument("--campplus-checkpoint", type=Path, default=None)
-    parser.add_argument(
-        "--campplus-projection-type",
-        choices=("mlp", "linear"),
-        default="mlp",
-    )
-    parser.add_argument(
-        "--campplus-projection-hidden-dim",
-        type=int,
-        default=384,
-    )
-    parser.add_argument("--arcface-scale", type=float, default=30.0)
-    parser.add_argument("--arcface-margin", type=float, default=0.2)
     parser.add_argument("--enc-channels", type=int, default=4096)
     parser.add_argument("--bottleneck-channels", type=int, default=256)
+    parser.add_argument("--speaker-embed-dim", type=int, default=192)
     parser.add_argument("--hidden-channels", type=int, default=512)
     parser.add_argument("--num-repeats", type=int, default=2)
     parser.add_argument("--r1-blocks", type=int, default=3)
     parser.add_argument("--r2-blocks", type=int, default=1)
     parser.add_argument("--s4d-state-dim", type=int, default=32)
-    # Loss
+
     parser.add_argument("--loss-sdr", type=float, default=1.0)
     parser.add_argument("--loss-mr-stft", type=float, default=1.0)
     parser.add_argument("--loss-absent", type=float, default=0.5)
     parser.add_argument("--loss-presence", type=float, default=0.1)
-    parser.add_argument("--loss-speaker-cls", type=float, default=0.2)
-    # DataLoader
+
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--prefetch-factor", type=int, default=4)
-    # Output
+
     parser.add_argument("--out-dir", type=Path, default=Path("./checkpoints"))
     parser.add_argument("--log-interval", type=int, default=50)
     parser.add_argument("--no-save-every-epoch", action="store_true")
-    # Runtime
+
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=1234)
 
@@ -1102,10 +814,6 @@ def _parse_args() -> TrainingConfig:
         cnceleb_root=args.cnceleb_root,
         noise_root=args.noise_root,
         campplus_checkpoint=args.campplus_checkpoint,
-        campplus_projection_type=args.campplus_projection_type,
-        campplus_projection_hidden_dim=args.campplus_projection_hidden_dim,
-        arcface_scale=args.arcface_scale,
-        arcface_margin=args.arcface_margin,
         segment_seconds=args.segment_seconds,
         enrollment_seconds=args.enrollment_seconds,
         snr_range_db=tuple(args.snr_range_db),
@@ -1124,17 +832,16 @@ def _parse_args() -> TrainingConfig:
         samples_per_epoch=args.samples_per_epoch,
         val_samples=args.val_samples,
         learning_rate=args.lr,
+        encoder_lr=args.encoder_lr,
         weight_decay=args.weight_decay,
         use_plateau_scheduler=True,
         plateau_patience=args.plateau_patience,
         plateau_factor=args.plateau_factor,
         early_stopping_patience=args.early_stopping_patience,
         grad_clip=args.grad_clip,
-        encoder_pretrain_epochs=args.encoder_pretrain_epochs,
-        encoder_pretrain_lr=args.encoder_pretrain_lr,
-        encoder_lr_scale=args.encoder_lr_scale,
         enc_channels=args.enc_channels,
         bottleneck_channels=args.bottleneck_channels,
+        speaker_embed_dim=args.speaker_embed_dim,
         hidden_channels=args.hidden_channels,
         num_repeats=args.num_repeats,
         r1_blocks=args.r1_blocks,
@@ -1144,7 +851,6 @@ def _parse_args() -> TrainingConfig:
         loss_mr_stft=args.loss_mr_stft,
         loss_absent=args.loss_absent,
         loss_presence=args.loss_presence,
-        loss_speaker_cls=args.loss_speaker_cls,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         val_speaker_ratio=args.val_speaker_ratio,
@@ -1153,7 +859,6 @@ def _parse_args() -> TrainingConfig:
         save_every_epoch=not args.no_save_every_epoch,
         device=args.device,
         seed=args.seed,
-        encoder_type=args.encoder_type,
     )
 
 

@@ -18,11 +18,11 @@ interface specification.
 ## Architecture
 
 **SpeakerBeam-SS** (causal Conv-TasNet + S4D, [arXiv 2407.01857](https://arxiv.org/abs/2407.01857))
-with a learnable d-vector speaker encoder trained end-to-end.
+with a fine-tuned CAM++ speaker encoder.
 
 - Separator: ~7.6M params, paper-faithful defaults (N=4096, B=256, D=32)
-- Speaker encoder: ~1M params learnable x-vector with auxiliary classification
-- FiLM speaker conditioning: `feat = feat * gamma(e) + beta(e)`
+- Speaker encoder: CAM++ (192-dim, fine-tuned with low LR)
+- FiLM speaker conditioning: `feat = feat * (1 + gamma(e)) + beta(e)`
 - Loss: direct SDR + multi-resolution STFT + silence penalty + presence head
 - Causal streaming with stateful S4D recurrence
 
@@ -48,10 +48,9 @@ and selects the best checkpoint by max `val_sdri_db` on speaker-disjoint
 validation. If the N=4096 separator OOMs on your GPU, try `--batch-size 12`
 or `--batch-size 8`.
 
-**Learnable d-vector** (default, trains encoder from scratch):
-
 ```bash
 uv run --directory python python -m wulfenite.training.train \
+    --campplus-checkpoint ../assets/campplus/campplus_cn_common.bin \
     --aishell1-root ../assets/aishell1 \
     --aishell3-root ../assets/aishell3 \
     --magicdata-root ../assets/magicdata \
@@ -59,40 +58,8 @@ uv run --directory python python -m wulfenite.training.train \
     --out-dir ../assets/checkpoints/phase3 \
     --batch-size 16 \
     --epochs 200 \
-    --lr 5e-4
-```
-
-**Frozen CAM++** (pretrained 200k-speaker encoder, only projection +
-separator train):
-
-```bash
-uv run --directory python python -m wulfenite.training.train \
-    --encoder-type campplus-frozen \
-    --campplus-checkpoint ../assets/campplus_cn_common.bin \
-    --aishell1-root ../assets/aishell1 \
-    --aishell3-root ../assets/aishell3 \
-    --magicdata-root ../assets/magicdata \
-    --noise-root ../assets/musan/noise \
-    --out-dir ../assets/checkpoints/phase3-campplus-frozen \
-    --batch-size 16 \
-    --epochs 200 \
-    --lr 5e-4
-```
-
-**Fine-tune CAM++** (pretrained encoder jointly trained at lower LR):
-
-```bash
-uv run --directory python python -m wulfenite.training.train \
-    --encoder-type campplus-finetune \
-    --campplus-checkpoint ../assets/campplus_cn_common.bin \
-    --aishell1-root ../assets/aishell1 \
-    --aishell3-root ../assets/aishell3 \
-    --magicdata-root ../assets/magicdata \
-    --noise-root ../assets/musan/noise \
-    --out-dir ../assets/checkpoints/phase3-campplus-finetune \
-    --batch-size 16 \
-    --epochs 200 \
-    --lr 5e-4
+    --lr 5e-4 \
+    --encoder-lr 1e-5
 ```
 
 ### Inference
@@ -124,7 +91,7 @@ uv run --directory python python -m wulfenite.inference.streaming \
 uv run --directory python pytest tests/ -v
 ```
 
-Expected: **73 passed**. Tests cover model shapes, streaming/forward
+Expected: **86 passed**. Tests cover model shapes, streaming/forward
 equivalence, FiLM initialization, SDR metric helpers, data scanners,
 and training smoke tests. No external datasets or GPU required.
 

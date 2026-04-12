@@ -54,7 +54,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from ..models.dvector import compute_fbank_batch
+from ..audio_features import compute_fbank_batch
 from .aishell import AudioEntry
 from .augmentation import (
     ReverbConfig,
@@ -92,7 +92,7 @@ class MixerConfig:
     # --- Mixing ---
     snr_range_db: tuple[float, float] = (-5.0, 5.0)
     target_present_prob: float = 0.85  # fraction of target-present samples
-    transition_prob: float = 0.20
+    transition_prob: float = 0.0
     transition_min_fraction: float = 0.25
     transition_min_target_rms: float = 0.01
 

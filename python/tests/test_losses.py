@@ -293,3 +293,21 @@ def test_combined_loss_without_presence_head() -> None:
     assert parts.presence == 0.0
     total.backward()
     assert clean.grad is not None
+
+
+def test_loss_dataclasses_no_longer_expose_speaker_cls() -> None:
+    weights = LossWeights()
+    assert not hasattr(weights, "speaker_cls")
+
+    clean = torch.randn(1, 256, requires_grad=True)
+    target = torch.randn(1, 256)
+    mixture = torch.randn(1, 256)
+    present = torch.ones(1)
+
+    total, parts = WulfeniteLoss(
+        mr_stft_loss=MultiResolutionSTFTLoss(
+            fft_sizes=(128,), hop_sizes=(32,), win_lengths=(128,),
+        ),
+    )(clean, target, mixture, present, presence_logit=None)
+    assert torch.isfinite(total)
+    assert not hasattr(parts, "speaker_cls")

@@ -1,13 +1,4 @@
-"""Smoke tests for the inference CLIs.
-
-These tests do NOT exercise the full ``run_whole`` / ``run_streaming``
-entry points. Instead, they test:
-
-1. The whole-utterance vs streaming numerical equivalence on random
-   weights end-to-end through ``WulfeniteTSE`` — same guarantee as
-   the SpeakerBeam-SS separator test, but including the TSE wrapper.
-2. The checkpoint round-trip preserves output bit-for-bit.
-"""
+"""Smoke tests for checkpoint-aware inference paths."""
 
 from __future__ import annotations
 
@@ -15,12 +6,10 @@ from pathlib import Path
 
 import pytest
 import torch
-from torch import nn
 
 from wulfenite.inference.utils import build_model_from_checkpoint
 from wulfenite.models import SpeakerBeamSSConfig, WulfeniteTSE
 from wulfenite.training.checkpoint import load_checkpoint, save_checkpoint
-from wulfenite.training.config import TrainingConfig
 
 
 SR = 16000
@@ -30,6 +19,7 @@ def _tiny_separator_config() -> SpeakerBeamSSConfig:
     return SpeakerBeamSSConfig(
         enc_channels=16,
         bottleneck_channels=16,
+        speaker_embed_dim=192,
         num_repeats=1,
         r1_blocks=1,
         r2_blocks=1,
@@ -40,358 +30,32 @@ def _tiny_separator_config() -> SpeakerBeamSSConfig:
 
 def _separator_checkpoint_config(
     separator_config: SpeakerBeamSSConfig,
-    *,
-    encoder_type: str,
-    campplus_projection_type: str | None = None,
-    campplus_projection_hidden_dim: int | None = None,
-) -> dict[str, int | str]:
-    config: dict[str, int | str] = {
-        "encoder_type": encoder_type,
+) -> dict[str, int]:
+    return {
         "enc_channels": separator_config.enc_channels,
         "bottleneck_channels": separator_config.bottleneck_channels,
+        "speaker_embed_dim": separator_config.speaker_embed_dim,
         "hidden_channels": separator_config.hidden_channels,
         "num_repeats": separator_config.num_repeats,
         "r1_blocks": separator_config.r1_blocks,
         "r2_blocks": separator_config.r2_blocks,
         "s4d_state_dim": separator_config.s4d_state_dim,
     }
-    if campplus_projection_type is not None:
-        config["campplus_projection_type"] = campplus_projection_type
-    if campplus_projection_hidden_dim is not None:
-        config["campplus_projection_hidden_dim"] = campplus_projection_hidden_dim
-    return config
 
 
 def _tiny_tse() -> WulfeniteTSE:
-    cfg = _tiny_separator_config()
-    return WulfeniteTSE.from_learnable_dvector(
-        num_speakers=4,
-        separator_config=cfg,
-        dvector_kwargs={
-            "tdnn_channels": 16,
-            "stats_dim": 16,
-            "spec_augment": False,
-        },
-    ).eval()
-
-
-def _checkpoint_tse(num_speakers: int = 4) -> WulfeniteTSE:
-    return WulfeniteTSE.from_learnable_dvector(
-        num_speakers=num_speakers,
-        dvector_kwargs={"spec_augment": False},
-    ).eval()
-
-
-def _tiny_campplus_tse(
-    freeze: bool,
-    *,
-    num_speakers: int | None = None,
-    projection_type: str = "mlp",
-    projection_hidden_dim: int = 384,
-    arcface_scale: float = 30.0,
-    arcface_margin: float = 0.2,
-) -> WulfeniteTSE:
     return WulfeniteTSE.from_campplus(
         campplus_checkpoint=None,
         separator_config=_tiny_separator_config(),
-        freeze_backbone=freeze,
-        num_speakers=num_speakers,
-        projection_type=projection_type,
-        projection_hidden_dim=projection_hidden_dim,
-        arcface_scale=arcface_scale,
-        arcface_margin=arcface_margin,
     ).eval()
 
 
 def test_whole_vs_streaming_end_to_end() -> None:
-    """End-to-end TSE forward vs streaming_step must agree numerically."""
     torch.manual_seed(0)
     tse = _tiny_tse()
 
-    # Random enrollment / mixture audio.
-    T = 8 * tse.separator.config.enc_stride  # 8 encoder frames
-    mixture = torch.randn(1, T)
-    enrollment_wav = torch.randn(SR)  # 1 second
-
-    with torch.no_grad():
-        # Whole-utterance path.
-        whole_outputs = tse(mixture, enrollment_wav)
-        whole_clean = whole_outputs["clean"]
-
-        # Streaming path, manually threaded.
-        emb = tse.encode_enrollment(enrollment_wav)
-        state = tse.separator.initial_streaming_state(batch_size=1)
-        chunk_size = 2 * tse.separator.config.enc_stride  # 2 frames per chunk
-        pieces = []
-        for start in range(0, T, chunk_size):
-            chunk = mixture[..., start:start + chunk_size]
-            if chunk.shape[-1] != chunk_size:
-                continue
-            out, state = tse.separator.streaming_step(chunk, emb, state)
-            pieces.append(out)
-        stream_clean = torch.cat(pieces, dim=-1)
-
-    assert whole_clean.shape == stream_clean.shape
-    diff = (whole_clean - stream_clean).abs().max().item()
-    assert diff < 1e-4, (
-        f"whole vs streaming TSE disagree by {diff:.2e} (>1e-4)"
-    )
-
-
-def test_checkpoint_preserves_inference_output(tmp_path: Path) -> None:
-    """Saving and re-loading a checkpoint must not change the model output."""
-    torch.manual_seed(1)
-    tse = _tiny_tse()
-    T = 4 * tse.separator.config.enc_stride
-    mixture = torch.randn(1, T)
-    enrollment = torch.randn(SR)
-
-    with torch.no_grad():
-        before = tse(mixture, enrollment)["clean"]
-
-    ckpt_path = tmp_path / "ckpt.pt"
-    save_checkpoint(ckpt_path, model=tse, config=TrainingConfig())
-
-    tse2 = _tiny_tse()
-    load_checkpoint(ckpt_path, model=tse2)
-    tse2.eval()
-    with torch.no_grad():
-        after = tse2(mixture, enrollment)["clean"]
-
-    assert torch.allclose(before, after, atol=1e-6), (
-        "inference output diverged after checkpoint round-trip"
-    )
-
-
-def test_build_model_from_checkpoint_learnable_path(tmp_path: Path) -> None:
-    """Inference checkpoints should rebuild through the classifier-free path."""
-    torch.manual_seed(3)
-    tse = _checkpoint_tse(num_speakers=4)
-    T = 4 * tse.separator.config.enc_stride
-    mixture = torch.randn(1, T)
-    enrollment = torch.randn(SR)
-
-    with torch.no_grad():
-        before = tse(mixture, enrollment)["clean"]
-
-    ckpt_path = tmp_path / "learnable.pt"
-    save_checkpoint(
-        ckpt_path,
-        model=tse,
-        config=TrainingConfig(),
-    )
-
-    loaded, info = build_model_from_checkpoint(ckpt_path)
-    assert loaded.speaker_encoder.classifier is None
-    assert info["skipped_classifier_keys"]
-    assert all(
-        key.startswith("speaker_encoder.classifier.")
-        for key in info["skipped_classifier_keys"]
-    )
-
-    with torch.no_grad():
-        after = loaded(mixture, enrollment)["clean"]
-
-    assert torch.allclose(before, after, atol=1e-6), (
-        "learnable inference output diverged after checkpoint rebuild"
-    )
-
-
-@pytest.mark.parametrize("encoder_type", ("campplus-frozen", "campplus-finetune"))
-def test_build_model_from_checkpoint_campplus_roundtrip(
-    tmp_path: Path,
-    encoder_type: str,
-) -> None:
-    """CAM++ checkpoints should rebuild through the strict inference path."""
-    torch.manual_seed(4)
-    tse = _tiny_campplus_tse(freeze=encoder_type == "campplus-frozen")
-    T = 4 * tse.separator.config.enc_stride
-    mixture = torch.randn(1, T)
-    enrollment = torch.randn(SR)
-
-    with torch.no_grad():
-        before = tse(mixture, enrollment)["clean"]
-
-    ckpt_path = tmp_path / f"{encoder_type}.pt"
-    save_checkpoint(
-        ckpt_path,
-        model=tse,
-        config=_separator_checkpoint_config(
-            tse.separator.config,
-            encoder_type=encoder_type,
-            campplus_projection_type="mlp",
-            campplus_projection_hidden_dim=384,
-        ),
-    )
-
-    loaded, info = build_model_from_checkpoint(ckpt_path)
-    assert loaded.separator.config == _tiny_separator_config()
-    assert info["config"]["encoder_type"] == encoder_type
-
-    with torch.no_grad():
-        after = loaded(mixture, enrollment)["clean"]
-
-    assert torch.allclose(before, after, atol=1e-6), (
-        "CAM++ inference output diverged after checkpoint rebuild"
-    )
-
-
-def test_build_model_from_checkpoint_campplus_mlp_classifier_roundtrip(
-    tmp_path: Path,
-) -> None:
-    """CAM++ inference loading should strip classifier keys from MLP checkpoints."""
-    torch.manual_seed(40)
-    tse = _tiny_campplus_tse(
-        freeze=True,
-        num_speakers=4,
-        projection_type="mlp",
-        projection_hidden_dim=48,
-    )
-    T = 4 * tse.separator.config.enc_stride
-    mixture = torch.randn(1, T)
-    enrollment = torch.randn(SR)
-
-    with torch.no_grad():
-        before = tse(mixture, enrollment)["clean"]
-
-    ckpt_path = tmp_path / "campplus_mlp_classifier.pt"
-    save_checkpoint(
-        ckpt_path,
-        model=tse,
-        config=_separator_checkpoint_config(
-            tse.separator.config,
-            encoder_type="campplus-frozen",
-            campplus_projection_type="mlp",
-            campplus_projection_hidden_dim=48,
-        ),
-    )
-
-    loaded, info = build_model_from_checkpoint(ckpt_path)
-    assert loaded.speaker_encoder.classifier is None
-    assert info["skipped_classifier_keys"]
-    assert all(
-        key.startswith("speaker_encoder.classifier.")
-        for key in info["skipped_classifier_keys"]
-    )
-
-    with torch.no_grad():
-        after = loaded(mixture, enrollment)["clean"]
-
-    assert torch.allclose(before, after, atol=1e-6), (
-        "CAM++ MLP inference output diverged after classifier stripping"
-    )
-
-
-def test_campplus_arcface_checkpoint_roundtrip_absorbs_legacy_linear_bias(
-    tmp_path: Path,
-) -> None:
-    """Legacy linear-classifier checkpoints should load into ArcFace models."""
-    torch.manual_seed(42)
-    tse = _tiny_campplus_tse(
-        freeze=True,
-        num_speakers=4,
-        projection_type="mlp",
-        projection_hidden_dim=48,
-        arcface_scale=18.0,
-        arcface_margin=0.35,
-    )
-    T = 4 * tse.separator.config.enc_stride
-    mixture = torch.randn(1, T)
-    enrollment = torch.randn(SR)
-    labels = torch.tensor([1])
-
-    with torch.no_grad():
-        before = tse(
-            mixture,
-            enrollment,
-            target_speaker_idx=labels,
-        )
-
-    ckpt_path = tmp_path / "campplus_arcface_legacy_bias.pt"
-    save_checkpoint(
-        ckpt_path,
-        model=tse,
-        config=_separator_checkpoint_config(
-            tse.separator.config,
-            encoder_type="campplus-frozen",
-            campplus_projection_type="mlp",
-            campplus_projection_hidden_dim=48,
-        ),
-    )
-
-    payload = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
-    payload["model_state_dict"]["speaker_encoder.classifier.bias"] = torch.randn(4)
-    torch.save(payload, ckpt_path)
-
-    loaded = _tiny_campplus_tse(
-        freeze=True,
-        num_speakers=4,
-        projection_type="mlp",
-        projection_hidden_dim=48,
-        arcface_scale=18.0,
-        arcface_margin=0.35,
-    )
-    load_checkpoint(ckpt_path, model=loaded)
-    loaded.eval()
-
-    with torch.no_grad():
-        after = loaded(
-            mixture,
-            enrollment,
-            target_speaker_idx=labels,
-        )
-
-    assert torch.allclose(before["clean"], after["clean"], atol=1e-6)
-    assert before["speaker_logits"] is not None
-    assert after["speaker_logits"] is not None
-    assert torch.allclose(before["speaker_logits"], after["speaker_logits"], atol=1e-6)
-
-
-def test_build_model_from_checkpoint_campplus_legacy_linear_checkpoint(
-    tmp_path: Path,
-) -> None:
-    """Legacy CAM++ checkpoints without projector metadata should load as linear."""
-    torch.manual_seed(41)
-    tse = _tiny_campplus_tse(
-        freeze=True,
-        projection_type="linear",
-    )
-    T = 4 * tse.separator.config.enc_stride
-    mixture = torch.randn(1, T)
-    enrollment = torch.randn(SR)
-
-    with torch.no_grad():
-        before = tse(mixture, enrollment)["clean"]
-
-    ckpt_path = tmp_path / "campplus_legacy_linear.pt"
-    save_checkpoint(
-        ckpt_path,
-        model=tse,
-        config=_separator_checkpoint_config(
-            tse.separator.config,
-            encoder_type="campplus-frozen",
-        ),
-    )
-
-    loaded, info = build_model_from_checkpoint(ckpt_path)
-    assert isinstance(loaded.speaker_encoder.to_separator, nn.Linear)
-    assert info["config"]["encoder_type"] == "campplus-frozen"
-
-    with torch.no_grad():
-        after = loaded(mixture, enrollment)["clean"]
-
-    assert torch.allclose(before, after, atol=1e-6), (
-        "Legacy CAM++ linear checkpoint failed to round-trip"
-    )
-
-
-def test_campplus_whole_vs_streaming_end_to_end() -> None:
-    """End-to-end CAM++ TSE forward vs streaming_step must agree numerically."""
-    torch.manual_seed(5)
-    tse = _tiny_campplus_tse(freeze=True)
-
-    T = 8 * tse.separator.config.enc_stride
-    mixture = torch.randn(1, T)
+    t = 8 * tse.separator.config.enc_stride
+    mixture = torch.randn(1, t)
     enrollment_wav = torch.randn(SR)
 
     with torch.no_grad():
@@ -402,7 +66,7 @@ def test_campplus_whole_vs_streaming_end_to_end() -> None:
         state = tse.separator.initial_streaming_state(batch_size=1)
         chunk_size = 2 * tse.separator.config.enc_stride
         pieces = []
-        for start in range(0, T, chunk_size):
+        for start in range(0, t, chunk_size):
             chunk = mixture[..., start:start + chunk_size]
             if chunk.shape[-1] != chunk_size:
                 continue
@@ -412,38 +76,111 @@ def test_campplus_whole_vs_streaming_end_to_end() -> None:
 
     assert whole_clean.shape == stream_clean.shape
     diff = (whole_clean - stream_clean).abs().max().item()
-    assert diff < 1e-4, (
-        f"whole vs streaming CAM++ TSE disagree by {diff:.2e} (>1e-4)"
-    )
+    assert diff < 1e-4
 
 
-def test_build_model_from_checkpoint_campplus_rejects_incompatible(
-    tmp_path: Path,
-) -> None:
-    """CAM++ inference loading should reject learnable checkpoints."""
-    torch.manual_seed(6)
+def test_checkpoint_preserves_inference_output(tmp_path: Path) -> None:
+    torch.manual_seed(1)
     tse = _tiny_tse()
+    t = 4 * tse.separator.config.enc_stride
+    mixture = torch.randn(1, t)
+    enrollment = torch.randn(SR)
 
-    ckpt_path = tmp_path / "campplus_incompatible.pt"
+    with torch.no_grad():
+        before = tse(mixture, enrollment)["clean"]
+
+    ckpt_path = tmp_path / "ckpt.pt"
     save_checkpoint(
         ckpt_path,
         model=tse,
-        config=_separator_checkpoint_config(
-            tse.separator.config,
-            encoder_type="campplus-frozen",
-        ),
+        config=_separator_checkpoint_config(tse.separator.config),
     )
 
-    with pytest.raises(RuntimeError, match="CAM\\+\\+ TSE pipeline"):
+    tse2 = _tiny_tse()
+    load_checkpoint(ckpt_path, model=tse2)
+    tse2.eval()
+    with torch.no_grad():
+        after = tse2(mixture, enrollment)["clean"]
+
+    assert torch.allclose(before, after, atol=1e-6)
+
+
+def test_build_model_from_checkpoint_roundtrip(tmp_path: Path) -> None:
+    torch.manual_seed(2)
+    tse = _tiny_tse()
+    t = 4 * tse.separator.config.enc_stride
+    mixture = torch.randn(1, t)
+    enrollment = torch.randn(SR)
+
+    with torch.no_grad():
+        before = tse(mixture, enrollment)["clean"]
+
+    ckpt_path = tmp_path / "campplus.pt"
+    save_checkpoint(
+        ckpt_path,
+        model=tse,
+        config=_separator_checkpoint_config(tse.separator.config),
+    )
+
+    loaded, info = build_model_from_checkpoint(ckpt_path)
+
+    assert loaded.separator.config == _tiny_separator_config()
+    assert info["skipped_legacy_keys"] == []
+    assert info["skipped_incompatible_keys"] == []
+
+    with torch.no_grad():
+        after = loaded(mixture, enrollment)["clean"]
+
+    assert torch.allclose(before, after, atol=1e-6)
+
+
+def test_build_model_from_checkpoint_skips_legacy_keys(tmp_path: Path) -> None:
+    torch.manual_seed(3)
+    tse = _tiny_tse()
+    ckpt_path = tmp_path / "legacy_camplus.pt"
+    save_checkpoint(
+        ckpt_path,
+        model=tse,
+        config=_separator_checkpoint_config(tse.separator.config),
+    )
+
+    payload = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    payload["model_state_dict"]["speaker_encoder.to_separator.weight"] = torch.randn(16, 192)
+    payload["model_state_dict"]["speaker_encoder.classifier.weight"] = torch.randn(4, 16)
+    payload["model_state_dict"]["separator.speaker_gamma.weight"] = torch.randn(16, 16)
+    payload["model_state_dict"]["separator.speaker_beta.weight"] = torch.randn(16, 16)
+    torch.save(payload, ckpt_path)
+
+    loaded, info = build_model_from_checkpoint(ckpt_path)
+
+    assert isinstance(loaded, WulfeniteTSE)
+    assert "speaker_encoder.to_separator.weight" in info["skipped_legacy_keys"]
+    assert "speaker_encoder.classifier.weight" in info["skipped_legacy_keys"]
+    assert "separator.speaker_gamma.weight" in info["skipped_incompatible_keys"]
+    assert "separator.speaker_beta.weight" in info["skipped_incompatible_keys"]
+
+
+def test_build_model_from_checkpoint_rejects_legacy_learnable(tmp_path: Path) -> None:
+    ckpt_path = tmp_path / "learnable.pt"
+    torch.save(
+        {
+            "model_state_dict": {
+                "speaker_encoder.frame.0.linear.weight": torch.randn(4, 4, 1),
+            },
+            "config": {"encoder_type": "learnable"},
+        },
+        ckpt_path,
+    )
+
+    with pytest.raises(RuntimeError, match="learnable d-vector"):
         build_model_from_checkpoint(ckpt_path)
 
 
 def test_presence_head_output_shape() -> None:
-    """The whole-utterance forward should emit presence_logit of shape [B]."""
-    torch.manual_seed(2)
+    torch.manual_seed(4)
     tse = _tiny_tse()
-    T = 4 * tse.separator.config.enc_stride
-    mixture = torch.randn(3, T)
+    t = 4 * tse.separator.config.enc_stride
+    mixture = torch.randn(3, t)
     enrollment = torch.randn(SR)
 
     with torch.no_grad():
@@ -455,12 +192,10 @@ def test_presence_head_output_shape() -> None:
 
 
 def test_streaming_state_initializes_to_zero() -> None:
-    """Initial state tensors should all be zero."""
     tse = _tiny_tse()
     state = tse.separator.initial_streaming_state(batch_size=2)
     assert torch.all(state["encoder_buffer"] == 0)
     assert torch.all(state["decoder_overlap"] == 0)
-    # block_states is a list of block-specific zero tensors
-    for bs in state["block_states"]:
-        if torch.is_tensor(bs):
-            assert torch.all(bs == 0)
+    for block_state in state["block_states"]:
+        if torch.is_tensor(block_state):
+            assert torch.all(block_state == 0)

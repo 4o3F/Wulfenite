@@ -1,9 +1,4 @@
-"""Training configuration for Wulfenite.
-
-A single dataclass captures every knob the training loop reads. The
-defaults match the recipe in ``docs/architecture.md`` section 5–6 and
-``docs/TRAIN.md`` section 7.
-"""
+"""Training configuration for Wulfenite."""
 
 from __future__ import annotations
 
@@ -22,19 +17,15 @@ class TrainingConfig:
     cnceleb_root: Path | None = None
     noise_root: Path | None = None
     campplus_checkpoint: Path | None = None
-    campplus_projection_type: str = "mlp"
-    campplus_projection_hidden_dim: int = 384
-    arcface_scale: float = 30.0
-    arcface_margin: float = 0.2
 
     # --- Mixer ---
     segment_seconds: float = 4.0
     enrollment_seconds: float = 4.0
     snr_range_db: tuple[float, float] = (-5.0, 5.0)
     target_present_prob: float = 0.85
-    transition_prob: float = 0.20
-    transition_warmup_ratio: float = 0.5
-    transition_ramp_ratio: float = 0.3
+    transition_prob: float = 0.0
+    transition_warmup_ratio: float = 0.0
+    transition_ramp_ratio: float = 0.0
     transition_min_fraction: float = 0.25
     transition_min_target_rms: float = 0.01
     noise_snr_range_db: tuple[float, float] = (10.0, 25.0)
@@ -48,19 +39,18 @@ class TrainingConfig:
     samples_per_epoch: int = 20000
     val_samples: int = 500
     learning_rate: float = 5e-4
+    encoder_lr: float = 1e-5
     weight_decay: float = 0.0
     use_plateau_scheduler: bool = True
     plateau_patience: int = 5
     plateau_factor: float = 0.5
     early_stopping_patience: int = 20
     grad_clip: float = 5.0
-    encoder_pretrain_epochs: int = 5
-    encoder_pretrain_lr: float = 3e-4
-    encoder_lr_scale: float = 0.25
 
     # --- Separator architecture ---
     enc_channels: int = 4096
     bottleneck_channels: int = 256
+    speaker_embed_dim: int = 192
     hidden_channels: int = 512
     num_repeats: int = 2
     r1_blocks: int = 3
@@ -72,7 +62,6 @@ class TrainingConfig:
     loss_mr_stft: float = 1.0
     loss_absent: float = 0.5
     loss_presence: float = 0.1
-    loss_speaker_cls: float = 0.2
 
     # --- DataLoader ---
     num_workers: int = 8
@@ -87,7 +76,6 @@ class TrainingConfig:
     # --- Runtime ---
     device: str = "cuda"
     seed: int = 1234
-    encoder_type: str = "learnable"
 
     def __post_init__(self) -> None:
         if self.transition_warmup_ratio < 0.0:

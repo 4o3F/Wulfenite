@@ -9,30 +9,20 @@ import torch
 
 from ..models import WulfeniteTSE
 from ..models.speakerbeam_ss import SpeakerBeamSSConfig
-from ..training.checkpoint import peek_checkpoint_config
 
 
 def _rebuild_separator_config(
     checkpoint_config: dict[str, Any],
 ) -> SpeakerBeamSSConfig | None:
-    """Try to reconstruct SpeakerBeamSSConfig from saved checkpoint config.
-
-    If the checkpoint was saved by the current training loop, its config
-    dict contains all ``SpeakerBeamSSConfig`` field names. If any are
-    missing (e.g. a very old checkpoint), we fall back to the current
-    code defaults so that fresh checkpoints always load correctly.
-    """
+    """Try to reconstruct SpeakerBeamSSConfig from saved checkpoint config."""
     if not checkpoint_config:
-        return None  # no config saved → use current defaults
+        return None
 
-    # Map TrainingConfig field names that mirror SpeakerBeamSSConfig
-    # (the training config doesn't store a nested separator config but
-    # checkpoint metadata may contain separator-level overrides from
-    # the future — for now, try the fields we know about)
     kwargs: dict[str, Any] = {}
     field_map = {
         "enc_channels": "enc_channels",
         "bottleneck_channels": "bottleneck_channels",
+        "speaker_embed_dim": "speaker_embed_dim",
         "hidden_channels": "hidden_channels",
         "s4d_state_dim": "s4d_state_dim",
         "num_repeats": "num_repeats",
@@ -50,7 +40,10 @@ def _rebuild_separator_config(
 def _checkpoint_info_from_payload(
     payload: dict[str, Any],
     *,
-    skipped_classifier_keys: list[str] | None = None,
+    skipped_legacy_keys: list[str] | None = None,
+    skipped_incompatible_keys: list[str] | None = None,
+    missing_after_load: list[str] | None = None,
+    unexpected_after_load: list[str] | None = None,
 ) -> dict[str, Any]:
     info = {
         "epoch": payload.get("epoch", 0),
@@ -59,54 +52,73 @@ def _checkpoint_info_from_payload(
         "metrics": payload.get("metrics", {}),
         "wulfenite_version": payload.get("wulfenite_version"),
     }
-    if skipped_classifier_keys is not None:
-        info["skipped_classifier_keys"] = skipped_classifier_keys
+    if skipped_legacy_keys is not None:
+        info["skipped_legacy_keys"] = skipped_legacy_keys
+    if skipped_incompatible_keys is not None:
+        info["skipped_incompatible_keys"] = skipped_incompatible_keys
+    if missing_after_load is not None:
+        info["missing_after_load"] = missing_after_load
+    if unexpected_after_load is not None:
+        info["unexpected_after_load"] = unexpected_after_load
     return info
 
 
-def _load_learnable_checkpoint(
-    checkpoint: Path,
+def _load_state_dict_compat(
+    payload: dict[str, Any],
     model: WulfeniteTSE,
-    device: str | torch.device = "cpu",
 ) -> dict[str, Any]:
-    """Load a learnable-encoder checkpoint into a classifier-free model."""
-    payload = torch.load(str(checkpoint), map_location=device, weights_only=False)
     state = dict(payload["model_state_dict"])
+    if any(key.startswith("speaker_encoder.frame.") for key in state):
+        raise RuntimeError(
+            "Legacy learnable d-vector checkpoints are unsupported by the "
+            "Phase 3 CAM++-only loader."
+        )
 
-    skipped_keys = [
-        key for key in state
-        if key.startswith("speaker_encoder.classifier.")
-    ]
-    for key in skipped_keys:
-        del state[key]
-
-    model.load_state_dict(state, strict=True)
-    return _checkpoint_info_from_payload(
-        payload,
-        skipped_classifier_keys=skipped_keys,
+    model_state = model.state_dict()
+    loadable_state: dict[str, torch.Tensor] = {}
+    skipped_legacy_keys: list[str] = []
+    skipped_incompatible_keys: list[str] = []
+    legacy_prefixes = (
+        "speaker_encoder.to_separator.",
+        "speaker_encoder.classifier.",
     )
+    for key, value in state.items():
+        if key.startswith(legacy_prefixes):
+            skipped_legacy_keys.append(key)
+            continue
+        if key not in model_state or model_state[key].shape != value.shape:
+            skipped_incompatible_keys.append(key)
+            continue
+        loadable_state[key] = value
 
+    incompatible = model.load_state_dict(loadable_state, strict=False)
+    missing_after_load = list(incompatible.missing_keys)
+    unexpected_after_load = list(incompatible.unexpected_keys)
 
-def _load_campplus_checkpoint(
-    checkpoint: Path,
-    model: WulfeniteTSE,
-    device: str | torch.device = "cpu",
-) -> dict[str, Any]:
-    """Load a CAM++ checkpoint into a classifier-free inference model."""
-    payload = torch.load(str(checkpoint), map_location=device, weights_only=False)
-    state = dict(payload["model_state_dict"])
+    # Keys that were intentionally skipped (legacy adapter/classifier or
+    # shape-incompatible FiLM) are expected to be missing.  Any *other*
+    # missing key means the checkpoint is materially incomplete — refuse
+    # to return a model with randomly-initialized required weights.
+    allowed_missing = {
+        key for key in skipped_incompatible_keys if key in model_state
+    }
+    disallowed_missing = sorted(
+        key for key in missing_after_load if key not in allowed_missing
+    )
+    if disallowed_missing or unexpected_after_load:
+        raise RuntimeError(
+            "Checkpoint is only partially compatible with the Phase 3 "
+            "CAM++-only loader; refusing to continue with randomly "
+            f"initialized weights. missing={disallowed_missing} "
+            f"unexpected={unexpected_after_load}"
+        )
 
-    skipped_keys = [
-        key for key in state
-        if key.startswith("speaker_encoder.classifier.")
-    ]
-    for key in skipped_keys:
-        del state[key]
-
-    model.load_state_dict(state, strict=True)
     return _checkpoint_info_from_payload(
         payload,
-        skipped_classifier_keys=skipped_keys,
+        skipped_legacy_keys=skipped_legacy_keys,
+        skipped_incompatible_keys=skipped_incompatible_keys,
+        missing_after_load=missing_after_load,
+        unexpected_after_load=unexpected_after_load,
     )
 
 
@@ -115,47 +127,17 @@ def build_model_from_checkpoint(
     device: str | torch.device = "cpu",
 ) -> tuple[WulfeniteTSE, dict[str, Any]]:
     """Build and load a Wulfenite TSE model from a checkpoint."""
-    cfg = peek_checkpoint_config(checkpoint)
-    encoder_type = cfg.get("encoder_type", "learnable")
+    payload = torch.load(str(checkpoint), map_location="cpu", weights_only=False)
+    cfg = payload.get("config")
+    cfg = cfg if isinstance(cfg, dict) else {}
 
-    # Rebuild separator config from checkpoint metadata when available,
-    # so legacy checkpoints with different defaults (e.g. 512/192) load
-    # correctly against the current code whose defaults are 4096/256.
     separator_config = _rebuild_separator_config(cfg)
-
-    dev = torch.device(device)
-    if encoder_type == "learnable":
-        model = WulfeniteTSE.from_learnable_dvector(
-            num_speakers=None,
-            separator_config=separator_config,
-        )
-        try:
-            info = _load_learnable_checkpoint(checkpoint, model, device="cpu")
-        except RuntimeError as exc:
-            raise RuntimeError(
-                "Checkpoint is incompatible with the learnable d-vector TSE pipeline."
-            ) from exc
-    elif encoder_type in {"campplus-frozen", "campplus-finetune"}:
-        projection_type = cfg.get("campplus_projection_type", "linear")
-        projection_hidden_dim = int(cfg.get("campplus_projection_hidden_dim", 384))
-        model = WulfeniteTSE.from_campplus(
-            campplus_checkpoint=None,
-            separator_config=separator_config,
-            freeze_backbone=encoder_type == "campplus-frozen",
-            num_speakers=None,
-            projection_type=projection_type,
-            projection_hidden_dim=projection_hidden_dim,
-        )
-        try:
-            info = _load_campplus_checkpoint(checkpoint, model, device="cpu")
-        except RuntimeError as exc:
-            raise RuntimeError(
-                "Checkpoint is incompatible with the CAM++ TSE pipeline."
-            ) from exc
-    else:
-        raise RuntimeError(f"Unsupported encoder_type in checkpoint: {encoder_type}")
-
-    model = model.to(dev).eval()
+    model = WulfeniteTSE.from_campplus(
+        campplus_checkpoint=None,
+        separator_config=separator_config,
+    )
+    info = _load_state_dict_compat(payload, model)
+    model = model.to(torch.device(device)).eval()
     return model, info
 
 

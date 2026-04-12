@@ -71,6 +71,7 @@ class SpeakerBeamSSConfig:
 
     # Separator bottleneck.
     bottleneck_channels: int = 256
+    speaker_embed_dim: int = 192
 
     # TCN+S4D block stack.
     num_repeats: int = 2         # "SS-2" in the paper
@@ -238,7 +239,7 @@ class S4DBlock(nn.Module):
 class SpeakerBeamSS(nn.Module):
     """SpeakerBeam-SS target speaker extractor.
 
-    Takes a mixture waveform and an L2-normalized bottleneck-dim speaker
+    Takes a mixture waveform and an L2-normalized speaker
     embedding, returns the estimated target waveform and an optional
     target-presence logit.
 
@@ -301,31 +302,15 @@ class SpeakerBeamSS(nn.Module):
                     dilation=dilation,
                 ))
 
-        # --- FiLM speaker conditioning (Plan C2) ---
-        # Plan B used multiplicative-only conditioning:
-        #     feat = feat * speaker_proj(e)
-        # where speaker_proj was a single Linear(d, d, bias=False) initialized
-        # to sqrt(d) * I. This plateaued at val_sdr ~= -5.75 with a decaying
-        # slope because the separator could only learn a channel-mixing GATE
-        # on the speaker signal, never an additive BIAS. Many speakers benefit
-        # from a "default offset" the gate cannot express.
-        #
-        # Plan C2 upgrades to FiLM (feature-wise linear modulation):
-        #     feat = feat * gamma(e) + beta(e)
-        # where gamma and beta are separate Linear(d, d, bias=False) layers:
-        #   - speaker_gamma init to sqrt(d) * I  (exactly Plan B's operator)
-        #   - speaker_beta  init to zeros        (no additive effect at step 0)
-        #
-        # Invariant: at step 0 FiLM output equals Plan B output EXACTLY, so
-        # any divergence during training is attributable purely to the added
-        # expressivity of learning a non-zero beta branch.
+        # --- FiLM speaker conditioning ---
         d = cfg.bottleneck_channels
-        scale = float(d) ** 0.5
-
-        self.speaker_gamma = nn.Linear(d, d, bias=False)
-        self.speaker_beta = nn.Linear(d, d, bias=False)
+        e = cfg.speaker_embed_dim
+        self.speaker_gamma = nn.Linear(e, d, bias=False)
+        self.speaker_beta = nn.Linear(e, d, bias=False)
         with torch.no_grad():
-            self.speaker_gamma.weight.copy_(scale * torch.eye(d))
+            # Residual FiLM: gamma = 1 + W_g(e), beta = W_b(e), so zero
+            # initialization starts from an exact identity/no-op.
+            self.speaker_gamma.weight.zero_()
             self.speaker_beta.weight.zero_()
 
         # --- Mask head (back to encoder dim, sigmoid activation) ---
@@ -360,7 +345,7 @@ class SpeakerBeamSS(nn.Module):
 
         Args:
             feat: ``[B, bottleneck_channels, T]`` post-bottleneck features.
-            speaker_embedding: ``[B, bottleneck_channels]`` L2-normalized
+            speaker_embedding: ``[B, speaker_embed_dim]`` L2-normalized
                 speaker embedding (from ``encode_enrollment``).
 
         Returns:
@@ -368,15 +353,15 @@ class SpeakerBeamSS(nn.Module):
         """
         if (
             speaker_embedding.dim() != 2
-            or speaker_embedding.size(-1) != self.config.bottleneck_channels
+            or speaker_embedding.size(-1) != self.config.speaker_embed_dim
         ):
             raise ValueError(
                 "speaker_embedding must be [B, "
-                f"{self.config.bottleneck_channels}], "
+                f"{self.config.speaker_embed_dim}], "
                 f"got {tuple(speaker_embedding.shape)}"
             )
-        gamma = self.speaker_gamma(speaker_embedding)     # [B, d]
-        beta = self.speaker_beta(speaker_embedding)       # [B, d]
+        gamma = 1.0 + self.speaker_gamma(speaker_embedding)  # [B, d]
+        beta = self.speaker_beta(speaker_embedding)          # [B, d]
         return feat * gamma.unsqueeze(-1) + beta.unsqueeze(-1)  # [B, d, T]
 
     def forward(
@@ -400,7 +385,7 @@ class SpeakerBeamSS(nn.Module):
                 default). Values that are not will still run but
                 will have a few samples of boundary artifact at the
                 decoder end.
-            speaker_embedding: ``[B, bottleneck_channels]`` L2-normalized speaker
+            speaker_embedding: ``[B, speaker_embed_dim]`` L2-normalized speaker
                 embedding.
 
         Returns:
@@ -416,10 +401,10 @@ class SpeakerBeamSS(nn.Module):
             raise ValueError(
                 f"expected mixture shape [B, T], got {tuple(mixture.shape)}"
             )
-        if speaker_embedding.dim() != 2 or speaker_embedding.size(-1) != self.config.bottleneck_channels:
+        if speaker_embedding.dim() != 2 or speaker_embedding.size(-1) != self.config.speaker_embed_dim:
             raise ValueError(
                 "speaker_embedding must be [B, "
-                f"{self.config.bottleneck_channels}], "
+                f"{self.config.speaker_embed_dim}], "
                 f"got {tuple(speaker_embedding.shape)}"
             )
 
@@ -544,7 +529,7 @@ class SpeakerBeamSS(nn.Module):
             mixture_chunk: ``[B, T_chunk]`` new audio samples. ``T_chunk``
                 must be a positive multiple of ``enc_stride`` (160 by
                 default). Typical values: 160 (10 ms) or 320 (20 ms).
-            speaker_embedding: ``[B, bottleneck_channels]`` L2-normalized
+            speaker_embedding: ``[B, speaker_embed_dim]`` L2-normalized
                 speaker embedding, normally computed once per session.
             state: dict from :meth:`initial_streaming_state` or the
                 previous call's second return value.
@@ -571,10 +556,10 @@ class SpeakerBeamSS(nn.Module):
                 f"streaming chunk length {mixture_chunk.shape[-1]} must be a "
                 f"positive multiple of enc_stride={stride}"
             )
-        if speaker_embedding.dim() != 2 or speaker_embedding.size(-1) != cfg.bottleneck_channels:
+        if speaker_embedding.dim() != 2 or speaker_embedding.size(-1) != cfg.speaker_embed_dim:
             raise ValueError(
                 "speaker_embedding must be [B, "
-                f"{cfg.bottleneck_channels}], got {tuple(speaker_embedding.shape)}"
+                f"{cfg.speaker_embed_dim}], got {tuple(speaker_embedding.shape)}"
             )
 
         # ---- Encoder with left-context buffer ----

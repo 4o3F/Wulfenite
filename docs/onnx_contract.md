@@ -36,7 +36,7 @@ Expected on disk (under `rust/assets/` or similar at deploy time):
 
 ## File 1: `wulfenite_speaker_encoder.onnx`
 
-The trained d-vector speaker encoder. This file contains both the
+The trained CAM++ speaker encoder. This file contains both the
 FBank extraction and the speaker encoder network; the Rust side sees
 raw audio in and a speaker embedding out.
 
@@ -50,7 +50,7 @@ raw audio in and a speaker embedding out.
 
 | Name | dtype | Shape | Description |
 |---|---|---|---|
-| `speaker_embedding` | float32 | `[1, 256]` | Already L2-normalized separator-space speaker embedding. Feed it directly into `wulfenite_tse.onnx`. |
+| `speaker_embedding` | float32 | `[1, 192]` | Already L2-normalized CAM++ speaker embedding. Feed it directly into `wulfenite_tse.onnx`. |
 
 ### Semantics
 
@@ -64,10 +64,10 @@ raw audio in and a speaker embedding out.
 ```
 enrollment_audio
   ↓ Kaldi FBank (n_mels=80, dither=0, utt mean norm)
-  ↓ LearnableDVector.forward
-  ↓ raw_embedding [1, 256]
+  ↓ CAMPPlus.forward
+  ↓ raw_embedding [1, 192]
   ↓ L2 normalize (torch.nn.functional.normalize(..., p=2, dim=-1))
-  ↓ speaker_embedding [1, 256]
+  ↓ speaker_embedding [1, 192]
 ```
 
 ---

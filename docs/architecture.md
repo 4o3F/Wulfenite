@@ -69,11 +69,11 @@ Delcroix — NTT, Interspeech 2024).
   channel-wise LayerNorm; convolutions are strictly causal. S4D has a
   recurrent form that supports stateful inference across frames.
 
-**Speaker encoders**:
+**Speaker encoder**:
 
-- **Single path**: a small x-vector-style d-vector encoder whose
-  normalized embedding is native 256-d and is trained jointly with the
-  separator.
+- **Single path**: a fine-tuned CAM++ encoder whose L2-normalized
+  embedding is native 192-d. The separator's FiLM layers project from
+  192-d to 256-d internally.
 
 The speaker encoder still runs exactly ONCE per session, not per frame.
 TSE's core assumption is that the target speaker is fixed for the
@@ -89,31 +89,29 @@ the steady-state per-frame budget — see
 
 The separator uses **FiLM speaker adaptation** (feature-wise linear
 modulation) on one of its bottleneck feature tensors. The L2-normalized
-speaker embedding `e` feeds two learnable `Linear(d, d, bias=False)`
+speaker embedding `e` feeds two learnable `Linear(192, 256, bias=False)`
 branches:
 
 ```
-feat ← feat * gamma(e) + beta(e)
+feat ← feat * (1 + gamma(e)) + beta(e)
 ```
 
-`gamma` is initialized to `sqrt(d) * I` and `beta` is initialized to
-zeros, so at step 0 this reduces to the original SpeakerBeam-style
-multiplicative adaptation (`feat * sqrt(d) * e`). During training the
-separator is free to learn a non-trivial rotation of the speaker space
-*and* an additive bias that the pure-multiplicative variant could not
-express — see `speakerbeam_ss.py::_apply_speaker_conditioning` for the
+Both `gamma` and `beta` weight matrices are initialized to zeros, so
+at step 0 the FiLM conditioning is an exact identity/no-op. The
+residual `1 + gamma(e)` formulation ensures the separator starts from
+unmodulated features and gradually learns speaker-dependent modulation.
+See `speakerbeam_ss.py::_apply_speaker_conditioning` for the
 implementation shared between `forward()` and `streaming_step()`.
 
-The separator stays faithful to the paper's internal `B = 256`, and the
-speaker encoder emits embeddings directly in that space:
+The separator uses `B = 256` internally, while the CAM++ speaker
+encoder emits 192-d embeddings. The FiLM layers handle the dimension
+adaptation:
 
 ```python
-emb = dvector(enrollment)             # [B, 256]
-emb = F.normalize(emb, p=2, dim=-1)   # [B, 256]
+raw, emb = campplus_encoder(enrollment) # [B, 192]
+emb = F.normalize(emb, p=2, dim=-1)    # [B, 192]
+# FiLM internally: Linear(192, 256) → modulate 256-d features
 ```
-
-No adapter projection is required between enrollment encoding and
-separator conditioning.
 
 ## 4. Latency target: 40 ms
 
@@ -220,7 +218,7 @@ coupling.
 
 Two separate ONNX files:
 
-1. `wulfenite_speaker_encoder.onnx` — the trained d-vector speaker
+1. `wulfenite_speaker_encoder.onnx` — the trained CAM++ speaker
    encoder, exported in eval mode for once-per-session enrollment.
 2. `wulfenite_tse.onnx` — the trained SpeakerBeam-SS separator, with
    explicit state tensors for frame-by-frame stateful inference.

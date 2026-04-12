@@ -205,7 +205,7 @@ No resampling is required. The scanner prefixes speaker ids as
 - **Content**: ~1000 Chinese speakers across interview, reading,
   singing, vlog, and other acoustic conditions
 - **Why**: materially increases train-speaker diversity for the
-  learnable d-vector path once AISHELL-only training stops improving
+  speaker encoder path once AISHELL-only training stops improving
 
 Extract so you end up with `assets/CN-Celeb_flac/data/id00001/*.flac`:
 
@@ -312,10 +312,11 @@ subdirs — both work.
 
 ## 4. Speaker encoder weights
 
-No separate speaker-encoder download is required. The d-vector encoder
-is trained jointly with the separator and stored inside the training
-checkpoint; ONNX export writes it out as its own graph for once-per-
-session enrollment.
+Training requires a pretrained CAM++ checkpoint (`campplus_cn_common.bin`)
+as the speaker encoder backbone. The CAM++ encoder is fine-tuned jointly
+with the separator at a lower learning rate. Download it from the
+CAM++ release and place it at `assets/campplus/campplus_cn_common.bin`.
+ONNX export writes it out as its own graph for once-per-session enrollment.
 
 ---
 
@@ -348,14 +349,14 @@ uv run python -c "import wulfenite; print(wulfenite.__version__)"
 
 Unit tests are fast (~40 seconds total) and do not require any
 datasets — they use synthetic wav fixtures and randomly-initialized
-d-vector models. Run them before any training to catch install or
-environment issues early:
+models. Run them before any training to catch install or environment
+issues early:
 
 ```bash
 uv run --directory python pytest tests/ -v
 ```
 
-Expected output: **67 passed** across models / losses / data /
+Expected output: **86 passed** across models / losses / data /
 training / inference. Any failure here is a red flag and should be
 reported before continuing.
 
@@ -364,20 +365,22 @@ reported before continuing.
 ## 7. Training
 
 The training loop lives at `python/src/wulfenite/training/train.py`
-and is invoked as a module. The Phase 3 paper-faithful run uses the
-learnable d-vector path plus the three clean speech datasets:
+and is invoked as a module. The Phase 3 recipe uses a fine-tuned CAM++
+speaker encoder with the three clean speech datasets:
 
 ```bash
 uv run --directory python python -m wulfenite.training.train \
+    --campplus-checkpoint ../assets/campplus/campplus_cn_common.bin \
     --aishell1-root ../assets/aishell1 \
     --aishell3-root ../assets/aishell3 \
     --magicdata-root ../assets/magicdata \
     --noise-root ../assets/musan/noise \
-    --out-dir ../assets/checkpoints/phase3_paper_magicdata \
+    --out-dir ../assets/checkpoints/phase3 \
     --batch-size 16 \
     --epochs 200 \
     --samples-per-epoch 20000 \
-    --lr 5e-4
+    --lr 5e-4 \
+    --encoder-lr 1e-5
 ```
 
 All paths are relative to the `python/` directory because
@@ -412,9 +415,9 @@ Key design points of the training loop (from `docs/architecture.md`):
 - **Mixture-aware silence** — `target_present_prob` defaults to
   0.85, so ~15 % of batches teach the "target is not talking →
   output silence" behavior.
-- **Speaker encoder is trainable** — the d-vector encoder is
-  optimized jointly with the separator, with an optional short
-  classifier-only warmup at the start of training.
+- **Speaker encoder is fine-tuned** — the CAM++ encoder is optimized
+  jointly with the separator at a lower learning rate (`--encoder-lr`,
+  default 1e-5) to preserve pretrained speaker discrimination.
 - **Mirror / offline-safe** — the default `pyproject.toml` uses the
   Aliyun PyTorch mirror so `uv sync` is fast inside China.
 
@@ -449,8 +452,8 @@ uv run --directory python python -m wulfenite.inference.export_onnx \
 
 Produces two files matching `docs/onnx_contract.md`:
 
-- `assets/exported/wulfenite_speaker_encoder.onnx` (the trained
-  d-vector speaker encoder)
+- `assets/exported/wulfenite_speaker_encoder.onnx` (the fine-tuned
+  CAM++ speaker encoder)
 - `assets/exported/wulfenite_tse.onnx` (~8 MB, the trained separator
   in its stateful form with opaque state tensors)
 

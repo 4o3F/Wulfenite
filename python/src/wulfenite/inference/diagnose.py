@@ -39,7 +39,7 @@ from ..data import (
     scan_cnceleb,
     scan_magicdata,
 )
-from ..models.dvector import compute_fbank_batch
+from ..audio_features import compute_fbank_batch
 from ..losses.sdr import compute_sdr_db
 from .utils import build_model_from_checkpoint
 
@@ -384,7 +384,7 @@ def _build_report(
     num_absent: int,
     mixer_cfg: MixerConfig,
     native_stats: dict[str, float | int],
-    projected_stats: dict[str, float | int],
+    normalized_stats: dict[str, float | int],
     mask_overall: dict[str, float | int | None],
     mask_active: dict[str, float | int | None],
     mask_silent: dict[str, float | int | None],
@@ -406,7 +406,7 @@ def _build_report(
         "[checkpoint]",
         f"path={checkpoint}",
         f"epoch={info.get('epoch', '?')} step={info.get('step', '?')}",
-        f"encoder_type={checkpoint_cfg.get('encoder_type', 'unknown')}",
+        f"encoder_type={checkpoint_cfg.get('encoder_type', 'campplus')}",
         (
             "saved_metrics="
             f"val_loss={metrics.get('val_loss', 'n/a')} "
@@ -441,15 +441,15 @@ def _build_report(
             f"cos_gap={_fmt(native_stats['cos_gap'])}"
         ),
         (
-            "projected="
-            f"dim={projected_stats['dim']} "
-            f"same_cos={_fmt(projected_stats['same_cos'])} "
-            f"diff_cos={_fmt(projected_stats['diff_cos'])} "
-            f"cos_gap={_fmt(projected_stats['cos_gap'])}"
+            "normalized="
+            f"dim={normalized_stats['dim']} "
+            f"same_cos={_fmt(normalized_stats['same_cos'])} "
+            f"diff_cos={_fmt(normalized_stats['diff_cos'])} "
+            f"cos_gap={_fmt(normalized_stats['cos_gap'])}"
         ),
         (
-            "projection_delta="
-            f"cos_gap_change={_fmt(projected_stats['cos_gap'] - native_stats['cos_gap'])}"
+            "normalization_delta="
+            f"cos_gap_change={_fmt(normalized_stats['cos_gap'] - native_stats['cos_gap'])}"
         ),
         (
             "pairs="
@@ -543,7 +543,7 @@ def run_diagnostic(
     pad_left = cfg.enc_kernel_size - cfg.enc_stride
 
     native_embeddings: list[torch.Tensor] = []
-    projected_embeddings: list[torch.Tensor] = []
+    normalized_embeddings: list[torch.Tensor] = []
     labels: list[int] = []
     energy_ratios: list[torch.Tensor] = []
     sdr_values: list[float] = []
@@ -578,7 +578,7 @@ def run_diagnostic(
                 mask = mask_capture.pop()
 
                 native_embeddings.append(outputs["raw_embedding"][0].detach().cpu())
-                projected_embeddings.append(outputs["embedding"][0].detach().cpu())
+                normalized_embeddings.append(outputs["embedding"][0].detach().cpu())
                 labels.append(int(sample["target_speaker_idx"].item()))
 
                 is_present = bool(sample["target_present"].item() >= 0.5)
@@ -625,14 +625,14 @@ def run_diagnostic(
     native_tensor = (
         torch.stack(native_embeddings, dim=0) if native_embeddings else torch.empty(0, 0)
     )
-    projected_tensor = (
-        torch.stack(projected_embeddings, dim=0)
-        if projected_embeddings else torch.empty(0, 0)
+    normalized_tensor = (
+        torch.stack(normalized_embeddings, dim=0)
+        if normalized_embeddings else torch.empty(0, 0)
     )
     label_tensor = torch.tensor(labels, dtype=torch.long)
 
     native_stats = _cosine_gap(native_tensor, label_tensor)
-    projected_stats = _cosine_gap(projected_tensor, label_tensor)
+    normalized_stats = _cosine_gap(normalized_tensor, label_tensor)
 
     energy_ratio_tensor = (
         torch.cat(energy_ratios, dim=0) if energy_ratios else torch.empty(0)
@@ -692,7 +692,7 @@ def run_diagnostic(
         num_absent=num_absent,
         mixer_cfg=mixer_cfg,
         native_stats=native_stats,
-        projected_stats=projected_stats,
+        normalized_stats=normalized_stats,
         mask_overall=mask_overall.summary(),
         mask_active=mask_active.summary(),
         mask_silent=mask_silent.summary(),
@@ -712,7 +712,7 @@ def run_diagnostic(
         "num_present": num_present,
         "num_absent": num_absent,
         "native": native_stats,
-        "projected": projected_stats,
+        "normalized": normalized_stats,
         "mask": {
             "overall": mask_overall.summary(),
             "target_active": mask_active.summary(),
