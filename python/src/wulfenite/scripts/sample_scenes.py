@@ -138,6 +138,45 @@ def _preview_waveform(
     return torch.cat(segments, dim=0), labels
 
 
+def _regions_from_mask(mask: torch.Tensor) -> list[dict[str, float]]:
+    mask = mask.to(torch.bool)
+    if mask.numel() == 0:
+        return []
+    padded = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int32),
+            mask.to(torch.int32),
+            torch.zeros(1, dtype=torch.int32),
+        ),
+        dim=0,
+    )
+    edges = padded[1:] - padded[:-1]
+    starts = torch.nonzero(edges == 1, as_tuple=False).squeeze(-1)
+    ends = torch.nonzero(edges == -1, as_tuple=False).squeeze(-1)
+    return [
+        {
+            "start_sec": float(start.item()) / 100.0,
+            "end_sec": float(end.item()) / 100.0,
+        }
+        for start, end in zip(starts, ends)
+    ]
+
+
+def _masked_rms(
+    track: torch.Tensor,
+    frame_mask: torch.Tensor,
+    *,
+    stride_samples: int,
+) -> float:
+    sample_mask = frame_mask.to(torch.bool).repeat_interleave(stride_samples)[
+        :track.shape[-1]
+    ]
+    if not bool(sample_mask.any().item()):
+        return 0.0
+    segment = track[sample_mask]
+    return float(torch.sqrt(torch.mean(segment * segment) + 1e-12))
+
+
 def _scene_metadata(scene: dict) -> dict[str, Any]:
     plan = scene["plan"]
     bundle = scene["bundle"]
@@ -151,9 +190,25 @@ def _scene_metadata(scene: dict) -> dict[str, Any]:
             role: float(mask.sum().item()) / 100.0
             for role, mask in bundle.active_frames_by_role.items()
         },
+        "actual_regions_by_role": {
+            role: _regions_from_mask(mask)
+            for role, mask in bundle.active_frames_by_role.items()
+        },
+        "role_stats_by_role": {
+            role: {
+                "peak": float(track.abs().max().item()),
+                "rms": float(torch.sqrt(torch.mean(track * track) + 1e-12).item()),
+                "active_rms": _masked_rms(
+                    track,
+                    bundle.active_frames_by_role[role],
+                    stride_samples=plan.stride_samples,
+                ),
+            }
+            for role, track in bundle.source_tracks.items()
+        },
         "overlap_seconds": float(bundle.overlap_frames.sum().item()) / 100.0,
         "background_seconds": float(bundle.background_frames.sum().item()) / 100.0,
-        "slots": [
+        "planned_slots": [
             {
                 "index": slot.index,
                 "event_type": slot.event_type.value,

@@ -433,8 +433,13 @@ class WulfeniteMixer(Dataset):
     ) -> "SpeakerCast":
         from .composer import SpeakerCast
 
+        required_samples_by_role = self._required_samples_by_role(plan)
         target_spk = rng.choice(self.speaker_ids)
-        target_entry, enroll_entry = rng.sample(self.speakers[target_spk], 2)
+        target_entry, enroll_entry = self._sample_role_entries(
+            target_spk,
+            required_source_frames=required_samples_by_role["A"],
+            rng=rng,
+        )
         used = {target_spk}
         source_speaker_ids = {"A": target_spk}
         source_entries: dict[str, AudioEntry] = {"A": target_entry}
@@ -443,7 +448,11 @@ class WulfeniteMixer(Dataset):
         for role in roles:
             spk_id = self._sample_interferer_speaker(target_spk, used, rng)
             used.add(spk_id)
-            source_entry, enrollment_entry = rng.sample(self.speakers[spk_id], 2)
+            source_entry, enrollment_entry = self._sample_role_entries(
+                spk_id,
+                required_source_frames=required_samples_by_role[role],
+                rng=rng,
+            )
             source_speaker_ids[role] = spk_id
             source_entries[role] = source_entry
             enrollment_entries[role] = enrollment_entry
@@ -455,6 +464,43 @@ class WulfeniteMixer(Dataset):
             outsider_speaker_id=outsider_spk,
             outsider_enrollment_entry=rng.choice(self.speakers[outsider_spk]),
         )
+
+    @staticmethod
+    def _required_samples_by_role(plan: "ClipPlan") -> dict[str, int]:
+        required = {
+            role: 0 for role in plan.active_frames_by_role
+        }
+        for slot in plan.slots:
+            length = (slot.end_frame - slot.start_frame) * plan.stride_samples
+            for role in slot.active_roles:
+                required[role] = required.get(role, 0) + length
+        return required
+
+    def _sample_role_entries(
+        self,
+        speaker_id: str,
+        *,
+        required_source_frames: int,
+        rng: random.Random,
+    ) -> tuple[AudioEntry, AudioEntry]:
+        entries = self.speakers[speaker_id]
+        source_candidates = [
+            entry for entry in entries
+            if entry.num_frames >= required_source_frames
+        ]
+        if not source_candidates:
+            ranked = sorted(entries, key=lambda entry: entry.num_frames, reverse=True)
+            source_candidates = ranked[:max(1, min(len(ranked), 4))]
+        source_entry = rng.choice(source_candidates)
+        enroll_candidates = [
+            entry for entry in entries if entry.path != source_entry.path
+        ]
+        if not enroll_candidates:
+            raise RuntimeError(
+                f"speaker {speaker_id} does not have a distinct enrollment utterance"
+            )
+        enrollment_entry = rng.choice(enroll_candidates)
+        return source_entry, enrollment_entry
 
     def _select_enrollment(
         self,
@@ -488,6 +534,58 @@ class WulfeniteMixer(Dataset):
                 union = union | active.bool()
         return union
 
+    @staticmethod
+    def _frame_mask_to_sample_mask(
+        frame_mask: torch.Tensor,
+        *,
+        stride_samples: int,
+        n_samples: int,
+    ) -> torch.Tensor:
+        return frame_mask.bool().repeat_interleave(stride_samples)[:n_samples]
+
+    @staticmethod
+    def _masked_rms(
+        signal: torch.Tensor,
+        sample_mask: torch.Tensor,
+    ) -> float:
+        if not bool(sample_mask.any().item()):
+            return 0.0
+        segment = signal[sample_mask]
+        return float(torch.sqrt(torch.mean(segment * segment) + 1e-12))
+
+    def _bundle_is_usable(
+        self,
+        plan: "ClipPlan",
+        bundle: "SceneBundle",
+    ) -> bool:
+        min_activity_ratio = 0.15
+        min_active_rms = self.cfg.rms_target * 0.02
+
+        for role, planned_mask in plan.active_frames_by_role.items():
+            actual_mask = bundle.active_frames_by_role.get(role)
+            track = bundle.source_tracks.get(role)
+            if actual_mask is None or track is None:
+                return False
+            planned_frames = int(planned_mask.sum().item())
+            actual_frames = int(actual_mask.sum().item())
+            min_frames = max(1, int(round(planned_frames * min_activity_ratio)))
+            if actual_frames < min_frames:
+                return False
+            active_sample_mask = self._frame_mask_to_sample_mask(
+                actual_mask,
+                stride_samples=plan.stride_samples,
+                n_samples=track.shape[-1],
+            )
+            if self._masked_rms(track, active_sample_mask) < min_active_rms:
+                return False
+
+        planned_overlap = int(plan.overlap_frames.sum().item())
+        actual_overlap = int(bundle.overlap_frames.sum().item())
+        min_overlap_frames = max(1, int(round(planned_overlap * min_activity_ratio)))
+        if actual_overlap < min_overlap_frames:
+            return False
+        return bool(bundle.background_frames.any().item())
+
     def _scene_views_from_bundle(
         self,
         bundle: "SceneBundle",
@@ -499,21 +597,29 @@ class WulfeniteMixer(Dataset):
         zeros_wave = torch.zeros_like(mixture)
         zeros_frames = torch.zeros_like(bundle.background_frames)
         speaker_indices = bundle.metadata["speaker_indices"]
+        target_active_a = bundle.active_frames_by_role["A"]
+        target_active_b = bundle.active_frames_by_role["B"]
+        target_present_a = float(bool(target_active_a.any().item()))
+        target_present_b = float(bool(target_active_b.any().item()))
         views = [
             SceneView(
                 scene_id=bundle.scene_id,
                 view_role="A",
                 enrollment=self._select_enrollment(bundle.enrollment_pool["A"], rng),
-                target=bundle.source_tracks["A"],
-                target_present=1.0,
+                target=(
+                    bundle.source_tracks["A"]
+                    if target_present_a >= 0.5
+                    else zeros_wave
+                ),
+                target_present=target_present_a,
                 target_speaker_idx=speaker_indices["A"],
-                target_active_frames=bundle.active_frames_by_role["A"],
+                target_active_frames=target_active_a,
                 nontarget_active_frames=self._union_active_frames(
                     bundle.active_frames_by_role,
                     exclude_role="A",
                 ),
                 overlap_frames=(
-                    bundle.active_frames_by_role["A"]
+                    target_active_a
                     & self._union_active_frames(
                         bundle.active_frames_by_role,
                         exclude_role="A",
@@ -526,16 +632,20 @@ class WulfeniteMixer(Dataset):
                 scene_id=bundle.scene_id,
                 view_role="B",
                 enrollment=self._select_enrollment(bundle.enrollment_pool["B"], rng),
-                target=bundle.source_tracks["B"],
-                target_present=1.0,
+                target=(
+                    bundle.source_tracks["B"]
+                    if target_present_b >= 0.5
+                    else zeros_wave
+                ),
+                target_present=target_present_b,
                 target_speaker_idx=speaker_indices["B"],
-                target_active_frames=bundle.active_frames_by_role["B"],
+                target_active_frames=target_active_b,
                 nontarget_active_frames=self._union_active_frames(
                     bundle.active_frames_by_role,
                     exclude_role="B",
                 ),
                 overlap_frames=(
-                    bundle.active_frames_by_role["B"]
+                    target_active_b
                     & self._union_active_frames(
                         bundle.active_frames_by_role,
                         exclude_role="B",
@@ -586,22 +696,29 @@ class WulfeniteMixer(Dataset):
         if self._planner is None or self._renderer is None:
             raise RuntimeError("clip_composer mode requires planner + renderer")
         rng = self._rng(index)
-        plan = self._planner.plan(rng=rng)
-        cast = self._sample_speaker_cast(plan, rng)
-        bundle = self._renderer.render_bundle(
-            scene_id=index,
-            plan=plan,
-            cast=cast,
-            speaker_to_idx=self.speaker_to_idx,
-            rng=rng,
+        for _ in range(8):
+            plan = self._planner.plan(rng=rng)
+            cast = self._sample_speaker_cast(plan, rng)
+            bundle = self._renderer.render_bundle(
+                scene_id=index,
+                plan=plan,
+                cast=cast,
+                speaker_to_idx=self.speaker_to_idx,
+                rng=rng,
+            )
+            bundle.metadata["snr_db"] = plan.snr_db
+            scene = {
+                "scene_id": index,
+                "plan": plan,
+                "bundle": bundle,
+                "views": self._scene_views_from_bundle(bundle, rng),
+            }
+            if self._bundle_is_usable(plan, bundle):
+                return scene
+        raise RuntimeError(
+            f"failed to render a usable clip_composer scene for index={index} "
+            f"after 8 attempts"
         )
-        bundle.metadata["snr_db"] = plan.snr_db
-        return {
-            "scene_id": index,
-            "plan": plan,
-            "bundle": bundle,
-            "views": self._scene_views_from_bundle(bundle, rng),
-        }
 
     def _attach_legacy_frame_labels(self, sample: dict) -> dict:
         stride = self.cfg.composer.stride_samples

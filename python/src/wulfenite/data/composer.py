@@ -551,6 +551,10 @@ class ClipRenderer:
                 role: track * scale for role, track in clean_tracks.items()
             }
 
+        active_frames_by_role, overlap_frames, background_frames = (
+            self._labels_from_tracks(clean_tracks, frame_size=plan.stride_samples)
+        )
+
         enrollment_pool = self._build_enrollment_pool(cast, rng)
         metadata = {
             "family": plan.family.value,
@@ -569,11 +573,9 @@ class ClipRenderer:
             mixture=mixture,
             source_tracks=clean_tracks,
             enrollment_pool=enrollment_pool,
-            active_frames_by_role={
-                role: mask.clone() for role, mask in plan.active_frames_by_role.items()
-            },
-            overlap_frames=plan.overlap_frames.clone(),
-            background_frames=plan.background_frames.clone(),
+            active_frames_by_role=active_frames_by_role,
+            overlap_frames=overlap_frames,
+            background_frames=background_frames,
             metadata=metadata,
         )
 
@@ -583,10 +585,57 @@ class ClipRenderer:
         cast: SpeakerCast,
         rng: random.Random,
     ) -> dict[str, torch.Tensor]:
+        required_samples_by_role = self._required_samples_by_role(plan)
         return {
-            role: _load_chunk(entry, plan.segment_samples, rng).to(torch.float32)
+            role: self._load_ranked_chunk(
+                entry,
+                required_samples_by_role.get(role, 0),
+                rng,
+                pick="loudest",
+            )
             for role, entry in cast.source_entries.items()
         }
+
+    def _required_samples_by_role(
+        self,
+        plan: ClipPlan,
+    ) -> dict[str, int]:
+        required = {
+            role: 0 for role in plan.active_frames_by_role
+        }
+        for slot in plan.slots:
+            length = (slot.end_frame - slot.start_frame) * plan.stride_samples
+            for role in slot.active_roles:
+                required[role] = required.get(role, 0) + length
+        return required
+
+    def _labels_from_tracks(
+        self,
+        role_tracks: dict[str, torch.Tensor],
+        *,
+        frame_size: int,
+        activity_threshold: float = 1e-4,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+        if not role_tracks:
+            raise ValueError("role_tracks must not be empty")
+        n_frames = next(iter(role_tracks.values())).shape[-1] // frame_size
+        active_frames_by_role: dict[str, torch.Tensor] = {}
+        for role, track in role_tracks.items():
+            usable = n_frames * frame_size
+            active_frames_by_role[role] = (
+                track[:usable]
+                .reshape(n_frames, frame_size)
+                .abs()
+                .amax(dim=-1)
+                .gt(activity_threshold)
+            )
+
+        stacked = torch.stack(
+            [mask.to(torch.int32) for mask in active_frames_by_role.values()], dim=0
+        )
+        overlap_frames = stacked.sum(dim=0) >= 2
+        background_frames = stacked.sum(dim=0) == 0
+        return active_frames_by_role, overlap_frames, background_frames
 
     def _build_role_envelopes(
         self,
@@ -726,9 +775,19 @@ class ClipRenderer:
         rng: random.Random,
     ) -> torch.Tensor:
         if mode == "dense":
-            audio = self._load_ranked_enrollment(entry, rng, pick="loudest")
+            audio = self._load_ranked_chunk(
+                entry,
+                self._enrollment_len,
+                rng,
+                pick="loudest",
+            )
         elif mode == "silence_heavy":
-            audio = self._load_ranked_enrollment(entry, rng, pick="quietest")
+            audio = self._load_ranked_chunk(
+                entry,
+                self._enrollment_len,
+                rng,
+                pick="quietest",
+            )
         else:
             audio = _load_chunk(entry, self._enrollment_len, rng)
         audio = self._normalize(audio.to(torch.float32))
@@ -745,20 +804,33 @@ class ClipRenderer:
             audio = self._normalize(apply_rir(audio, self._sample_rir(rng)))
         return audio
 
-    def _load_ranked_enrollment(
+    def _load_ranked_chunk(
         self,
         entry: AudioEntry,
+        target_len: int,
         rng: random.Random,
         *,
         pick: str,
         n_trials: int = 8,
     ) -> torch.Tensor:
-        candidates = [
-            _load_chunk(entry, self._enrollment_len, rng).to(torch.float32)
-            for _ in range(max(1, n_trials))
-        ]
+        if target_len <= 0:
+            return torch.zeros(0, dtype=torch.float32)
+
+        if entry.num_frames <= 0:
+            return torch.zeros(target_len, dtype=torch.float32)
+
         key = max if pick == "loudest" else min
-        return key(candidates, key=lambda chunk: float(_rms(chunk)))
+        chunks: list[torch.Tensor] = []
+        remaining = target_len
+        while remaining > 0:
+            chunk_len = min(remaining, entry.num_frames)
+            candidates = [
+                _load_chunk(entry, chunk_len, rng).to(torch.float32)
+                for _ in range(max(1, n_trials))
+            ]
+            chunks.append(key(candidates, key=lambda chunk: float(_rms(chunk))))
+            remaining -= chunk_len
+        return torch.cat(chunks, dim=0)[:target_len]
 
     def _sample_rir(self, rng: random.Random) -> torch.Tensor:
         if self._rir_pool:

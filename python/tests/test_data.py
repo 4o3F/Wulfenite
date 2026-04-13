@@ -8,6 +8,7 @@ the tests exercise the actual scan paths.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 import random
 from pathlib import Path
@@ -465,6 +466,100 @@ def test_sample_scene_export_writes_audio_inventory(tmp_path: Path) -> None:
     assert (scene0 / "enrollment_outsider_dense.wav").exists()
     assert (scene0 / "metadata.json").exists()
     assert (out_dir / "manifest.json").exists()
+
+
+def test_scene_views_use_rendered_target_presence(tmp_path: Path) -> None:
+    mixer = _build_mixer(
+        tmp_path,
+        composition_mode="clip_composer",
+        segment_seconds=8.0,
+    )
+    scene = mixer.sample_scene(0)
+    bundle = scene["bundle"]
+    silent_b_mask = torch.zeros_like(bundle.active_frames_by_role["B"])
+    silent_bundle = replace(
+        bundle,
+        source_tracks={
+            **bundle.source_tracks,
+            "B": torch.zeros_like(bundle.source_tracks["B"]),
+        },
+        active_frames_by_role={
+            **bundle.active_frames_by_role,
+            "B": silent_b_mask,
+        },
+        overlap_frames=torch.zeros_like(bundle.overlap_frames),
+    )
+
+    views = mixer._scene_views_from_bundle(silent_bundle, random.Random(0))
+    b_view = next(view for view in views if view["view_role"] == "B")
+
+    assert b_view["target_present"].item() == 0.0
+    assert torch.allclose(b_view["target"], torch.zeros_like(b_view["target"]))
+    assert not b_view["target_active_frames"].any()
+
+
+def test_sample_scene_retries_invalid_rendered_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mixer = _build_mixer(
+        tmp_path,
+        composition_mode="clip_composer",
+        segment_seconds=8.0,
+    )
+    assert mixer._planner is not None
+    assert mixer._renderer is not None
+
+    rng = random.Random(0)
+    plan = mixer._planner.plan(rng=rng)
+    cast = mixer._sample_speaker_cast(plan, rng)
+    valid_bundle = mixer._renderer.render_bundle(
+        scene_id=0,
+        plan=plan,
+        cast=cast,
+        speaker_to_idx=mixer.speaker_to_idx,
+        rng=rng,
+    )
+    invalid_bundle = replace(
+        valid_bundle,
+        source_tracks={
+            **valid_bundle.source_tracks,
+            "B": torch.zeros_like(valid_bundle.source_tracks["B"]),
+        },
+        active_frames_by_role={
+            **valid_bundle.active_frames_by_role,
+            "B": torch.zeros_like(valid_bundle.active_frames_by_role["B"]),
+        },
+        overlap_frames=torch.zeros_like(valid_bundle.overlap_frames),
+    )
+
+    calls = {"count": 0}
+
+    def fake_plan(*, rng: random.Random) -> object:
+        return plan
+
+    def fake_sample_cast(plan_: object, rng_: random.Random) -> object:
+        return cast
+
+    def fake_render_bundle(
+        *,
+        scene_id: int,
+        plan: object,
+        cast: object,
+        speaker_to_idx: dict[str, int],
+        rng: random.Random,
+    ) -> object:
+        calls["count"] += 1
+        return invalid_bundle if calls["count"] == 1 else valid_bundle
+
+    monkeypatch.setattr(mixer._planner, "plan", fake_plan)
+    monkeypatch.setattr(mixer, "_sample_speaker_cast", fake_sample_cast)
+    monkeypatch.setattr(mixer._renderer, "render_bundle", fake_render_bundle)
+
+    scene = mixer.sample_scene(0)
+
+    assert calls["count"] == 2
+    assert scene["bundle"].active_frames_by_role["B"].any()
 
 
 def test_mixer_collate_recomputes_fbank(tmp_path: Path) -> None:

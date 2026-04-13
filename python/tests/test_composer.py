@@ -130,6 +130,20 @@ def test_renderer_bundle_preserves_roles_and_enrollment_pools(
     assert bundle.overlap_frames.shape == (expected_frames,)
 
 
+def test_renderer_loads_only_required_role_audio(tmp_path: Path) -> None:
+    planner, renderer, cast, _ = _renderer_and_cast(tmp_path)
+    plan = planner.plan(rng=random.Random(12))
+    stems = renderer._load_role_stems(plan, cast, random.Random(13))
+
+    for role, stem in stems.items():
+        expected_len = sum(
+            (slot.end_frame - slot.start_frame) * plan.stride_samples
+            for slot in plan.slots
+            if role in slot.active_roles
+        )
+        assert stem.shape == (expected_len,)
+
+
 def test_renderer_label_consistency(tmp_path: Path) -> None:
     planner, renderer, cast, speaker_to_idx = _renderer_and_cast(tmp_path)
     plan = planner.plan(rng=random.Random(4))
@@ -143,6 +157,42 @@ def test_renderer_label_consistency(tmp_path: Path) -> None:
             assert a_energy > 0.0
         else:
             assert a_energy == pytest.approx(0.0, abs=1e-6)
+
+
+def test_renderer_labels_follow_rendered_audio_not_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planner, renderer, cast, speaker_to_idx = _renderer_and_cast(tmp_path)
+    plan = planner.plan(rng=random.Random(14))
+
+    def fake_role_stems(
+        plan_: ClipPlan,
+        cast_: SpeakerCast,
+        rng_: random.Random,
+    ) -> dict[str, torch.Tensor]:
+        stems: dict[str, torch.Tensor] = {}
+        for role in cast_.source_entries:
+            expected_len = sum(
+                (slot.end_frame - slot.start_frame) * plan_.stride_samples
+                for slot in plan_.slots
+                if role in slot.active_roles
+            )
+            fill = 0.0 if role == "B" else 0.25
+            stems[role] = torch.full(
+                (expected_len,),
+                fill,
+                dtype=torch.float32,
+            )
+        return stems
+
+    monkeypatch.setattr(renderer, "_load_role_stems", fake_role_stems)
+    bundle = renderer.render_bundle(0, plan, cast, speaker_to_idx, random.Random(15))
+
+    assert bundle.active_frames_by_role["A"].any()
+    assert not bundle.active_frames_by_role["B"].any()
+    assert not bundle.overlap_frames.any()
+    assert bundle.background_frames.any()
 
 
 def test_renderer_crossfade_no_clicks(tmp_path: Path) -> None:
