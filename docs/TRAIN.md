@@ -397,11 +397,6 @@ uv run --directory python python -m wulfenite.training.train \
     --noise-root ../assets/musan/noise \
     --out-dir ../assets/checkpoints/smoke_test \
     --composition-mode clip_composer \
-    --family-multiturn-weight 0.60 \
-    --family-overlap-heavy-weight 0.25 \
-    --family-hard-negative-weight 0.15 \
-    --min-events 4 \
-    --max-events 8 \
     --crossfade-ms 5.0 \
     --batch-size 4 \
     --epochs 1 \
@@ -417,9 +412,9 @@ Key design points of the training loop (from `docs/architecture.md`):
   ``streaming_step`` deployment path is numerically equivalent to
   the same forward pass, verified by
   ``tests/test_speakerbeam_ss.py::test_speakerbeam_streaming_matches_forward``.
-- **Clip composer** — the default mixer path builds 4-second clips
-  from multi-turn target-present, overlap-heavy, and hard-negative
-  templates rather than the older branch-specific recipes.
+- **Clip composer** — the default mixer path builds long scenes from a
+  template family with sparse / medium / dense overlap tiers, then
+  derives multiple enrollment-conditioned views from the same mixture.
 - **`WulfeniteLoss` combined loss** — by default uses direct SDR +
   MR-STFT + target-absent energy penalty + framewise inactive-region
   supervision. Presence BCE and recall-floor supervision remain
@@ -437,6 +432,21 @@ The current recipe uses Adam, `ReduceLROnPlateau(mode="max")` on
 present-only `val_sdri_db`, and early stopping with patience 20. On a
 24 GB GPU, batch size 16 is the first setting to try; if the
 paper-aligned `N = 2048` separator still OOMs, drop to 12 or 8.
+
+Important `clip_composer` defaults in the current recipe:
+
+- `--noise-snr-range-db 0 25` widens additive noise exposure down to 0 dB SNR.
+- `--global-gain-range-db -9 9` adds large clip-level loudness variation, while
+  `--gain-drift-db-range -1.5 1.5` keeps the smaller within-clip drift.
+- `--outsider-view-prob 0.15` keeps absent-target outsider views as a minority.
+- `--overlap-density-weights 0.20 0.55 0.25` samples sparse / medium / dense
+  overlap scenes respectively.
+- `--overlap-ratio-sparse 0.15 0.25`, `--overlap-ratio-medium 0.25 0.40`, and
+  `--overlap-ratio-dense 0.40 0.55` target an average overlap ratio around
+  30-35% across the full training set.
+- `--overlap-snr-center-range-db -2 4`, `--overlap-snr-tail-range-db -6 8`, and
+  `--overlap-snr-center-prob 0.7` bias overlap regions toward near-parity
+  conversational SNRs while still sampling harder tails.
 
 Checkpoints are written to `--out-dir`:
 

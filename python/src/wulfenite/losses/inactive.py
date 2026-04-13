@@ -82,7 +82,7 @@ def target_inactive_loss(
     # leakage frames rather than averaging over every inactive frame.
     audible = mix_energy > 1e-4
     masked = mask.float() * audible.float()
-    ratio = est_energy / (mix_energy + eps)
+    ratio = torch.clamp(est_energy / (mix_energy + eps), max=4.0)
     penalty = torch.relu(ratio - threshold).square()
 
     per_sample_terms: list[torch.Tensor] = []

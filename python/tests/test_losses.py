@@ -305,6 +305,23 @@ def test_inactive_loss_topk_focuses_on_worst_frame() -> None:
     assert loss.item() == pytest.approx(1.0, abs=1e-6)
 
 
+def test_inactive_loss_clamps_extreme_ratio_before_squaring() -> None:
+    estimate = torch.tensor([[10.0, 10.0]])
+    mixture = torch.tensor([[1e-2, 1e-2]])
+    inactive_frames = torch.tensor([[True]])
+
+    loss = target_inactive_loss(
+        estimate,
+        mixture,
+        inactive_frames=inactive_frames,
+        frame_size=2,
+        threshold=0.0,
+        topk_fraction=1.0,
+    )
+
+    assert loss.item() == pytest.approx(16.0, abs=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # presence
 # ---------------------------------------------------------------------------

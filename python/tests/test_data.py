@@ -293,6 +293,7 @@ def _build_mixer(
     transition_prob: float = 0.0,
     composition_mode: str = "legacy_branch",
     segment_seconds: float = 1.0,
+    outsider_view_prob: float = 1.0,
 ) -> WulfeniteMixer:
     a1 = _build_fake_aishell1(tmp_path / "a1", num_speakers=4,
                               utts_per_speaker=4)
@@ -310,6 +311,7 @@ def _build_mixer(
         enrollment_seconds=segment_seconds,
         composition_mode=composition_mode,
         target_present_prob=0.75,
+        outsider_view_prob=outsider_view_prob,
         transition_prob=transition_prob,
     )
     return WulfeniteMixer(
@@ -319,6 +321,24 @@ def _build_mixer(
         samples_per_epoch=20,
         seed=7,
     )
+
+
+def test_mixer_clip_composer_requires_outsider_speaker(tmp_path: Path) -> None:
+    root = _build_fake_aishell1(tmp_path / "a1_min", num_speakers=2, utts_per_speaker=4)
+    speakers = scan_aishell1(root)
+
+    with pytest.raises(RuntimeError, match="clip_composer mode requires at least 3 speakers"):
+        WulfeniteMixer(
+            speakers=speakers,
+            noise_pool=None,
+            config=MixerConfig(
+                segment_seconds=8.0,
+                enrollment_seconds=8.0,
+                composition_mode="clip_composer",
+            ),
+            samples_per_epoch=4,
+            seed=7,
+        )
 
 
 def test_mixer_sample_shapes(tmp_path: Path) -> None:
@@ -338,6 +358,7 @@ def test_mixer_composer_sample_shapes(tmp_path: Path) -> None:
         tmp_path,
         composition_mode="clip_composer",
         segment_seconds=8.0,
+        outsider_view_prob=1.0,
     )
     sample = mixer[0]
     expected_len = int(8.0 * SR)
@@ -434,6 +455,7 @@ def test_mixer_composer_collate_framewise(tmp_path: Path) -> None:
         tmp_path,
         composition_mode="clip_composer",
         segment_seconds=8.0,
+        outsider_view_prob=1.0,
     )
     batch = [mixer[i] for i in range(2)]
     collated = collate_mixer_batch(batch)
@@ -444,6 +466,25 @@ def test_mixer_composer_collate_framewise(tmp_path: Path) -> None:
     assert collated["background_frames"].shape == (6, int(8.0 * SR) // 160)
     assert collated["scene_id"].shape == (6,)
     assert collated["view_role_id"].shape == (6,)
+
+
+def test_mixer_outsider_view_probability(tmp_path: Path) -> None:
+    mixer = _build_mixer(
+        tmp_path,
+        composition_mode="clip_composer",
+        segment_seconds=8.0,
+        outsider_view_prob=0.15,
+    )
+    n_scenes = 400
+    outsider_views = 0
+    for i in range(n_scenes):
+        sample = mixer[i]
+        outsider_views += sum(
+            1 for view in sample["views"] if view["view_role"] == "OUTSIDER"
+        )
+
+    observed = outsider_views / n_scenes
+    assert observed == pytest.approx(0.15, abs=0.05)
 
 
 def test_sample_scene_export_writes_audio_inventory(tmp_path: Path) -> None:

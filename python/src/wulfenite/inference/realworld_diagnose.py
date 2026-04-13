@@ -373,7 +373,7 @@ def _mixer_config_for_hard_negatives(checkpoint_cfg: dict[str, Any]) -> MixerCon
         ),
         snr_range_db=tuple(checkpoint_cfg.get("snr_range_db", (-5.0, 5.0))),
         noise_snr_range_db=tuple(
-            checkpoint_cfg.get("noise_snr_range_db", (10.0, 25.0))
+            checkpoint_cfg.get("noise_snr_range_db", (0.0, 25.0))
         ),
     )
     reverb_prob = float(checkpoint_cfg.get("reverb_prob", 0.85))

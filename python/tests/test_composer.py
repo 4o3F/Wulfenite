@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import Counter
+from dataclasses import replace
 import math
 import random
 from pathlib import Path
@@ -20,6 +22,10 @@ from wulfenite.data.composer import (
     EventSlot,
     EventType,
     SpeakerCast,
+    TEMPLATES,
+    _AnchorSpec,
+    _resolve_template_roles,
+    _slot_min_frames_for_cfg,
 )
 
 
@@ -83,14 +89,36 @@ def _renderer_and_cast(
     return planner, renderer, cast, speaker_to_idx
 
 
+def _template_specs(
+    planner: ClipPlanner,
+    template_name: str,
+    *,
+    use_third_speaker: bool,
+) -> tuple[_AnchorSpec, ...]:
+    template = TEMPLATES[template_name]
+    return tuple(
+        _AnchorSpec(
+            event_type=event_type,
+            min_frames=_slot_min_frames_for_cfg(
+                planner.cfg,
+                event_type=event_type,
+                anchor_name=anchor_name,
+            ),
+            active_roles=_resolve_template_roles(
+                active_roles,
+                use_third_speaker=use_third_speaker,
+            ),
+            anchor_name=anchor_name,
+        )
+        for event_type, active_roles, anchor_name in template["slots"]
+    )
+
+
 def test_planner_unified_scene_constraints() -> None:
     planner = ClipPlanner(MixerConfig().composer, allow_third_speaker=True)
     for seed in range(32):
         plan = planner.plan(rng=random.Random(seed))
-        transitions = [
-            (plan.slots[i].event_type, plan.slots[i + 1].event_type)
-            for i in range(len(plan.slots) - 1)
-        ]
+        event_sequence = [slot.event_type for slot in plan.slots]
         nontarget = torch.zeros_like(plan.active_frames_by_role["A"])
         for role, active in plan.active_frames_by_role.items():
             if role != "A":
@@ -98,15 +126,139 @@ def test_planner_unified_scene_constraints() -> None:
         target_only = plan.active_frames_by_role["A"] & ~nontarget
         assert plan.family is ClipFamily.UNIFIED_LONG_SCENE
         assert len(plan.slots) == 7
+        assert plan.template_name in TEMPLATES
+        assert plan.overlap_density == TEMPLATES[plan.template_name]["density"]
+        assert plan.overlap_ratio is not None
         assert plan.slots[0].start_frame == 0
         assert plan.slots[-1].end_frame == plan.total_frames
         assert target_only.any()
         assert plan.active_frames_by_role["B"].any()
         assert plan.overlap_frames.any()
         assert plan.background_frames.any()
-        assert (EventType.TARGET_ONLY, EventType.NONTARGET_ONLY) in transitions
-        assert (EventType.NONTARGET_ONLY, EventType.TARGET_ONLY) in transitions
-        assert (EventType.TARGET_ONLY, EventType.OVERLAP) in transitions
+        assert EventType.NONTARGET_ONLY in event_sequence
+        assert EventType.OVERLAP in event_sequence
+        assert min(
+            i for i, event_type in enumerate(event_sequence)
+            if event_type is EventType.TARGET_ONLY
+        ) < max(
+            i for i, event_type in enumerate(event_sequence)
+            if event_type is EventType.NONTARGET_ONLY
+        )
+        assert min(
+            i for i, event_type in enumerate(event_sequence)
+            if event_type is EventType.NONTARGET_ONLY
+        ) < max(
+            i for i, event_type in enumerate(event_sequence)
+            if event_type is EventType.TARGET_ONLY
+        )
+        assert min(
+            i for i, event_type in enumerate(event_sequence)
+            if event_type is EventType.TARGET_ONLY
+        ) < max(
+            i for i, event_type in enumerate(event_sequence)
+            if event_type is EventType.OVERLAP
+        )
+
+
+def test_planner_template_family_coverage() -> None:
+    planner = ClipPlanner(MixerConfig().composer, allow_third_speaker=True)
+
+    for i, template_name in enumerate(TEMPLATES):
+        specs = _template_specs(
+            planner,
+            template_name,
+            use_third_speaker=True,
+        )
+        durations, overlap_ratio = planner._allocate_frames(
+            specs,
+            density=TEMPLATES[template_name]["density"],
+            rng=random.Random(100 + i),
+        )
+        slots = planner._materialize_slots(specs, durations)
+        active_frames_by_role = planner._labels_from_slots(slots)
+        overlap_frames = planner._compute_overlap(active_frames_by_role)
+        background_frames = planner._compute_background(
+            active_frames_by_role,
+            planner.cfg.total_frames,
+        )
+
+        planner._assert_constraints(
+            slots=slots,
+            active_frames_by_role=active_frames_by_role,
+            overlap_frames=overlap_frames,
+            background_frames=background_frames,
+        )
+
+        assert len(slots) == 7
+        assert 0.0 < overlap_ratio < 1.0
+
+
+def test_planner_anchor_validation_handles_noncanonical_slot_order() -> None:
+    planner = ClipPlanner(MixerConfig().composer, allow_third_speaker=False)
+    specs = _template_specs(
+        planner,
+        "nontarget_heavy",
+        use_third_speaker=False,
+    )
+    durations, _ = planner._allocate_frames(
+        specs,
+        density="sparse",
+        rng=random.Random(17),
+    )
+    slots = planner._materialize_slots(specs, durations)
+    active_frames_by_role = planner._labels_from_slots(slots)
+    overlap_frames = planner._compute_overlap(active_frames_by_role)
+    background_frames = planner._compute_background(
+        active_frames_by_role,
+        planner.cfg.total_frames,
+    )
+
+    planner._assert_constraints(
+        slots=slots,
+        active_frames_by_role=active_frames_by_role,
+        overlap_frames=overlap_frames,
+        background_frames=background_frames,
+    )
+
+    assert slots[0].event_type is EventType.NONTARGET_ONLY
+    assert next(
+        slot for slot in slots if slot.anchor_name == "target_only_intro"
+    ).index == 1
+
+
+def test_planner_density_selection_matches_weights() -> None:
+    planner = ClipPlanner(MixerConfig().composer, allow_third_speaker=True)
+    counts: Counter[str] = Counter()
+    n_plans = 1200
+
+    for seed in range(n_plans):
+        plan = planner.plan(rng=random.Random(seed))
+        assert plan.overlap_density is not None
+        counts[plan.overlap_density] += 1
+
+    for density, expected in planner.cfg.overlap_density_weights.items():
+        observed = counts[density] / n_plans
+        assert observed == pytest.approx(expected, abs=0.05)
+
+
+@pytest.mark.parametrize("density", ("sparse", "medium", "dense"))
+def test_planner_overlap_ratio_stays_within_density_range(density: str) -> None:
+    cfg = replace(
+        MixerConfig().composer,
+        overlap_density_weights={
+            "sparse": 1.0 if density == "sparse" else 0.0,
+            "medium": 1.0 if density == "medium" else 0.0,
+            "dense": 1.0 if density == "dense" else 0.0,
+        },
+    )
+    planner = ClipPlanner(cfg, allow_third_speaker=True)
+    lo, hi = cfg.overlap_ratio_ranges[density]
+
+    for seed in range(32):
+        plan = planner.plan(rng=random.Random(seed))
+        assert plan.overlap_density == density
+        assert plan.overlap_ratio is not None
+        assert lo - 1e-6 <= plan.overlap_ratio <= hi + 1e-6
 
 
 def test_renderer_bundle_preserves_roles_and_enrollment_pools(
@@ -213,6 +365,45 @@ def test_renderer_finite_values(tmp_path: Path) -> None:
     for pool in bundle.enrollment_pool.values():
         for candidate in pool:
             assert torch.isfinite(candidate).all()
+
+
+def test_renderer_normalizes_stems_before_sparse_stitching(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planner, renderer, cast, speaker_to_idx = _renderer_and_cast(tmp_path)
+    plan = planner.plan(rng=random.Random(18))
+
+    def fake_load_ranked_chunk(
+        entry: object,
+        target_len: int,
+        rng: random.Random,
+        *,
+        pick: str,
+        n_trials: int = 8,
+    ) -> torch.Tensor:
+        del entry, rng, pick, n_trials
+        return torch.full((target_len,), 0.5, dtype=torch.float32)
+
+    monkeypatch.setattr(renderer, "_load_ranked_chunk", fake_load_ranked_chunk)
+    monkeypatch.setattr(
+        renderer,
+        "_sample_temporal_drift",
+        lambda n_samples, rng: torch.ones(n_samples, dtype=torch.float32),
+    )
+    monkeypatch.setattr(renderer, "_sample_global_gain", lambda rng: 1.0)
+    bundle = renderer.render_bundle(0, plan, cast, speaker_to_idx, random.Random(19))
+
+    active_mask = bundle.active_frames_by_role["A"].repeat_interleave(plan.stride_samples)[
+        :plan.segment_samples
+    ]
+    active = bundle.source_tracks["A"][active_mask]
+    full = bundle.source_tracks["A"]
+    active_rms = float(torch.sqrt(torch.mean(active * active) + 1e-12))
+    full_rms = float(torch.sqrt(torch.mean(full * full) + 1e-12))
+
+    assert active_rms == pytest.approx(renderer.cfg.rms_target, rel=0.25, abs=1e-3)
+    assert full_rms < active_rms
 
 
 def test_renderer_overlap_snr_accuracy(

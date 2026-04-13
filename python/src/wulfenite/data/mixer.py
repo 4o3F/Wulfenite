@@ -111,6 +111,7 @@ class MixerConfig:
     composition_mode: str = "clip_composer"
     composer: "ComposerConfig" = field(default_factory=_default_composer_config)
     target_present_prob: float = 0.85  # fraction of target-present samples
+    outsider_view_prob: float = 0.15
     transition_prob: float = 0.0
     transition_min_fraction: float = 0.25
     transition_min_target_rms: float = 0.01
@@ -125,7 +126,7 @@ class MixerConfig:
     # --- Additive noise on the final mixture ---
     apply_noise: bool = True
     noise_prob: float = 0.80
-    noise_snr_range_db: tuple[float, float] = (10.0, 25.0)
+    noise_snr_range_db: tuple[float, float] = (0.0, 25.0)
     # If True and a noise_pool is provided, sample real noise files;
     # otherwise (or if disabled here) fall back to synthetic Gaussian
     # noise. Accepts any corpus that can be scanned by
@@ -162,6 +163,11 @@ class MixerConfig:
             raise ValueError(
                 "transition_prob must be in [0, 1]; got "
                 f"{self.transition_prob}"
+            )
+        if not 0.0 <= self.outsider_view_prob <= 1.0:
+            raise ValueError(
+                "outsider_view_prob must be in [0, 1]; got "
+                f"{self.outsider_view_prob}"
             )
         if not 0.0 < self.transition_min_fraction < 0.5:
             raise ValueError(
@@ -319,6 +325,12 @@ class WulfeniteMixer(Dataset):
             raise RuntimeError(
                 "Need at least 2 speakers with ≥ 2 utterances each."
             )
+        if cfg.composition_mode == "clip_composer" and len(self.speaker_ids) < 3:
+            raise RuntimeError(
+                "clip_composer mode requires at least 3 speakers with ≥ 2 "
+                "utterances each so one speaker can remain outside the scene "
+                "for the outsider enrollment view."
+            )
 
         self.noise_pool = list(noise_pool) if noise_pool else []
         # If caller disabled the noise pool or provided none, fall back
@@ -432,8 +444,9 @@ class WulfeniteMixer(Dataset):
         rng: random.Random,
     ) -> "SpeakerCast":
         from .composer import SpeakerCast
+        from .composer import _required_samples_by_role
 
-        required_samples_by_role = self._required_samples_by_role(plan)
+        required_samples_by_role = _required_samples_by_role(plan)
         target_spk = rng.choice(self.speaker_ids)
         target_entry, enroll_entry = self._sample_role_entries(
             target_spk,
@@ -464,17 +477,6 @@ class WulfeniteMixer(Dataset):
             outsider_speaker_id=outsider_spk,
             outsider_enrollment_entry=rng.choice(self.speakers[outsider_spk]),
         )
-
-    @staticmethod
-    def _required_samples_by_role(plan: "ClipPlan") -> dict[str, int]:
-        required = {
-            role: 0 for role in plan.active_frames_by_role
-        }
-        for slot in plan.slots:
-            length = (slot.end_frame - slot.start_frame) * plan.stride_samples
-            for role in slot.active_roles:
-                required[role] = required.get(role, 0) + length
-        return required
 
     def _sample_role_entries(
         self,
@@ -654,24 +656,27 @@ class WulfeniteMixer(Dataset):
                 background_frames=bundle.background_frames,
                 snr_db=float(bundle.metadata.get("snr_db", 0.0)),
             ),
-            SceneView(
-                scene_id=bundle.scene_id,
-                view_role="OUTSIDER",
-                enrollment=self._select_enrollment(
-                    bundle.enrollment_pool["OUTSIDER"], rng,
-                ),
-                target=zeros_wave,
-                target_present=0.0,
-                target_speaker_idx=bundle.metadata["outsider_speaker_idx"],
-                target_active_frames=zeros_frames,
-                nontarget_active_frames=self._union_active_frames(
-                    bundle.active_frames_by_role,
-                ),
-                overlap_frames=zeros_frames,
-                background_frames=bundle.background_frames,
-                snr_db=0.0,
-            ),
         ]
+        if rng.random() < self.cfg.outsider_view_prob:
+            views.append(
+                SceneView(
+                    scene_id=bundle.scene_id,
+                    view_role="OUTSIDER",
+                    enrollment=self._select_enrollment(
+                        bundle.enrollment_pool["OUTSIDER"], rng,
+                    ),
+                    target=zeros_wave,
+                    target_present=0.0,
+                    target_speaker_idx=bundle.metadata["outsider_speaker_idx"],
+                    target_active_frames=zeros_frames,
+                    nontarget_active_frames=self._union_active_frames(
+                        bundle.active_frames_by_role,
+                    ),
+                    overlap_frames=zeros_frames,
+                    background_frames=bundle.background_frames,
+                    snr_db=0.0,
+                )
+            )
 
         samples: list[dict] = []
         for view in views:

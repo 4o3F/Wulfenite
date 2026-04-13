@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Sequence
 
@@ -106,6 +106,171 @@ class ClipPlan:
     active_frames_by_role: dict[str, torch.Tensor]
     overlap_frames: torch.Tensor
     background_frames: torch.Tensor
+    template_name: str | None = None
+    overlap_density: str | None = None
+    overlap_ratio: float | None = None
+
+
+OVERLAP_DENSITY_ORDER = ("sparse", "medium", "dense")
+_ROLE_POST_OV = "post_ov"
+_ROLE_OV2 = "ov2"
+TEMPLATES: dict[str, dict[str, object]] = {
+    "baseline_mid_overlap": {
+        "density": "medium",
+        "slots": (
+            (EventType.TARGET_ONLY, ("A",), "target_only_intro"),
+            (EventType.NONTARGET_ONLY, ("B",), "nontarget_only_intro"),
+            (EventType.TARGET_ONLY, ("A",), "target_return_after_absence"),
+            (EventType.OVERLAP, ("A", "B"), "overlap_main"),
+            (
+                EventType.NONTARGET_ONLY,
+                (_ROLE_POST_OV,),
+                "nontarget_only_after_overlap",
+            ),
+            (EventType.BACKGROUND_ONLY, (), "background_only_reset"),
+            (EventType.TARGET_ONLY, ("A",), "target_return_final"),
+        ),
+    },
+    "early_overlap_double": {
+        "density": "dense",
+        "slots": (
+            (EventType.TARGET_ONLY, ("A",), "target_only_intro"),
+            (EventType.OVERLAP, ("A", "B"), "overlap_main"),
+            (EventType.NONTARGET_ONLY, ("B",), "nontarget_only_intro"),
+            (EventType.TARGET_ONLY, ("A",), "target_return_after_absence"),
+            (EventType.OVERLAP, ("A", _ROLE_OV2), "overlap_secondary"),
+            (EventType.BACKGROUND_ONLY, (), "background_only_reset"),
+            (EventType.TARGET_ONLY, ("A",), "target_return_final"),
+        ),
+    },
+    "late_overlap_long_absence": {
+        "density": "sparse",
+        "slots": (
+            (EventType.TARGET_ONLY, ("A",), "target_only_intro"),
+            (EventType.NONTARGET_ONLY, ("B",), "nontarget_only_intro"),
+            (EventType.BACKGROUND_ONLY, (), "background_only_reset"),
+            (
+                EventType.NONTARGET_ONLY,
+                (_ROLE_POST_OV,),
+                "nontarget_only_after_overlap",
+            ),
+            (EventType.TARGET_ONLY, ("A",), "target_return_after_absence"),
+            (EventType.OVERLAP, ("A", "B"), "overlap_main"),
+            (EventType.TARGET_ONLY, ("A",), "target_return_final"),
+        ),
+    },
+    "background_mid_double_overlap": {
+        "density": "dense",
+        "slots": (
+            (EventType.TARGET_ONLY, ("A",), "target_only_intro"),
+            (EventType.OVERLAP, ("A", "B"), "overlap_main"),
+            (EventType.NONTARGET_ONLY, ("B",), "nontarget_only_intro"),
+            (EventType.BACKGROUND_ONLY, (), "background_only_reset"),
+            (EventType.TARGET_ONLY, ("A",), "target_return_after_absence"),
+            (EventType.OVERLAP, ("A", _ROLE_OV2), "overlap_secondary"),
+            (EventType.TARGET_ONLY, ("A",), "target_return_final"),
+        ),
+    },
+    "nontarget_heavy": {
+        "density": "sparse",
+        "slots": (
+            (EventType.NONTARGET_ONLY, ("B",), "nontarget_only_intro"),
+            (EventType.TARGET_ONLY, ("A",), "target_only_intro"),
+            (
+                EventType.NONTARGET_ONLY,
+                (_ROLE_POST_OV,),
+                "nontarget_only_after_overlap",
+            ),
+            (EventType.TARGET_ONLY, ("A",), "target_return_after_absence"),
+            (EventType.BACKGROUND_ONLY, (), "background_only_reset"),
+            (EventType.OVERLAP, ("A", "B"), "overlap_main"),
+            (EventType.TARGET_ONLY, ("A",), "target_return_final"),
+        ),
+    },
+}
+TEMPLATE_NAMES_BY_DENSITY = {
+    density: tuple(
+        name
+        for name, spec in TEMPLATES.items()
+        if spec["density"] == density
+    )
+    for density in OVERLAP_DENSITY_ORDER
+}
+
+
+def _default_overlap_density_weights() -> dict[str, float]:
+    return {
+        "sparse": 0.20,
+        "medium": 0.55,
+        "dense": 0.25,
+    }
+
+
+def _default_overlap_ratio_ranges() -> dict[str, tuple[float, float]]:
+    return {
+        "sparse": (0.15, 0.25),
+        "medium": (0.25, 0.40),
+        "dense": (0.40, 0.55),
+    }
+
+
+def _resolve_template_roles(
+    active_roles: tuple[str, ...],
+    *,
+    use_third_speaker: bool,
+) -> tuple[str, ...]:
+    resolved: list[str] = []
+    overlap_role = "C" if use_third_speaker else "B"
+    for role in active_roles:
+        if role in {_ROLE_POST_OV, _ROLE_OV2}:
+            resolved.append(overlap_role)
+        else:
+            resolved.append(role)
+    return tuple(resolved)
+
+
+def _slot_min_frames_for_cfg(
+    cfg: "ComposerConfig",
+    *,
+    event_type: EventType,
+    anchor_name: str,
+) -> int:
+    if event_type is EventType.TARGET_ONLY:
+        return cfg.target_only_min_frames
+    if event_type is EventType.NONTARGET_ONLY and anchor_name in {
+        "nontarget_only_intro",
+        "nontarget_only_after_overlap",
+    }:
+        return max(
+            cfg.nontarget_only_min_frames,
+            cfg.absence_before_return_min_frames,
+        )
+    if event_type is EventType.NONTARGET_ONLY:
+        return cfg.nontarget_only_min_frames
+    if event_type is EventType.OVERLAP:
+        return cfg.overlap_min_frames
+    if event_type is EventType.BACKGROUND_ONLY:
+        return cfg.background_min_frames
+    raise ValueError(f"unsupported event type {event_type!r}")
+
+
+def _find_slot(slots: Sequence[EventSlot], anchor_name: str) -> EventSlot:
+    return next(slot for slot in slots if slot.anchor_name == anchor_name)
+
+
+def _distribute_extra_frames(
+    durations: list[int],
+    *,
+    indices: Sequence[int],
+    extra_frames: int,
+    rng: random.Random,
+) -> None:
+    if extra_frames <= 0:
+        return
+    if not indices:
+        raise ValueError("cannot distribute frames across an empty slot set")
+    for _ in range(extra_frames):
+        durations[rng.choice(tuple(indices))] += 1
 
 
 @dataclass
@@ -126,8 +291,18 @@ class ComposerConfig:
 
     optional_third_speaker_prob: float = 0.35
     gain_drift_db_range: tuple[float, float] = (-1.5, 1.5)
+    global_gain_range_db: tuple[float, float] = (-9.0, 9.0)
     snr_range_db: tuple[float, float] = (-5.0, 5.0)
-    noise_snr_range_db: tuple[float, float] = (10.0, 25.0)
+    noise_snr_range_db: tuple[float, float] = (0.0, 25.0)
+    overlap_density_weights: dict[str, float] = field(
+        default_factory=_default_overlap_density_weights,
+    )
+    overlap_ratio_ranges: dict[str, tuple[float, float]] = field(
+        default_factory=_default_overlap_ratio_ranges,
+    )
+    overlap_snr_center_range_db: tuple[float, float] = (-2.0, 4.0)
+    overlap_snr_tail_range_db: tuple[float, float] = (-6.0, 8.0)
+    overlap_snr_center_prob: float = 0.7
 
     def __post_init__(self) -> None:
         if self.sample_rate <= 0:
@@ -173,15 +348,53 @@ class ComposerConfig:
                 "crossfade_samples must be smaller than stride_samples; got "
                 f"{self.crossfade_samples} vs {self.stride_samples}"
             )
-        min_required_frames = (
-            self.target_only_min_frames * 3
-            + max(
-                self.nontarget_only_min_frames,
-                self.absence_before_return_min_frames,
+        for name, value in (
+            ("gain_drift_db_range", self.gain_drift_db_range),
+            ("global_gain_range_db", self.global_gain_range_db),
+            ("snr_range_db", self.snr_range_db),
+            ("noise_snr_range_db", self.noise_snr_range_db),
+            ("overlap_snr_center_range_db", self.overlap_snr_center_range_db),
+            ("overlap_snr_tail_range_db", self.overlap_snr_tail_range_db),
+        ):
+            lo, hi = value
+            if lo > hi:
+                raise ValueError(f"{name} must satisfy lo <= hi; got {value}")
+        if not 0.0 <= self.overlap_snr_center_prob <= 1.0:
+            raise ValueError(
+                "overlap_snr_center_prob must be in [0, 1]; got "
+                f"{self.overlap_snr_center_prob}"
             )
-            + self.nontarget_only_min_frames
-            + self.overlap_min_frames
-            + self.background_min_frames
+        weight_keys = set(self.overlap_density_weights.keys())
+        if weight_keys != set(OVERLAP_DENSITY_ORDER):
+            raise ValueError(
+                "overlap_density_weights must define sparse/medium/dense; got "
+                f"{sorted(weight_keys)}"
+            )
+        if sum(self.overlap_density_weights.values()) <= 0.0:
+            raise ValueError("overlap_density_weights must sum to a positive value")
+        ratio_keys = set(self.overlap_ratio_ranges.keys())
+        if ratio_keys != set(OVERLAP_DENSITY_ORDER):
+            raise ValueError(
+                "overlap_ratio_ranges must define sparse/medium/dense; got "
+                f"{sorted(ratio_keys)}"
+            )
+        for density, ratio_range in self.overlap_ratio_ranges.items():
+            lo, hi = ratio_range
+            if lo < 0.0 or hi > 1.0 or lo > hi:
+                raise ValueError(
+                    "overlap_ratio_ranges values must satisfy 0 <= lo <= hi <= 1; "
+                    f"got {density}={ratio_range}"
+                )
+        min_required_frames = max(
+            sum(
+                _slot_min_frames_for_cfg(
+                    self,
+                    event_type=event_type,
+                    anchor_name=anchor_name,
+                )
+                for event_type, _, anchor_name in spec["slots"]
+            )
+            for spec in TEMPLATES.values()
         )
         if min_required_frames > self.total_frames:
             raise ValueError(
@@ -260,6 +473,25 @@ class _AnchorSpec:
     anchor_name: str
 
 
+@dataclass(frozen=True)
+class _TemplateSelection:
+    template_name: str
+    density: str
+    specs: tuple[_AnchorSpec, ...]
+
+
+def _required_samples_by_role(plan: ClipPlan) -> dict[str, int]:
+    """Return the total source samples needed per role for ``plan``."""
+    required = {
+        role: 0 for role in plan.active_frames_by_role
+    }
+    for slot in plan.slots:
+        length = (slot.end_frame - slot.start_frame) * plan.stride_samples
+        for role in slot.active_roles:
+            required[role] = required.get(role, 0) + length
+    return required
+
+
 class ClipPlanner:
     """Generate one coherent long scene with mandatory routing patterns."""
 
@@ -281,9 +513,13 @@ class ClipPlanner:
             self.allow_third_speaker
             and rng.random() < self.cfg.optional_third_speaker_prob
         )
-        slot_specs = self._build_slot_specs(use_third_speaker)
-        durations = self._allocate_frames(slot_specs, rng)
-        slots = self._materialize_slots(slot_specs, durations)
+        template = self._build_slot_specs(use_third_speaker, rng)
+        durations, overlap_ratio = self._allocate_frames(
+            template.specs,
+            density=template.density,
+            rng=rng,
+        )
+        slots = self._materialize_slots(template.specs, durations)
         active_frames_by_role = self._labels_from_slots(slots)
         overlap_frames = self._compute_overlap(active_frames_by_role)
         background_frames = self._compute_background(
@@ -302,78 +538,105 @@ class ClipPlanner:
             stride_samples=self.cfg.stride_samples,
             segment_samples=self.cfg.segment_samples,
             use_third_speaker=use_third_speaker,
-            snr_db=rng.uniform(*self.cfg.snr_range_db),
+            snr_db=self._sample_overlap_snr_db(rng),
             noise_snr_db=rng.uniform(*self.cfg.noise_snr_range_db),
             active_frames_by_role=active_frames_by_role,
             overlap_frames=overlap_frames,
             background_frames=background_frames,
+            template_name=template.template_name,
+            overlap_density=template.density,
+            overlap_ratio=overlap_ratio,
         )
 
     def _build_slot_specs(
         self,
         use_third_speaker: bool,
-    ) -> tuple[_AnchorSpec, ...]:
-        post_overlap_role = "C" if use_third_speaker else "B"
-        return (
+        rng: random.Random,
+    ) -> _TemplateSelection:
+        density = rng.choices(
+            OVERLAP_DENSITY_ORDER,
+            weights=[
+                self.cfg.overlap_density_weights[density]
+                for density in OVERLAP_DENSITY_ORDER
+            ],
+            k=1,
+        )[0]
+        template_name = rng.choice(TEMPLATE_NAMES_BY_DENSITY[density])
+        template = TEMPLATES[template_name]
+        slots = tuple(
             _AnchorSpec(
-                EventType.TARGET_ONLY,
-                self.cfg.target_only_min_frames,
-                ("A",),
-                "target_only_intro",
-            ),
-            _AnchorSpec(
-                EventType.NONTARGET_ONLY,
-                max(
-                    self.cfg.nontarget_only_min_frames,
-                    self.cfg.absence_before_return_min_frames,
+                event_type=event_type,
+                min_frames=_slot_min_frames_for_cfg(
+                    self.cfg,
+                    event_type=event_type,
+                    anchor_name=anchor_name,
                 ),
-                ("B",),
-                "other_only_intro",
-            ),
-            _AnchorSpec(
-                EventType.TARGET_ONLY,
-                self.cfg.target_only_min_frames,
-                ("A",),
-                "target_return_after_absence",
-            ),
-            _AnchorSpec(
-                EventType.OVERLAP,
-                self.cfg.overlap_min_frames,
-                ("A", "B"),
-                "overlap_main",
-            ),
-            _AnchorSpec(
-                EventType.NONTARGET_ONLY,
-                self.cfg.nontarget_only_min_frames,
-                (post_overlap_role,),
-                "other_only_after_overlap",
-            ),
-            _AnchorSpec(
-                EventType.BACKGROUND_ONLY,
-                self.cfg.background_min_frames,
-                (),
-                "background_only_reset",
-            ),
-            _AnchorSpec(
-                EventType.TARGET_ONLY,
-                self.cfg.target_only_min_frames,
-                ("A",),
-                "target_return_final",
-            ),
+                active_roles=_resolve_template_roles(
+                    active_roles,
+                    use_third_speaker=use_third_speaker,
+                ),
+                anchor_name=anchor_name,
+            )
+            for event_type, active_roles, anchor_name in template["slots"]
+        )
+        return _TemplateSelection(
+            template_name=template_name,
+            density=density,
+            specs=slots,
         )
 
     def _allocate_frames(
         self,
         specs: Sequence[_AnchorSpec],
+        *,
+        density: str,
         rng: random.Random,
-    ) -> list[int]:
+    ) -> tuple[list[int], float]:
         durations = [spec.min_frames for spec in specs]
+        overlap_indices = [
+            i for i, spec in enumerate(specs) if spec.event_type is EventType.OVERLAP
+        ]
+        non_overlap_indices = [
+            i for i, spec in enumerate(specs) if spec.event_type is not EventType.OVERLAP
+        ]
+        overlap_min_frames = sum(durations[i] for i in overlap_indices)
+        non_overlap_min_frames = sum(durations[i] for i in non_overlap_indices)
+        ratio_lo, ratio_hi = self.cfg.overlap_ratio_ranges[density]
+        feasible_lo = max(
+            ratio_lo,
+            overlap_min_frames / self.cfg.total_frames,
+        )
+        feasible_hi = min(
+            ratio_hi,
+            (self.cfg.total_frames - non_overlap_min_frames) / self.cfg.total_frames,
+        )
+        if feasible_hi < feasible_lo:
+            raise ValueError(
+                "configured overlap ratio range is incompatible with scene minima; "
+                f"density={density} feasible=({feasible_lo:.3f}, {feasible_hi:.3f})"
+            )
+        target_overlap_ratio = rng.uniform(feasible_lo, feasible_hi)
+        target_overlap_frames = int(round(target_overlap_ratio * self.cfg.total_frames))
+        target_overlap_frames = max(target_overlap_frames, overlap_min_frames)
+        max_overlap_frames = self.cfg.total_frames - non_overlap_min_frames
+        target_overlap_frames = min(target_overlap_frames, max_overlap_frames)
+        _distribute_extra_frames(
+            durations,
+            indices=overlap_indices,
+            extra_frames=target_overlap_frames - overlap_min_frames,
+            rng=rng,
+        )
         remaining = self.cfg.total_frames - sum(durations)
-        while remaining > 0:
-            idx = rng.randrange(len(durations))
-            durations[idx] += 1
-            remaining -= 1
-        return durations
+        _distribute_extra_frames(
+            durations,
+            indices=non_overlap_indices,
+            extra_frames=remaining,
+            rng=rng,
+        )
+        actual_overlap_ratio = (
+            sum(durations[i] for i in overlap_indices) / self.cfg.total_frames
+        )
+        return durations, actual_overlap_ratio
 
     def _materialize_slots(
         self,
@@ -444,6 +707,11 @@ class ClipPlanner:
             raise AssertionError("planner produced no slots")
         if slots[0].start_frame != 0 or slots[-1].end_frame != self.cfg.total_frames:
             raise AssertionError("planner must cover the full scene")
+        if any(
+            slots[i].end_frame != slots[i + 1].start_frame
+            for i in range(len(slots) - 1)
+        ):
+            raise AssertionError("planner must not leave gaps or overlaps between slots")
         if not active_frames_by_role["A"].any():
             raise AssertionError("target role A must be active")
         if not active_frames_by_role["B"].any():
@@ -472,27 +740,62 @@ class ClipPlanner:
         if int(background_frames.sum().item()) < self.cfg.background_min_frames:
             raise AssertionError("background-only minimum not satisfied")
 
-        intro_end = slots[1].end_frame
-        return_start = slots[2].start_frame
-        if return_start - slots[0].end_frame < self.cfg.absence_before_return_min_frames:
+        return_slot = _find_slot(slots, "target_return_after_absence")
+        previous_target_end = max(
+            slot.end_frame
+            for slot in slots
+            if slot.end_frame <= return_slot.start_frame
+            and "A" in slot.active_roles
+            and slot.anchor_name != "target_return_after_absence"
+        )
+        if (
+            return_slot.start_frame - previous_target_end
+            < self.cfg.absence_before_return_min_frames
+        ):
             raise AssertionError("target return after absence minimum not satisfied")
         transitions = [
             (slots[i].event_type, slots[i + 1].event_type)
             for i in range(len(slots) - 1)
         ]
-        required = {
+
+        def _has_order(before: EventType, after: EventType) -> bool:
+            before_seen = False
+            for slot in slots:
+                if slot.event_type is before:
+                    before_seen = True
+                elif before_seen and slot.event_type is after:
+                    return True
+            return False
+
+        required_orders = (
             (EventType.TARGET_ONLY, EventType.NONTARGET_ONLY),
             (EventType.NONTARGET_ONLY, EventType.TARGET_ONLY),
             (EventType.TARGET_ONLY, EventType.OVERLAP),
-        }
-        if not required.issubset(set(transitions)):
-            raise AssertionError(f"missing required transitions: {transitions}")
+        )
+        if not all(_has_order(before, after) for before, after in required_orders):
+            raise AssertionError(f"missing required event ordering: {transitions}")
         if (
-            (EventType.NONTARGET_ONLY, EventType.OVERLAP) not in transitions
-            and (EventType.OVERLAP, EventType.NONTARGET_ONLY) not in transitions
+            not _has_order(EventType.NONTARGET_ONLY, EventType.OVERLAP)
+            and not _has_order(EventType.OVERLAP, EventType.NONTARGET_ONLY)
         ):
             raise AssertionError("scene must contain other_only <-> overlap transition")
-        del intro_end
+
+    def _sample_overlap_snr_db(self, rng: random.Random) -> float:
+        center_lo, center_hi = self.cfg.overlap_snr_center_range_db
+        tail_lo, tail_hi = self.cfg.overlap_snr_tail_range_db
+        if rng.random() < self.cfg.overlap_snr_center_prob:
+            return rng.uniform(center_lo, center_hi)
+        lower_tail_valid = tail_lo < center_lo
+        upper_tail_valid = tail_hi > center_hi
+        if lower_tail_valid and upper_tail_valid:
+            if rng.random() < 0.5:
+                return rng.uniform(tail_lo, center_lo)
+            return rng.uniform(center_hi, tail_hi)
+        if lower_tail_valid:
+            return rng.uniform(tail_lo, center_lo)
+        if upper_tail_valid:
+            return rng.uniform(center_hi, tail_hi)
+        return rng.uniform(center_lo, center_hi)
 
 
 class ClipRenderer:
@@ -531,11 +834,12 @@ class ClipRenderer:
             role: track * role_envelopes.get(role, 1.0)
             for role, track in role_tracks.items()
         }
-        role_tracks = {
-            role: self._normalize(track) for role, track in role_tracks.items()
-        }
         role_tracks = self._apply_role_augmentation(role_tracks, rng)
         role_tracks = self._match_scene_snr(plan, role_tracks)
+        scene_gain = self._sample_global_gain(rng)
+        role_tracks = {
+            role: track * scene_gain for role, track in role_tracks.items()
+        }
         clean_tracks = {role: track.clone() for role, track in role_tracks.items()}
 
         mixture = torch.zeros(plan.segment_samples, dtype=torch.float32)
@@ -559,6 +863,9 @@ class ClipRenderer:
         metadata = {
             "family": plan.family.value,
             "snr_db": float(plan.snr_db),
+            "template_name": plan.template_name,
+            "overlap_density": plan.overlap_density,
+            "overlap_ratio": plan.overlap_ratio,
             "source_speaker_ids": dict(cast.source_speaker_ids),
             "outsider_speaker_id": cast.outsider_speaker_id,
             "speaker_indices": {
@@ -585,29 +892,18 @@ class ClipRenderer:
         cast: SpeakerCast,
         rng: random.Random,
     ) -> dict[str, torch.Tensor]:
-        required_samples_by_role = self._required_samples_by_role(plan)
+        required_samples_by_role = _required_samples_by_role(plan)
         return {
-            role: self._load_ranked_chunk(
-                entry,
-                required_samples_by_role.get(role, 0),
-                rng,
-                pick="loudest",
+            role: self._normalize(
+                self._load_ranked_chunk(
+                    entry,
+                    required_samples_by_role.get(role, 0),
+                    rng,
+                    pick="loudest",
+                )
             )
             for role, entry in cast.source_entries.items()
         }
-
-    def _required_samples_by_role(
-        self,
-        plan: ClipPlan,
-    ) -> dict[str, int]:
-        required = {
-            role: 0 for role in plan.active_frames_by_role
-        }
-        for slot in plan.slots:
-            length = (slot.end_frame - slot.start_frame) * plan.stride_samples
-            for role in slot.active_roles:
-                required[role] = required.get(role, 0) + length
-        return required
 
     def _labels_from_tracks(
         self,
@@ -710,16 +1006,14 @@ class ClipRenderer:
         role_tracks: dict[str, torch.Tensor],
         rng: random.Random,
     ) -> dict[str, torch.Tensor]:
-        tracks = {
-            role: self._normalize(track.clone()) for role, track in role_tracks.items()
-        }
+        tracks = {role: track.clone() for role, track in role_tracks.items()}
         if self.cfg.apply_reverb and rng.random() < self.cfg.reverb_prob:
             tracks = {
-                role: self._normalize(apply_rir(track, self._sample_rir(rng)))
+                role: apply_rir(track, self._sample_rir(rng))
                 for role, track in tracks.items()
             }
         return {
-            role: track * self._sample_gain_drift(track.numel(), rng)
+            role: track * self._sample_temporal_drift(track.numel(), rng)
             for role, track in tracks.items()
         }
 
@@ -851,13 +1145,18 @@ class ClipRenderer:
             return add_noise_at_snr(mixture, noise, noise_snr_db)
         return add_gaussian_noise(mixture, noise_snr_db)
 
-    def _sample_gain_drift(
+    def _sample_global_gain(self, rng: random.Random) -> float:
+        lo_db, hi_db = self.composer.global_gain_range_db
+        gain_db = rng.uniform(lo_db, hi_db)
+        return 10.0 ** (gain_db / 20.0)
+
+    def _sample_temporal_drift(
         self,
         n_samples: int,
         rng: random.Random,
     ) -> torch.Tensor:
         lo_db, hi_db = self.composer.gain_drift_db_range
-        if lo_db == 0.0 and hi_db == 0.0:
+        if n_samples <= 0 or (lo_db == 0.0 and hi_db == 0.0):
             return torch.ones(n_samples, dtype=torch.float32)
         amplitude_db = rng.uniform(lo_db, hi_db)
         phase = rng.uniform(0.0, 2.0 * math.pi)

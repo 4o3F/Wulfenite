@@ -19,6 +19,7 @@ from wulfenite.training.train import (
     build_dataset,
     build_loss,
     build_optimizer,
+    compute_checkpoint_score,
     compute_enrollment_shuffle_sdr_drop,
     effective_transition_prob,
     run_training,
@@ -404,6 +405,46 @@ def test_build_optimizer_uses_three_param_groups() -> None:
         cfg.learning_rate * cfg.speaker_modulation_lr_scale
     )
     assert optimizer.param_groups[2]["lr"] == pytest.approx(cfg.learning_rate)
+
+
+def test_build_dataset_clip_composer_requires_three_speakers_per_split(
+    tmp_path: Path,
+) -> None:
+    aishell_root = _build_aishell1_tree(
+        tmp_path / "aishell1_clip_small",
+        num_speakers=5,
+        utts_per_speaker=3,
+        seconds=2.0,
+    )
+    cfg = TrainingConfig(
+        aishell1_root=aishell_root,
+        composition_mode="clip_composer",
+        samples_per_epoch=4,
+        val_samples=2,
+        num_workers=0,
+        device="cpu",
+    )
+
+    with pytest.raises(RuntimeError, match="at least 6 speakers"):
+        build_dataset(cfg)
+
+
+def test_compute_checkpoint_score_ignores_wrong_enrollment_metric() -> None:
+    cfg = TrainingConfig()
+    metrics = {
+        "sdri_db": 5.0,
+        "other_only_energy_true": 0.2,
+        "wrong_enrollment_leakage": 0.1,
+        "overlap_energy_wrong": 0.3,
+    }
+    shifted = {
+        **metrics,
+        "wrong_enrollment_leakage": 0.9,
+    }
+
+    assert compute_checkpoint_score(metrics, cfg) == pytest.approx(
+        compute_checkpoint_score(shifted, cfg)
+    )
 
 
 def test_build_loss_matches_config_weights() -> None:

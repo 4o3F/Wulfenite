@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,28 +24,40 @@ class TrainingConfig:
     enrollment_seconds: float = 4.0
     snr_range_db: tuple[float, float] = (-5.0, 5.0)
     composition_mode: str = "clip_composer"
-    family_multiturn_weight: float = 0.60
-    family_overlap_heavy_weight: float = 0.25
-    family_hard_negative_weight: float = 0.15
-    min_events: int = 4
-    max_events: int = 8
-    min_event_seconds: float = 0.30
-    max_event_seconds: float = 1.20
     crossfade_ms: float = 5.0
     optional_third_speaker_prob: float = 0.35
     gain_drift_db_range: tuple[float, float] = (-1.5, 1.5)
+    global_gain_range_db: tuple[float, float] = (-9.0, 9.0)
     scene_target_only_min_seconds: float = 0.8
     scene_nontarget_only_min_seconds: float = 0.8
     scene_overlap_min_seconds: float = 0.4
     scene_background_min_seconds: float = 0.3
     scene_absence_before_return_min_seconds: float = 1.0
+    overlap_density_weights: dict[str, float] = field(
+        default_factory=lambda: {
+            "sparse": 0.20,
+            "medium": 0.55,
+            "dense": 0.25,
+        }
+    )
+    overlap_ratio_ranges: dict[str, tuple[float, float]] = field(
+        default_factory=lambda: {
+            "sparse": (0.15, 0.25),
+            "medium": (0.25, 0.40),
+            "dense": (0.40, 0.55),
+        }
+    )
+    overlap_snr_center_range_db: tuple[float, float] = (-2.0, 4.0)
+    overlap_snr_tail_range_db: tuple[float, float] = (-6.0, 8.0)
+    overlap_snr_center_prob: float = 0.7
     target_present_prob: float = 0.85
+    outsider_view_prob: float = 0.15
     transition_prob: float = 0.0
     transition_warmup_ratio: float = 0.0
     transition_ramp_ratio: float = 0.0
     transition_min_fraction: float = 0.25
     transition_min_target_rms: float = 0.01
-    noise_snr_range_db: tuple[float, float] = (10.0, 25.0)
+    noise_snr_range_db: tuple[float, float] = (0.0, 25.0)
     noise_prob: float = 0.80
     reverb_prob: float = 0.85
     rir_pool_size: int = 1000
@@ -95,7 +108,6 @@ class TrainingConfig:
     overlap_margin: float = 0.02
     overlap_dominance_margin: float = 0.02
     checkpoint_other_only_alpha: float = 4.0
-    checkpoint_wrong_enrollment_beta: float = 2.0
     checkpoint_overlap_wrong_gamma: float = 1.5
 
     # --- DataLoader ---
@@ -118,15 +130,15 @@ class TrainingConfig:
                 "composition_mode must be 'clip_composer' or 'legacy_branch'; got "
                 f"{self.composition_mode!r}"
             )
-        if self.min_events <= 0 or self.max_events < self.min_events:
-            raise ValueError(
-                f"event bounds must satisfy 0 < min <= max; got "
-                f"{self.min_events}, {self.max_events}"
-            )
-        if self.min_event_seconds <= 0.0 or self.max_event_seconds < self.min_event_seconds:
-            raise ValueError(
-                "event duration bounds must satisfy 0 < min <= max; got "
-                f"{self.min_event_seconds}, {self.max_event_seconds}"
+        if (
+            self.composition_mode == "clip_composer"
+            and tuple(self.snr_range_db) != (-5.0, 5.0)
+        ):
+            warnings.warn(
+                "snr_range_db is ignored in clip_composer mode; use "
+                "overlap_snr_center_range_db / overlap_snr_tail_range_db instead",
+                UserWarning,
+                stacklevel=2,
             )
         for name, value in (
             ("scene_target_only_min_seconds", self.scene_target_only_min_seconds),
@@ -161,6 +173,16 @@ class TrainingConfig:
             raise ValueError(
                 "transition_warmup_ratio + transition_ramp_ratio must be <= 1.0; "
                 f"got {self.transition_warmup_ratio + self.transition_ramp_ratio}"
+            )
+        if not 0.0 <= self.outsider_view_prob <= 1.0:
+            raise ValueError(
+                "outsider_view_prob must be in [0, 1]; got "
+                f"{self.outsider_view_prob}"
+            )
+        if not 0.0 <= self.overlap_snr_center_prob <= 1.0:
+            raise ValueError(
+                "overlap_snr_center_prob must be in [0, 1]; got "
+                f"{self.overlap_snr_center_prob}"
             )
         if not 0.0 < self.inactive_topk_fraction <= 1.0:
             raise ValueError(

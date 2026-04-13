@@ -44,21 +44,30 @@ def _split_speakers_for_val(
     speakers: dict[str, list],
     val_ratio: float = 0.2,
     seed: int = 1234,
+    *,
+    min_speakers_per_split: int = 2,
 ) -> tuple[dict[str, list], dict[str, list]]:
     """Split speakers into reproducible train/val subsets."""
     speaker_ids = sorted(speakers.keys())
-    if len(speaker_ids) < 4:
+    min_total_speakers = 2 * min_speakers_per_split
+    if len(speaker_ids) < min_total_speakers:
         raise RuntimeError(
-            "Need at least 4 speakers to make speaker-disjoint train/val splits."
+            "Need at least "
+            f"{min_total_speakers} speakers to make speaker-disjoint train/val "
+            f"splits with at least {min_speakers_per_split} speakers per split."
         )
 
     rng = random.Random(seed)
     rng.shuffle(speaker_ids)
-    n_val = max(2, int(len(speaker_ids) * val_ratio))
-    n_val = min(n_val, len(speaker_ids) - 2)
-    if n_val < 2 or len(speaker_ids) - n_val < 2:
+    n_val = max(min_speakers_per_split, int(len(speaker_ids) * val_ratio))
+    n_val = min(n_val, len(speaker_ids) - min_speakers_per_split)
+    if (
+        n_val < min_speakers_per_split
+        or len(speaker_ids) - n_val < min_speakers_per_split
+    ):
         raise RuntimeError(
-            "Speaker-disjoint split must leave at least 2 speakers in each split."
+            "Speaker-disjoint split must leave at least "
+            f"{min_speakers_per_split} speakers in each split."
         )
 
     val_ids = set(speaker_ids[:n_val])
@@ -111,6 +120,7 @@ def build_dataset(cfg: TrainingConfig) -> tuple[WulfeniteMixer, WulfeniteMixer]:
         speakers,
         val_ratio=cfg.val_speaker_ratio,
         seed=cfg.seed,
+        min_speakers_per_split=3 if cfg.composition_mode == "clip_composer" else 2,
     )
 
     noise_pool = None
@@ -137,8 +147,17 @@ def build_dataset(cfg: TrainingConfig) -> tuple[WulfeniteMixer, WulfeniteMixer]:
             crossfade_samples=max(0, int(round(cfg.crossfade_ms * 16))),
             optional_third_speaker_prob=cfg.optional_third_speaker_prob,
             gain_drift_db_range=tuple(cfg.gain_drift_db_range),
+            global_gain_range_db=tuple(cfg.global_gain_range_db),
             snr_range_db=tuple(cfg.snr_range_db),
             noise_snr_range_db=tuple(cfg.noise_snr_range_db),
+            overlap_density_weights=dict(cfg.overlap_density_weights),
+            overlap_ratio_ranges={
+                density: tuple(bounds)
+                for density, bounds in cfg.overlap_ratio_ranges.items()
+            },
+            overlap_snr_center_range_db=tuple(cfg.overlap_snr_center_range_db),
+            overlap_snr_tail_range_db=tuple(cfg.overlap_snr_tail_range_db),
+            overlap_snr_center_prob=cfg.overlap_snr_center_prob,
         )
     else:
         composer_cfg = ComposerConfig()
@@ -150,6 +169,7 @@ def build_dataset(cfg: TrainingConfig) -> tuple[WulfeniteMixer, WulfeniteMixer]:
         composition_mode=cfg.composition_mode,
         composer=composer_cfg,
         target_present_prob=cfg.target_present_prob,
+        outsider_view_prob=cfg.outsider_view_prob,
         transition_prob=cfg.transition_prob,
         transition_min_fraction=cfg.transition_min_fraction,
         transition_min_target_rms=cfg.transition_min_target_rms,
@@ -306,8 +326,6 @@ def compute_checkpoint_score(
     return (
         metrics["sdri_db"]
         - cfg.checkpoint_other_only_alpha * metrics.get("other_only_energy_true", 0.0)
-        - cfg.checkpoint_wrong_enrollment_beta
-        * metrics.get("wrong_enrollment_leakage", 0.0)
         - cfg.checkpoint_overlap_wrong_gamma
         * metrics.get("overlap_energy_wrong", 0.0)
     )
@@ -958,17 +976,13 @@ def _parse_args() -> TrainingConfig:
         choices=("clip_composer", "legacy_branch"),
         default="clip_composer",
     )
-    parser.add_argument("--family-multiturn-weight", type=float, default=0.60)
-    parser.add_argument("--family-overlap-heavy-weight", type=float, default=0.25)
-    parser.add_argument("--family-hard-negative-weight", type=float, default=0.15)
-    parser.add_argument("--min-events", type=int, default=4)
-    parser.add_argument("--max-events", type=int, default=8)
-    parser.add_argument("--min-event-seconds", type=float, default=0.30)
-    parser.add_argument("--max-event-seconds", type=float, default=1.20)
     parser.add_argument("--crossfade-ms", type=float, default=5.0)
     parser.add_argument("--optional-third-speaker-prob", type=float, default=0.35)
     parser.add_argument(
         "--gain-drift-db-range", type=float, nargs=2, default=(-1.5, 1.5),
+    )
+    parser.add_argument(
+        "--global-gain-range-db", type=float, nargs=2, default=(-9.0, 9.0),
     )
     parser.add_argument("--scene-target-only-min-seconds", type=float, default=0.8)
     parser.add_argument("--scene-nontarget-only-min-seconds", type=float, default=0.8)
@@ -977,13 +991,37 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument(
         "--scene-absence-before-return-min-seconds", type=float, default=1.0,
     )
+    parser.add_argument(
+        "--overlap-density-weights",
+        type=float,
+        nargs=3,
+        metavar=("SPARSE", "MEDIUM", "DENSE"),
+        default=(0.20, 0.55, 0.25),
+    )
+    parser.add_argument(
+        "--overlap-ratio-sparse", type=float, nargs=2, default=(0.15, 0.25),
+    )
+    parser.add_argument(
+        "--overlap-ratio-medium", type=float, nargs=2, default=(0.25, 0.40),
+    )
+    parser.add_argument(
+        "--overlap-ratio-dense", type=float, nargs=2, default=(0.40, 0.55),
+    )
+    parser.add_argument(
+        "--overlap-snr-center-range-db", type=float, nargs=2, default=(-2.0, 4.0),
+    )
+    parser.add_argument(
+        "--overlap-snr-tail-range-db", type=float, nargs=2, default=(-6.0, 8.0),
+    )
+    parser.add_argument("--overlap-snr-center-prob", type=float, default=0.7)
     parser.add_argument("--target-present-prob", type=float, default=0.85)
+    parser.add_argument("--outsider-view-prob", type=float, default=0.15)
     parser.add_argument("--transition-prob", type=float, default=0.0)
     parser.add_argument("--transition-warmup-ratio", type=float, default=0.0)
     parser.add_argument("--transition-ramp-ratio", type=float, default=0.0)
     parser.add_argument("--transition-min-fraction", type=float, default=0.25)
     parser.add_argument("--transition-min-target-rms", type=float, default=0.01)
-    parser.add_argument("--noise-snr-range-db", type=float, nargs=2, default=(10.0, 25.0))
+    parser.add_argument("--noise-snr-range-db", type=float, nargs=2, default=(0.0, 25.0))
     parser.add_argument("--noise-prob", type=float, default=0.80)
     parser.add_argument("--reverb-prob", type=float, default=0.85)
     parser.add_argument("--rir-pool-size", type=int, default=1000)
@@ -1038,9 +1076,6 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--overlap-margin", type=float, default=0.02)
     parser.add_argument("--overlap-dominance-margin", type=float, default=0.02)
     parser.add_argument("--checkpoint-other-only-alpha", type=float, default=4.0)
-    parser.add_argument(
-        "--checkpoint-wrong-enrollment-beta", type=float, default=2.0,
-    )
     parser.add_argument("--checkpoint-overlap-wrong-gamma", type=float, default=1.5)
 
     parser.add_argument("--num-workers", type=int, default=8)
@@ -1066,16 +1101,10 @@ def _parse_args() -> TrainingConfig:
         enrollment_seconds=args.enrollment_seconds,
         snr_range_db=tuple(args.snr_range_db),
         composition_mode=args.composition_mode,
-        family_multiturn_weight=args.family_multiturn_weight,
-        family_overlap_heavy_weight=args.family_overlap_heavy_weight,
-        family_hard_negative_weight=args.family_hard_negative_weight,
-        min_events=args.min_events,
-        max_events=args.max_events,
-        min_event_seconds=args.min_event_seconds,
-        max_event_seconds=args.max_event_seconds,
         crossfade_ms=args.crossfade_ms,
         optional_third_speaker_prob=args.optional_third_speaker_prob,
         gain_drift_db_range=tuple(args.gain_drift_db_range),
+        global_gain_range_db=tuple(args.global_gain_range_db),
         scene_target_only_min_seconds=args.scene_target_only_min_seconds,
         scene_nontarget_only_min_seconds=args.scene_nontarget_only_min_seconds,
         scene_overlap_min_seconds=args.scene_overlap_min_seconds,
@@ -1083,7 +1112,21 @@ def _parse_args() -> TrainingConfig:
         scene_absence_before_return_min_seconds=(
             args.scene_absence_before_return_min_seconds
         ),
+        overlap_density_weights={
+            "sparse": args.overlap_density_weights[0],
+            "medium": args.overlap_density_weights[1],
+            "dense": args.overlap_density_weights[2],
+        },
+        overlap_ratio_ranges={
+            "sparse": tuple(args.overlap_ratio_sparse),
+            "medium": tuple(args.overlap_ratio_medium),
+            "dense": tuple(args.overlap_ratio_dense),
+        },
+        overlap_snr_center_range_db=tuple(args.overlap_snr_center_range_db),
+        overlap_snr_tail_range_db=tuple(args.overlap_snr_tail_range_db),
+        overlap_snr_center_prob=args.overlap_snr_center_prob,
         target_present_prob=args.target_present_prob,
+        outsider_view_prob=args.outsider_view_prob,
         transition_prob=args.transition_prob,
         transition_warmup_ratio=args.transition_warmup_ratio,
         transition_ramp_ratio=args.transition_ramp_ratio,
@@ -1134,7 +1177,6 @@ def _parse_args() -> TrainingConfig:
         overlap_margin=args.overlap_margin,
         overlap_dominance_margin=args.overlap_dominance_margin,
         checkpoint_other_only_alpha=args.checkpoint_other_only_alpha,
-        checkpoint_wrong_enrollment_beta=args.checkpoint_wrong_enrollment_beta,
         checkpoint_overlap_wrong_gamma=args.checkpoint_overlap_wrong_gamma,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
