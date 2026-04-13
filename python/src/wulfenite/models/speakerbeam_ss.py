@@ -168,12 +168,16 @@ class S4DBlock(nn.Module):
         self,
         x_new: torch.Tensor,
         state: torch.Tensor,
+        *,
+        s4d_state_decay: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         residual_1 = x_new
         y = self.norm_1(x_new)
         outputs = []
         cur_state = state
         for t in range(y.size(-1)):
+            if s4d_state_decay < 1.0:
+                cur_state = cur_state * s4d_state_decay
             y_t, cur_state = self.s4d.forward_step(y[..., t], cur_state)
             outputs.append(y_t)
         y = torch.stack(outputs, dim=-1)
@@ -234,10 +238,16 @@ class ConvS4DSubBlock(nn.Module):
         self,
         x_new: torch.Tensor,
         state: tuple[torch.Tensor, torch.Tensor],
+        *,
+        s4d_state_decay: float = 1.0,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         conv_state, s4d_state = state
         y, new_conv_state = self.conv.forward_step(x_new, conv_state)
-        y, new_s4d_state = self.s4d.forward_step(y, s4d_state)
+        y, new_s4d_state = self.s4d.forward_step(
+            y,
+            s4d_state,
+            s4d_state_decay=s4d_state_decay,
+        )
         return y, (new_conv_state, new_s4d_state)
 
     def reset_s4d_state(
@@ -481,10 +491,11 @@ class SpeakerBeamSS(nn.Module):
         pre_count = len(self.pre_fusion_blocks)
         block_states = state["block_states"]
         for idx, block in enumerate(self.pre_fusion_blocks):
-            feat, new_state = block.forward_step(feat, block_states[idx])
-            if s4d_state_decay < 1.0:
-                conv_state, s4d_state = new_state
-                new_state = (conv_state, s4d_state * s4d_state_decay)
+            feat, new_state = block.forward_step(
+                feat,
+                block_states[idx],
+                s4d_state_decay=s4d_state_decay,
+            )
             new_block_states.append(new_state)
 
         feat = self._apply_speaker_modulation(feat, speaker_embedding)
@@ -493,10 +504,8 @@ class SpeakerBeamSS(nn.Module):
             feat, new_state = block.forward_step(
                 feat,
                 block_states[pre_count + idx],
+                s4d_state_decay=s4d_state_decay,
             )
-            if s4d_state_decay < 1.0:
-                conv_state, s4d_state = new_state
-                new_state = (conv_state, s4d_state * s4d_state_decay)
             new_block_states.append(new_state)
 
         mask = self.mask_head(feat)

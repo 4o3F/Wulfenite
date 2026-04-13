@@ -270,9 +270,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-mask", action="store_true",
                         help="Print per-chunk mask statistics for diagnostics.")
     parser.add_argument("--s4d-decay", type=float, default=1.0,
-                        help="Per-step decay factor for S4D recurrent state "
-                             "(1.0 = paper-aligned / no decay; values < 1.0 "
-                             "enable the repo's optional decay heuristic)")
+                        help="Per-latent-step decay factor for S4D recurrent "
+                             "state (one latent step = 10 ms at the default "
+                             "encoder stride). 1.0 = paper-aligned / no "
+                             "decay; values < 1.0 enable the repo's optional "
+                             "decay heuristic.")
     parser.add_argument("--s4d-reset-seconds", type=float, default=None,
                         help="Reset only the S4D recurrent state at this "
                              "interval in seconds. Encoder, TCN, and decoder "

@@ -134,6 +134,38 @@ def test_streaming_s4d_decay_bounds_state() -> None:
     assert decay_norms_t.max() < no_decay_norms_t.max()
 
 
+def test_streaming_s4d_decay_is_chunk_size_invariant() -> None:
+    torch.manual_seed(4)
+    cfg = _small_config()
+    model = SpeakerBeamSS(cfg).eval()
+
+    batch = 2
+    total_samples = 16 * cfg.enc_stride
+    mixture = torch.randn(batch, total_samples)
+    embedding = torch.nn.functional.normalize(
+        torch.randn(batch, cfg.speaker_embed_dim), p=2, dim=-1,
+    )
+
+    outputs = []
+    state_norms = []
+    with torch.no_grad():
+        for chunk_size in (cfg.enc_stride, 4 * cfg.enc_stride):
+            state = model.initial_streaming_state(batch_size=batch)
+            pieces = []
+            for start in range(0, total_samples, chunk_size):
+                chunk = mixture[..., start:start + chunk_size]
+                y, state = model.streaming_step(
+                    chunk, embedding, state, s4d_state_decay=0.99,
+                )
+                pieces.append(y)
+            outputs.append(torch.cat(pieces, dim=-1))
+            state_norms.append(_s4d_state_norm(model, state))
+
+    diff = (outputs[0] - outputs[1]).abs().max().item()
+    assert diff < 1e-5
+    assert abs(state_norms[0] - state_norms[1]) < 1e-5
+
+
 def test_streaming_s4d_decay_default_matches_explicit() -> None:
     """Default s4d_state_decay=1.0 matches passing it explicitly."""
     torch.manual_seed(3)
