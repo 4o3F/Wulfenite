@@ -76,7 +76,12 @@ class TrainingConfig:
     plateau_factor: float = 0.5
     early_stopping_patience: int = 20
     grad_clip: float = 5.0
-    absent_warmup_epochs: int = 10
+    absent_warmup_epochs: int = 15
+    inactive_warmup_epochs: int = 15
+    route_warmup_epochs: int = 20
+    overlap_route_warmup_epochs: int = 20
+    ae_warmup_epochs: int = 2
+    separator_frontend_lr_scale: float = 0.5
 
     # --- Separator architecture ---
     enc_channels: int = 2048
@@ -89,16 +94,18 @@ class TrainingConfig:
     s4d_state_dim: int = 32
     s4d_ffn_multiplier: int = 4
     target_presence_head: bool = False
+    mask_activation: str = "scaled_sigmoid"
 
-    # --- Loss weights (matches LossWeights defaults) ---
+    # --- Loss weights ---
     loss_sdr: float = 1.0
     loss_mr_stft: float = 1.0
-    loss_absent: float = 0.5
+    loss_absent: float = 0.15
     loss_presence: float = 0.1
-    loss_recall: float = 0.0
-    loss_inactive: float = 0.25
-    loss_route: float = 0.5
-    loss_overlap_route: float = 0.25
+    loss_recall: float = 0.20
+    loss_inactive: float = 0.05
+    loss_route: float = 0.15
+    loss_overlap_route: float = 0.05
+    loss_ae: float = 0.10
     recall_floor: float = 0.3
     recall_frame_size: int = 320
     inactive_threshold: float = 0.05

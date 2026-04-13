@@ -196,7 +196,8 @@ def run_streaming(
     clean = clean[:original_len]
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(output), clean, SAMPLE_RATE)
+    # Use FLOAT subtype to avoid PCM_16 hard-clipping values outside [-1, 1].
+    sf.write(str(output), clean, SAMPLE_RATE, subtype="FLOAT")
 
     # --- Metrics ---
     lat = torch.tensor(latencies_ms)

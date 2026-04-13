@@ -219,3 +219,90 @@ def test_speaker_modulation_helper_is_noop_at_init() -> None:
 
     diff = (actual - feat).abs().max().item()
     assert diff < 1e-6
+
+
+def test_scaled_sigmoid_mask_range() -> None:
+    """Mask values from scaled_sigmoid must be in [0, 2]."""
+    torch.manual_seed(10)
+    cfg = _small_config()
+    cfg.mask_activation = "scaled_sigmoid"
+    model = SpeakerBeamSS(cfg).eval()
+
+    batch = 2
+    t = 8 * cfg.enc_stride
+    mixture = torch.randn(batch, t)
+    embedding = torch.nn.functional.normalize(
+        torch.randn(batch, cfg.speaker_embed_dim), p=2, dim=-1,
+    )
+
+    with torch.no_grad():
+        outputs = model(mixture, embedding)
+
+    mask = outputs["mask"]
+    assert mask.min() >= 0.0
+    assert mask.max() <= 2.0 + 1e-6
+
+
+def test_return_training_aux_produces_ae_reconstruction() -> None:
+    """return_training_aux=True must add ae_reconstruction key."""
+    torch.manual_seed(11)
+    cfg = _small_config()
+    model = SpeakerBeamSS(cfg).eval()
+
+    batch = 2
+    t = 8 * cfg.enc_stride
+    mixture = torch.randn(batch, t)
+    embedding = torch.nn.functional.normalize(
+        torch.randn(batch, cfg.speaker_embed_dim), p=2, dim=-1,
+    )
+
+    with torch.no_grad():
+        without = model(mixture, embedding, return_training_aux=False)
+        with_aux = model(mixture, embedding, return_training_aux=True)
+
+    assert "ae_reconstruction" not in without
+    assert "ae_reconstruction" in with_aux
+    assert with_aux["ae_reconstruction"].shape == mixture.shape
+
+
+def test_streaming_equivalence_scaled_sigmoid() -> None:
+    """Whole-vs-streaming must agree with scaled_sigmoid mask."""
+    torch.manual_seed(12)
+    cfg = _small_config()
+    cfg.mask_activation = "scaled_sigmoid"
+    model = SpeakerBeamSS(cfg).eval()
+
+    batch = 1
+    stride = cfg.enc_stride
+    t = 8 * stride
+    mixture = torch.randn(batch, t)
+    embedding = torch.nn.functional.normalize(
+        torch.randn(batch, cfg.speaker_embed_dim), p=2, dim=-1,
+    )
+
+    with torch.no_grad():
+        out_whole = model(mixture, embedding)["clean"]
+        state = model.initial_streaming_state(batch_size=batch)
+        pieces = []
+        for start in range(0, t, stride):
+            chunk = mixture[..., start:start + stride]
+            y, state = model.streaming_step(
+                chunk, embedding, state, s4d_state_decay=1.0,
+            )
+            pieces.append(y)
+        out_stream = torch.cat(pieces, dim=-1)
+
+    diff = (out_stream - out_whole).abs().max().item()
+    assert diff < 1e-4
+
+
+def test_invalid_mask_activation_raises() -> None:
+    """Invalid mask_activation should raise ValueError."""
+    cfg = _small_config()
+    cfg.mask_activation = "softplus"
+    model = SpeakerBeamSS(cfg)
+    logits = torch.randn(1, cfg.enc_channels, 4)
+
+    import pytest
+    with pytest.raises(ValueError, match="unsupported mask_activation"):
+        model._apply_mask_activation(logits)

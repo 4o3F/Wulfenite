@@ -30,6 +30,7 @@ def _rebuild_separator_config(
         "conv_blocks_per_repeat": "conv_blocks_per_repeat",
         "s4d_ffn_multiplier": "s4d_ffn_multiplier",
         "target_presence_head": "target_presence_head",
+        "mask_activation": "mask_activation",
     }
     for ck_key, cfg_key in field_map.items():
         if ck_key in checkpoint_config:

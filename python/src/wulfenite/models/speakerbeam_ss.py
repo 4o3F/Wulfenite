@@ -58,6 +58,11 @@ class SpeakerBeamSSConfig:
     s4d_state_dim: int = 32
     s4d_ffn_multiplier: int = 4
 
+    # Mask activation: "relu" (Conv-TasNet default) or "scaled_sigmoid"
+    # (bounded [0, 2], no dead zone). Default "relu" for legacy checkpoint
+    # compatibility; new training should use "scaled_sigmoid".
+    mask_activation: str = "relu"
+
     # Repo extension kept optional for experimentation; disabled by default
     # because it is not part of the paper architecture.
     target_presence_head: bool = False
@@ -308,10 +313,7 @@ class SpeakerBeamSS(nn.Module):
             self.speaker_projection.weight.zero_()
             self.speaker_projection.bias.fill_(1.0)
 
-        self.mask_head = nn.Sequential(
-            nn.Conv1d(cfg.bottleneck_channels, cfg.enc_channels, 1),
-            nn.ReLU(),
-        )
+        self.mask_head = nn.Conv1d(cfg.bottleneck_channels, cfg.enc_channels, 1)
 
         self.presence_head: nn.Module | None
         if cfg.target_presence_head:
@@ -343,6 +345,20 @@ class SpeakerBeamSS(nn.Module):
     def _all_blocks(self) -> tuple[ConvS4DSubBlock, ...]:
         return tuple(self.pre_fusion_blocks) + tuple(self.post_fusion_blocks)
 
+    _VALID_MASK_ACTIVATIONS = frozenset({"relu", "scaled_sigmoid"})
+
+    def _apply_mask_activation(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply the configured mask activation to raw mask logits."""
+        act = self.config.mask_activation
+        if act == "scaled_sigmoid":
+            return 2.0 * torch.sigmoid(logits)
+        if act == "relu":
+            return torch.relu(logits)
+        raise ValueError(
+            f"unsupported mask_activation {act!r}; "
+            f"expected one of {sorted(self._VALID_MASK_ACTIVATIONS)}"
+        )
+
     def _apply_speaker_modulation(
         self,
         feat: torch.Tensor,
@@ -364,6 +380,8 @@ class SpeakerBeamSS(nn.Module):
         self,
         mixture: torch.Tensor,
         speaker_embedding: torch.Tensor,
+        *,
+        return_training_aux: bool = False,
     ) -> dict[str, torch.Tensor]:
         if mixture.dim() != 2:
             raise ValueError(
@@ -385,7 +403,7 @@ class SpeakerBeamSS(nn.Module):
         for block in self.post_fusion_blocks:
             feat = block(feat)
 
-        mask = self.mask_head(feat)
+        mask = self._apply_mask_activation(self.mask_head(feat))
         masked = enc * mask
         clean = self.decoder(masked).squeeze(1)
         clean = clean[..., :total_samples]
@@ -394,6 +412,10 @@ class SpeakerBeamSS(nn.Module):
             "clean": clean,
             "mask": mask,
         }
+        if return_training_aux:
+            outputs["ae_reconstruction"] = (
+                self.decoder(enc).squeeze(1)[..., :total_samples]
+            )
         if self.presence_head is not None:
             pooled = feat.mean(dim=-1)
             outputs["presence_logit"] = self.presence_head(pooled).squeeze(-1)
@@ -508,7 +530,7 @@ class SpeakerBeamSS(nn.Module):
             )
             new_block_states.append(new_state)
 
-        mask = self.mask_head(feat)
+        mask = self._apply_mask_activation(self.mask_head(feat))
         masked = enc * mask
 
         decoded = self.decoder(masked)

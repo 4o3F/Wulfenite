@@ -585,3 +585,61 @@ def test_scene_routing_stats_penalize_swapped_outputs() -> None:
     assert float(stats["target_only_energy_wrong"].item()) > float(
         stats["target_only_energy_true"].item()
     )
+
+
+# ---------------------------------------------------------------------------
+# AE reconstruction loss
+# ---------------------------------------------------------------------------
+
+
+def test_ae_loss_perfect_reconstruction_is_zero() -> None:
+    torch.manual_seed(20)
+    mixture = torch.randn(2, 8000)
+    target = torch.randn(2, 8000)
+    clean = target.clone()
+    target_present = torch.ones(2)
+
+    loss_fn = WulfeniteLoss(weights=LossWeights(ae=1.0, sdr=0.0, mr_stft=0.0))
+    total, parts = loss_fn(
+        clean=clean,
+        target=target,
+        mixture=mixture,
+        target_present=target_present,
+        ae_reconstruction=mixture,  # perfect reconstruction
+    )
+    assert parts.ae < 1e-6
+
+
+def test_ae_loss_zero_reconstruction_matches_mixture_mean() -> None:
+    torch.manual_seed(21)
+    mixture = torch.randn(2, 8000)
+    target = torch.randn(2, 8000)
+    clean = target.clone()
+    target_present = torch.ones(2)
+
+    loss_fn = WulfeniteLoss(weights=LossWeights(ae=1.0, sdr=0.0, mr_stft=0.0))
+    total, parts = loss_fn(
+        clean=clean,
+        target=target,
+        mixture=mixture,
+        target_present=target_present,
+        ae_reconstruction=torch.zeros_like(mixture),
+    )
+    expected = mixture.abs().mean().item()
+    assert abs(parts.ae - expected) < 1e-5
+
+
+def test_ae_loss_raises_when_missing() -> None:
+    mixture = torch.randn(2, 8000)
+    target = torch.randn(2, 8000)
+    clean = target.clone()
+    target_present = torch.ones(2)
+
+    loss_fn = WulfeniteLoss(weights=LossWeights(ae=1.0, sdr=0.0, mr_stft=0.0))
+    with pytest.raises(ValueError, match="ae_reconstruction is required"):
+        loss_fn(
+            clean=clean,
+            target=target,
+            mixture=mixture,
+            target_present=target_present,
+        )

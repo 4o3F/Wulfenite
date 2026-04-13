@@ -92,7 +92,8 @@ def run_whole(
 
     clean = outputs["clean"][0].cpu().numpy()
     output.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(output), clean, SAMPLE_RATE)
+    # Use FLOAT subtype to avoid PCM_16 hard-clipping values outside [-1, 1].
+    sf.write(str(output), clean, SAMPLE_RATE, subtype="FLOAT")
 
     duration = mix_wav.shape[-1] / SAMPLE_RATE
     peak = float(abs(clean).max())

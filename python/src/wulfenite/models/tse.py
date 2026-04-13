@@ -60,17 +60,24 @@ class WulfeniteTSE(nn.Module):
         self,
         mixture: torch.Tensor,
         speaker_embedding: torch.Tensor,
+        *,
+        return_training_aux: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Run the separator with a pre-computed embedding."""
         if speaker_embedding.size(0) == 1 and mixture.size(0) > 1:
             speaker_embedding = speaker_embedding.expand(mixture.size(0), -1)
-        return self.separator(mixture, speaker_embedding)
+        return self.separator(
+            mixture, speaker_embedding,
+            return_training_aux=return_training_aux,
+        )
 
     def forward(
         self,
         mixture: torch.Tensor,
         enrollment: torch.Tensor,
         enrollment_fbank: torch.Tensor | None = None,
+        *,
+        return_training_aux: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Compute speaker embedding on the fly and run separation."""
         if enrollment.dim() == 1:
@@ -85,7 +92,10 @@ class WulfeniteTSE(nn.Module):
         if norm_emb.size(0) == 1 and mixture.size(0) > 1:
             raw_emb = raw_emb.expand(mixture.size(0), -1)
             norm_emb = norm_emb.expand(mixture.size(0), -1)
-        out = self.separate(mixture, norm_emb)
+        out = self.separate(
+            mixture, norm_emb,
+            return_training_aux=return_training_aux,
+        )
         out["embedding"] = norm_emb
         out["raw_embedding"] = raw_emb
         return out

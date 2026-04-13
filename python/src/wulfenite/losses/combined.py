@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from .inactive import target_inactive_loss
@@ -31,6 +32,7 @@ class LossWeights:
     inactive: float = 0.25
     route: float = 0.5
     overlap_route: float = 0.25
+    ae: float = 0.0
 
 
 @dataclass
@@ -46,6 +48,7 @@ class LossParts:
     presence: float
     route: float
     overlap_route: float
+    ae: float
     n_present: int
     n_absent: int
     n_route_pairs: int
@@ -264,6 +267,7 @@ class WulfeniteLoss(nn.Module):
         background_frames: torch.Tensor | None = None,
         scene_id: torch.Tensor | None = None,
         view_role_id: torch.Tensor | None = None,
+        ae_reconstruction: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, LossParts]:
         """Compute the full training loss."""
         if clean.shape != target.shape or clean.shape != mixture.shape:
@@ -354,6 +358,14 @@ class WulfeniteLoss(nn.Module):
         l_route = routing_stats["route_loss"]
         l_overlap_route = routing_stats["overlap_route_loss"]
 
+        l_ae = zero
+        if self.weights.ae > 0.0:
+            if ae_reconstruction is None:
+                raise ValueError(
+                    "ae_reconstruction is required when loss weight ae > 0"
+                )
+            l_ae = F.l1_loss(ae_reconstruction, mixture)
+
         w = self.weights
         total = (
             w.sdr * l_sdr
@@ -364,6 +376,7 @@ class WulfeniteLoss(nn.Module):
             + w.presence * l_presence
             + w.route * l_route
             + w.overlap_route * l_overlap_route
+            + w.ae * l_ae
         )
 
         parts = LossParts(
@@ -376,6 +389,7 @@ class WulfeniteLoss(nn.Module):
             presence=float(l_presence.detach()),
             route=float(l_route.detach()),
             overlap_route=float(l_overlap_route.detach()),
+            ae=float(l_ae.detach()),
             n_present=n_present,
             n_absent=n_absent,
             n_route_pairs=int(routing_stats["n_pairs"].item()),

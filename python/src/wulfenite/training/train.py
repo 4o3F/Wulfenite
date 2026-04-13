@@ -76,6 +76,13 @@ def _split_speakers_for_val(
     return train_speakers, val_speakers
 
 
+def _warmup_weight(base: float, epoch: int, warmup_epochs: int) -> float:
+    """Linearly ramp a loss weight from 0 to *base* over *warmup_epochs*."""
+    if base <= 0.0 or warmup_epochs <= 0:
+        return base
+    return base * min(1.0, epoch / warmup_epochs)
+
+
 def effective_transition_prob(epoch_idx: int, cfg: TrainingConfig) -> float:
     """Curriculum-adjusted transition probability for a zero-based epoch."""
     if cfg.transition_prob <= 0.0:
@@ -213,6 +220,7 @@ def build_model(cfg: TrainingConfig) -> WulfeniteTSE:
         s4d_state_dim=cfg.s4d_state_dim,
         s4d_ffn_multiplier=cfg.s4d_ffn_multiplier,
         target_presence_head=cfg.target_presence_head,
+        mask_activation=cfg.mask_activation,
     )
     return WulfeniteTSE.from_campplus(
         cfg.campplus_checkpoint,
@@ -231,6 +239,7 @@ def build_loss(cfg: TrainingConfig) -> WulfeniteLoss:
             inactive=cfg.loss_inactive,
             route=cfg.loss_route,
             overlap_route=cfg.loss_overlap_route,
+            ae=cfg.loss_ae,
         ),
         recall_frame_size=cfg.recall_frame_size,
         recall_floor=cfg.recall_floor,
@@ -252,17 +261,37 @@ def build_optimizer(
     del total_steps
 
     encoder_groups = model.speaker_encoder.optimizer_groups(cfg)
+
+    # Separator frontend (encoder + decoder) — lower LR for basis stability.
+    frontend_params = [
+        p for p in (
+            list(model.separator.encoder.parameters())
+            + list(model.separator.decoder.parameters())
+        ) if p.requires_grad
+    ]
+    frontend_ids = {id(p) for p in frontend_params}
+
     speaker_modulation_params = [
         p
         for p in model.separator.speaker_projection.parameters()
         if p.requires_grad
     ]
     modulation_param_ids = {id(p) for p in speaker_modulation_params}
+
+    excluded_ids = frontend_ids | modulation_param_ids
     separator_rest = [
         p for p in model.separator.parameters()
-        if p.requires_grad and id(p) not in modulation_param_ids
+        if p.requires_grad and id(p) not in excluded_ids
     ]
+
     param_groups = [*encoder_groups]
+    param_groups.append(
+        {
+            "name": "separator_frontend",
+            "params": frontend_params,
+            "lr": cfg.learning_rate * cfg.separator_frontend_lr_scale,
+        }
+    )
     param_groups.append(
         {
             "name": "separator_speaker_modulation",
@@ -536,10 +565,12 @@ def train_one_epoch(
     for step, batch in enumerate(pbar):
         batch = _move_batch(batch, device, non_blocking=pin)
 
+        need_ae = criterion.weights.ae > 0.0
         outputs = model(
             batch["mixture"],
             batch["enrollment"],
             batch.get("enrollment_fbank"),
+            return_training_aux=need_ae,
         )
         loss, parts = criterion(
             clean=outputs["clean"],
@@ -553,6 +584,7 @@ def train_one_epoch(
             background_frames=batch.get("background_frames"),
             scene_id=batch.get("scene_id"),
             view_role_id=batch.get("view_role_id"),
+            ae_reconstruction=outputs.get("ae_reconstruction"),
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -575,6 +607,7 @@ def train_one_epoch(
             "recall": f"{parts.recall:.3f}",
             "inactive": f"{parts.inactive:.3f}",
             "route": f"{parts.route:.3f}",
+            "ae": f"{parts.ae:.3f}",
             "lr_s": f"{optimizer.param_groups[-1]['lr']:.1e}",
         }
         pbar.set_postfix(refresh=False, **postfix)
@@ -586,7 +619,7 @@ def train_one_epoch(
                 f"stft={parts.mr_stft:.4f} recall={parts.recall:.4f} "
                 f"inactive={parts.inactive:.4f} route={parts.route:.4f} "
                 f"overlap_route={parts.overlap_route:.4f} "
-                f"absent={parts.absent:.4f} "
+                f"absent={parts.absent:.4f} ae={parts.ae:.4f} "
                 f"presence={parts.presence:.4f} "
                 f"present={parts.n_present}/{parts.n_present + parts.n_absent} "
                 f"route_pairs={parts.n_route_pairs} "
@@ -618,6 +651,7 @@ def validate(
     presence_sum = 0.0
     route_sum = 0.0
     overlap_route_sum = 0.0
+    ae_sum = 0.0
     sdr_db_sum = 0.0
     sdri_db_sum = 0.0
     routing_weight_sum = 0.0
@@ -645,10 +679,12 @@ def validate(
     )
     for batch in iterator:
         batch = _move_batch(batch, device, non_blocking=pin)
+        need_ae = criterion.weights.ae > 0.0
         outputs = model(
             batch["mixture"],
             batch["enrollment"],
             batch.get("enrollment_fbank"),
+            return_training_aux=need_ae,
         )
         _, parts = criterion(
             clean=outputs["clean"],
@@ -662,6 +698,7 @@ def validate(
             background_frames=batch.get("background_frames"),
             scene_id=batch.get("scene_id"),
             view_role_id=batch.get("view_role_id"),
+            ae_reconstruction=outputs.get("ae_reconstruction"),
         )
         total += parts.total
         sdr_loss_sum += parts.sdr
@@ -672,6 +709,7 @@ def validate(
         presence_sum += parts.presence
         route_sum += parts.route
         overlap_route_sum += parts.overlap_route
+        ae_sum += parts.ae
         batch_sdr_db, batch_sdri_db, batch_n_present = compute_val_sdri_present(
             outputs["clean"],
             batch["target"],
@@ -700,6 +738,7 @@ def validate(
         "presence": presence_sum / n_safe,
         "route": route_sum / n_safe,
         "overlap_route": overlap_route_sum / n_safe,
+        "ae": ae_sum / n_safe,
         "sdr_db": sdr_db_sum / n_present_safe,
         "sdri_db": sdri_db_sum / n_present_safe,
         "n_present": float(n_present),
@@ -816,13 +855,23 @@ def run_training(
         epoch_idx = epoch - 1
         eff_prob = effective_transition_prob(epoch_idx, cfg)
         train_ds.cfg.transition_prob = eff_prob
-        if cfg.absent_warmup_epochs > 0 and epoch <= cfg.absent_warmup_epochs:
-            eff_absent_weight = cfg.loss_absent * (
-                epoch / cfg.absent_warmup_epochs
-            )
-        else:
-            eff_absent_weight = cfg.loss_absent
-        criterion.weights.absent = eff_absent_weight
+        # Generalized warmup for suppression and regularization losses.
+        criterion.weights.recall = cfg.loss_recall
+        criterion.weights.absent = _warmup_weight(
+            cfg.loss_absent, epoch, cfg.absent_warmup_epochs,
+        )
+        criterion.weights.inactive = _warmup_weight(
+            cfg.loss_inactive, epoch, cfg.inactive_warmup_epochs,
+        )
+        criterion.weights.route = _warmup_weight(
+            cfg.loss_route, epoch, cfg.route_warmup_epochs,
+        )
+        criterion.weights.overlap_route = _warmup_weight(
+            cfg.loss_overlap_route, epoch, cfg.overlap_route_warmup_epochs,
+        )
+        criterion.weights.ae = _warmup_weight(
+            cfg.loss_ae, epoch, cfg.ae_warmup_epochs,
+        )
         epoch_t0 = time.time()
         train_loss, global_step = train_one_epoch(
             model,
@@ -853,7 +902,7 @@ def run_training(
             "train_loss": train_loss,
             "val_loss": val_loss,
             "train_num_speakers": len(train_ds.speaker_ids),
-            "absent_weight": eff_absent_weight,
+            "absent_weight": criterion.weights.absent,
             "checkpoint_score": checkpoint_score,
             **{f"val_{k}": v for k, v in val_parts.items()},
         }
@@ -884,7 +933,7 @@ def run_training(
 
         log(
             f"epoch {epoch} transition_prob={eff_prob:.3f} "
-            f"absent_weight={eff_absent_weight:.4f} "
+            f"absent_weight={criterion.weights.absent:.4f} "
             f"train_loss={train_loss:+.4f} val_loss={val_loss:+.4f} "
             f"val_sdr_db={val_parts['sdr_db']:+.3f} "
             f"val_sdri_db={val_parts['sdri_db']:+.3f} "
@@ -1045,7 +1094,12 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--plateau-factor", type=float, default=0.5)
     parser.add_argument("--early-stopping-patience", type=int, default=20)
     parser.add_argument("--grad-clip", type=float, default=5.0)
-    parser.add_argument("--absent-warmup-epochs", type=int, default=10)
+    parser.add_argument("--absent-warmup-epochs", type=int, default=15)
+    parser.add_argument("--inactive-warmup-epochs", type=int, default=15)
+    parser.add_argument("--route-warmup-epochs", type=int, default=20)
+    parser.add_argument("--overlap-route-warmup-epochs", type=int, default=20)
+    parser.add_argument("--ae-warmup-epochs", type=int, default=2)
+    parser.add_argument("--separator-frontend-lr-scale", type=float, default=0.5)
 
     parser.add_argument("--campplus-checkpoint", type=Path, default=None)
     parser.add_argument("--enc-channels", type=int, default=2048)
@@ -1058,15 +1112,18 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--s4d-state-dim", type=int, default=32)
     parser.add_argument("--s4d-ffn-multiplier", type=int, default=4)
     parser.add_argument("--target-presence-head", action="store_true")
+    parser.add_argument("--mask-activation", type=str, default="scaled_sigmoid",
+                        choices=["relu", "scaled_sigmoid"])
 
     parser.add_argument("--loss-sdr", type=float, default=1.0)
     parser.add_argument("--loss-mr-stft", type=float, default=1.0)
-    parser.add_argument("--loss-absent", type=float, default=0.5)
+    parser.add_argument("--loss-absent", type=float, default=0.15)
     parser.add_argument("--loss-presence", type=float, default=0.1)
-    parser.add_argument("--loss-recall", type=float, default=0.0)
-    parser.add_argument("--loss-inactive", type=float, default=0.25)
-    parser.add_argument("--loss-route", type=float, default=0.5)
-    parser.add_argument("--loss-overlap-route", type=float, default=0.25)
+    parser.add_argument("--loss-recall", type=float, default=0.20)
+    parser.add_argument("--loss-inactive", type=float, default=0.05)
+    parser.add_argument("--loss-route", type=float, default=0.15)
+    parser.add_argument("--loss-overlap-route", type=float, default=0.05)
+    parser.add_argument("--loss-ae", type=float, default=0.10)
     parser.add_argument("--recall-floor", type=float, default=0.3)
     parser.add_argument("--recall-frame-size", type=int, default=320)
     parser.add_argument("--inactive-threshold", type=float, default=0.05)
@@ -1150,6 +1207,11 @@ def _parse_args() -> TrainingConfig:
         early_stopping_patience=args.early_stopping_patience,
         grad_clip=args.grad_clip,
         absent_warmup_epochs=args.absent_warmup_epochs,
+        inactive_warmup_epochs=args.inactive_warmup_epochs,
+        route_warmup_epochs=args.route_warmup_epochs,
+        overlap_route_warmup_epochs=args.overlap_route_warmup_epochs,
+        ae_warmup_epochs=args.ae_warmup_epochs,
+        separator_frontend_lr_scale=args.separator_frontend_lr_scale,
         enc_channels=args.enc_channels,
         bottleneck_channels=args.bottleneck_channels,
         speaker_embed_dim=args.speaker_embed_dim,
@@ -1160,6 +1222,7 @@ def _parse_args() -> TrainingConfig:
         s4d_state_dim=args.s4d_state_dim,
         s4d_ffn_multiplier=args.s4d_ffn_multiplier,
         target_presence_head=args.target_presence_head,
+        mask_activation=args.mask_activation,
         loss_sdr=args.loss_sdr,
         loss_mr_stft=args.loss_mr_stft,
         loss_absent=args.loss_absent,
@@ -1168,6 +1231,7 @@ def _parse_args() -> TrainingConfig:
         loss_inactive=args.loss_inactive,
         loss_route=args.loss_route,
         loss_overlap_route=args.loss_overlap_route,
+        loss_ae=args.loss_ae,
         recall_floor=args.recall_floor,
         recall_frame_size=args.recall_frame_size,
         inactive_threshold=args.inactive_threshold,

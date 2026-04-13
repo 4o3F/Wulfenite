@@ -136,22 +136,29 @@ def test_training_config_defaults() -> None:
     assert cfg.scene_background_min_seconds == pytest.approx(0.3)
     assert cfg.scene_absence_before_return_min_seconds == pytest.approx(1.0)
     assert cfg.loss_sdr == 1.0
-    assert cfg.loss_inactive == pytest.approx(0.25)
-    assert cfg.loss_route == pytest.approx(0.5)
-    assert cfg.loss_overlap_route == pytest.approx(0.25)
+    assert cfg.loss_inactive == pytest.approx(0.05)
+    assert cfg.loss_route == pytest.approx(0.15)
+    assert cfg.loss_overlap_route == pytest.approx(0.05)
+    assert cfg.loss_ae == pytest.approx(0.10)
     assert cfg.inactive_threshold == pytest.approx(0.05)
     assert cfg.inactive_topk_fraction == pytest.approx(0.25)
     assert cfg.learning_rate == pytest.approx(5e-4)
     assert cfg.encoder_lr == pytest.approx(3e-5)
     assert cfg.speaker_modulation_lr_scale == pytest.approx(2.0)
-    assert cfg.absent_warmup_epochs == 10
+    assert cfg.separator_frontend_lr_scale == pytest.approx(0.5)
+    assert cfg.absent_warmup_epochs == 15
+    assert cfg.inactive_warmup_epochs == 15
+    assert cfg.route_warmup_epochs == 20
+    assert cfg.overlap_route_warmup_epochs == 20
+    assert cfg.ae_warmup_epochs == 2
     assert cfg.speaker_embed_dim == 192
+    assert cfg.mask_activation == "scaled_sigmoid"
     assert cfg.transition_prob == pytest.approx(0.0)
     assert cfg.transition_warmup_ratio == pytest.approx(0.0)
     assert cfg.transition_ramp_ratio == pytest.approx(0.0)
     assert cfg.transition_min_fraction == pytest.approx(0.25)
     assert cfg.transition_min_target_rms == pytest.approx(0.01)
-    assert cfg.loss_recall == pytest.approx(0.0)
+    assert cfg.loss_recall == pytest.approx(0.20)
     assert cfg.recall_floor == pytest.approx(0.3)
     assert cfg.recall_frame_size == 320
     assert cfg.route_frame_size == 160
@@ -387,7 +394,7 @@ def test_enrollment_shuffle_sdr_drop_present_mode(tmp_path: Path) -> None:
     assert isinstance(drop, float)
 
 
-def test_build_optimizer_uses_three_param_groups() -> None:
+def test_build_optimizer_uses_four_param_groups() -> None:
     model = _small_tse()
     cfg = TrainingConfig()
 
@@ -397,14 +404,18 @@ def test_build_optimizer_uses_three_param_groups() -> None:
     assert isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)
     assert [group["name"] for group in optimizer.param_groups] == [
         "encoder_backbone",
+        "separator_frontend",
         "separator_speaker_modulation",
         "separator_rest",
     ]
     assert optimizer.param_groups[0]["lr"] == pytest.approx(cfg.encoder_lr)
     assert optimizer.param_groups[1]["lr"] == pytest.approx(
+        cfg.learning_rate * cfg.separator_frontend_lr_scale
+    )
+    assert optimizer.param_groups[2]["lr"] == pytest.approx(
         cfg.learning_rate * cfg.speaker_modulation_lr_scale
     )
-    assert optimizer.param_groups[2]["lr"] == pytest.approx(cfg.learning_rate)
+    assert optimizer.param_groups[3]["lr"] == pytest.approx(cfg.learning_rate)
 
 
 def test_build_dataset_clip_composer_requires_three_speakers_per_split(
@@ -474,6 +485,7 @@ def test_build_loss_matches_config_weights() -> None:
         inactive=0.4,
         route=0.3,
         overlap_route=0.2,
+        ae=cfg.loss_ae,
     )
     assert loss.recall_floor == pytest.approx(0.4)
     assert loss.recall_frame_size == 160

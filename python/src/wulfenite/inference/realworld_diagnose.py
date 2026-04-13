@@ -277,7 +277,8 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def _save_wav(path: Path, waveform: torch.Tensor) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(path), waveform.cpu().numpy(), SAMPLE_RATE)
+    # Use FLOAT subtype to avoid PCM_16 hard-clipping values outside [-1, 1].
+    sf.write(str(path), waveform.cpu().numpy(), SAMPLE_RATE, subtype="FLOAT")
 
 
 def _build_speaker_pool(args: argparse.Namespace) -> dict[str, list[Any]]:

@@ -43,6 +43,7 @@ def _separator_checkpoint_config(
         "s4d_state_dim": separator_config.s4d_state_dim,
         "s4d_ffn_multiplier": separator_config.s4d_ffn_multiplier,
         "target_presence_head": separator_config.target_presence_head,
+        "mask_activation": separator_config.mask_activation,
     }
 
 
