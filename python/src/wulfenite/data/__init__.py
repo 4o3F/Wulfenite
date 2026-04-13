@@ -26,7 +26,13 @@ from .augmentation import (
     apply_rir,
     synth_room_rir,
 )
-from .composer import ClipFamily, ComposerConfig, EventType
+from .composer import (
+    ClipFamily,
+    ComposerConfig,
+    EventType,
+    SceneBundle,
+    SceneView,
+)
 from .mixer import MixerConfig, WulfeniteMixer, collate_mixer_batch
 from .noise import NoiseEntry, scan_noise_dir
 
@@ -45,6 +51,8 @@ __all__ = [
     "ClipFamily",
     "ComposerConfig",
     "EventType",
+    "SceneBundle",
+    "SceneView",
     "NoiseEntry",
     "scan_noise_dir",
     "MixerConfig",

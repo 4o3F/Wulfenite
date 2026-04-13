@@ -1,9 +1,13 @@
-"""On-the-fly 2-speaker TSE mixer.
+"""On-the-fly TSE mixer.
 
-Generates training samples for SpeakerBeam-SS with both target-present
-and target-absent branches, as described in ``docs/architecture.md``
-section 5 and 6. Each ``__getitem__`` call produces a dict suitable
-for feeding into :class:`wulfenite.losses.combined.WulfeniteLoss`.
+Legacy mode still emits single-view present/absent samples. The
+default ``clip_composer`` mode now generates one long coherent scene
+and derives several enrollment-conditioned views from the same
+mixture:
+
+- target speaker ``A``
+- alternate in-scene speaker ``B``
+- outsider absent view
 
 ### Sample composition
 
@@ -68,6 +72,12 @@ from .noise import NoiseEntry
 
 
 SAMPLE_RATE = 16000
+VIEW_ROLE_TO_ID = {
+    "A": 0,
+    "B": 1,
+    "OUTSIDER": 2,
+    "A_ALT": 3,
+}
 
 
 def _default_composer_config() -> "ComposerConfig":
@@ -90,7 +100,7 @@ class MixerConfig:
     """
 
     sample_rate: int = SAMPLE_RATE
-    segment_seconds: float = 4.0
+    segment_seconds: float = 8.0
     enrollment_seconds: float = 4.0
     # Deprecated compatibility shim for older inference utilities and
     # checkpoints that still pass or read a fixed "range".
@@ -351,14 +361,15 @@ class WulfeniteMixer(Dataset):
                 )
             if abs(cfg.target_present_prob - 0.85) > 1e-6:
                 warnings.warn(
-                    "target_present_prob is ignored in clip_composer mode; use "
-                    "family_*_weight in ComposerConfig instead",
+                    "target_present_prob is ignored in clip_composer mode because "
+                    "each unified long scene now emits both present and absent "
+                    "views by construction",
                     DeprecationWarning,
                     stacklevel=2,
                 )
             self._planner = ClipPlanner(
                 cfg.composer,
-                allow_third_speaker=len(self.speaker_ids) >= 3,
+                allow_third_speaker=len(self.speaker_ids) >= 4,
             )
             self._renderer = ClipRenderer(
                 cfg,
@@ -425,21 +436,172 @@ class WulfeniteMixer(Dataset):
         target_spk = rng.choice(self.speaker_ids)
         target_entry, enroll_entry = rng.sample(self.speakers[target_spk], 2)
         used = {target_spk}
-        interferer_ids: list[str] = []
-        interferer_entries: dict[str, AudioEntry] = {}
+        source_speaker_ids = {"A": target_spk}
+        source_entries: dict[str, AudioEntry] = {"A": target_entry}
+        enrollment_entries: dict[str, AudioEntry] = {"A": enroll_entry}
         roles = ("B", "C") if plan.use_third_speaker else ("B",)
         for role in roles:
             spk_id = self._sample_interferer_speaker(target_spk, used, rng)
             used.add(spk_id)
-            interferer_ids.append(spk_id)
-            interferer_entries[role] = rng.choice(self.speakers[spk_id])
+            source_entry, enrollment_entry = rng.sample(self.speakers[spk_id], 2)
+            source_speaker_ids[role] = spk_id
+            source_entries[role] = source_entry
+            enrollment_entries[role] = enrollment_entry
+        outsider_spk = self._sample_interferer_speaker(target_spk, used, rng)
         return SpeakerCast(
-            target_speaker_id=target_spk,
-            interferer_speaker_ids=tuple(interferer_ids),
-            target_entry=target_entry,
-            enrollment_entry=enroll_entry,
-            interferer_entries=interferer_entries,
+            source_speaker_ids=source_speaker_ids,
+            source_entries=source_entries,
+            enrollment_entries=enrollment_entries,
+            outsider_speaker_id=outsider_spk,
+            outsider_enrollment_entry=rng.choice(self.speakers[outsider_spk]),
         )
+
+    def _select_enrollment(
+        self,
+        pool: Sequence[torch.Tensor],
+        rng: random.Random,
+        *,
+        avoid_index: int | None = None,
+    ) -> torch.Tensor:
+        if not pool:
+            raise ValueError("enrollment pool must not be empty")
+        weights = [0.35, 0.25, 0.15, 0.15, 0.10]
+        indices = list(range(len(pool)))
+        if avoid_index is not None and avoid_index in indices and len(indices) > 1:
+            indices.remove(avoid_index)
+        selected = rng.choices(
+            indices,
+            weights=[weights[i] if i < len(weights) else 1.0 for i in indices],
+            k=1,
+        )[0]
+        return pool[selected].clone()
+
+    @staticmethod
+    def _union_active_frames(
+        active_frames_by_role: dict[str, torch.Tensor],
+        *,
+        exclude_role: str | None = None,
+    ) -> torch.Tensor:
+        union = torch.zeros_like(next(iter(active_frames_by_role.values())))
+        for role, active in active_frames_by_role.items():
+            if role != exclude_role:
+                union = union | active.bool()
+        return union
+
+    def _scene_views_from_bundle(
+        self,
+        bundle: "SceneBundle",
+        rng: random.Random,
+    ) -> list[dict]:
+        from .composer import SceneView
+
+        mixture = bundle.mixture
+        zeros_wave = torch.zeros_like(mixture)
+        zeros_frames = torch.zeros_like(bundle.background_frames)
+        speaker_indices = bundle.metadata["speaker_indices"]
+        views = [
+            SceneView(
+                scene_id=bundle.scene_id,
+                view_role="A",
+                enrollment=self._select_enrollment(bundle.enrollment_pool["A"], rng),
+                target=bundle.source_tracks["A"],
+                target_present=1.0,
+                target_speaker_idx=speaker_indices["A"],
+                target_active_frames=bundle.active_frames_by_role["A"],
+                nontarget_active_frames=self._union_active_frames(
+                    bundle.active_frames_by_role,
+                    exclude_role="A",
+                ),
+                overlap_frames=(
+                    bundle.active_frames_by_role["A"]
+                    & self._union_active_frames(
+                        bundle.active_frames_by_role,
+                        exclude_role="A",
+                    )
+                ),
+                background_frames=bundle.background_frames,
+                snr_db=float(bundle.metadata.get("snr_db", 0.0)),
+            ),
+            SceneView(
+                scene_id=bundle.scene_id,
+                view_role="B",
+                enrollment=self._select_enrollment(bundle.enrollment_pool["B"], rng),
+                target=bundle.source_tracks["B"],
+                target_present=1.0,
+                target_speaker_idx=speaker_indices["B"],
+                target_active_frames=bundle.active_frames_by_role["B"],
+                nontarget_active_frames=self._union_active_frames(
+                    bundle.active_frames_by_role,
+                    exclude_role="B",
+                ),
+                overlap_frames=(
+                    bundle.active_frames_by_role["B"]
+                    & self._union_active_frames(
+                        bundle.active_frames_by_role,
+                        exclude_role="B",
+                    )
+                ),
+                background_frames=bundle.background_frames,
+                snr_db=float(bundle.metadata.get("snr_db", 0.0)),
+            ),
+            SceneView(
+                scene_id=bundle.scene_id,
+                view_role="OUTSIDER",
+                enrollment=self._select_enrollment(
+                    bundle.enrollment_pool["OUTSIDER"], rng,
+                ),
+                target=zeros_wave,
+                target_present=0.0,
+                target_speaker_idx=bundle.metadata["outsider_speaker_idx"],
+                target_active_frames=zeros_frames,
+                nontarget_active_frames=self._union_active_frames(
+                    bundle.active_frames_by_role,
+                ),
+                overlap_frames=zeros_frames,
+                background_frames=bundle.background_frames,
+                snr_db=0.0,
+            ),
+        ]
+
+        samples: list[dict] = []
+        for view in views:
+            sample = view.to_sample()
+            sample["mixture"] = mixture.clone()
+            sample["view_role_id"] = torch.tensor(
+                VIEW_ROLE_TO_ID[view.view_role], dtype=torch.long,
+            )
+            sample["view_role"] = view.view_role
+            samples.append(sample)
+        return samples
+
+    def sample_scene(self, index: int) -> dict:
+        """Sample one full long-scene bundle plus its derived views.
+
+        Only valid in ``clip_composer`` mode. This is a utility for
+        diagnostics and audio export; training still consumes
+        ``__getitem__`` / ``collate_mixer_batch``.
+        """
+        if self.cfg.composition_mode != "clip_composer":
+            raise RuntimeError("sample_scene is only available in clip_composer mode")
+        if self._planner is None or self._renderer is None:
+            raise RuntimeError("clip_composer mode requires planner + renderer")
+        rng = self._rng(index)
+        plan = self._planner.plan(rng=rng)
+        cast = self._sample_speaker_cast(plan, rng)
+        bundle = self._renderer.render_bundle(
+            scene_id=index,
+            plan=plan,
+            cast=cast,
+            speaker_to_idx=self.speaker_to_idx,
+            rng=rng,
+        )
+        bundle.metadata["snr_db"] = plan.snr_db
+        return {
+            "scene_id": index,
+            "plan": plan,
+            "bundle": bundle,
+            "views": self._scene_views_from_bundle(bundle, rng),
+        }
 
     def _attach_legacy_frame_labels(self, sample: dict) -> dict:
         stride = self.cfg.composer.stride_samples
@@ -679,13 +841,13 @@ class WulfeniteMixer(Dataset):
         }
 
     def __getitem__(self, index: int) -> dict:
-        rng = self._rng(index)
         if self.cfg.composition_mode == "clip_composer":
-            if self._planner is None or self._renderer is None:
-                raise RuntimeError("clip_composer mode requires planner + renderer")
-            plan = self._planner.plan(rng=rng)
-            cast = self._sample_speaker_cast(plan, rng)
-            return self._renderer.render(plan, cast, self.speaker_to_idx, rng)
+            scene = self.sample_scene(index)
+            return {
+                "scene_id": torch.tensor(index, dtype=torch.long),
+                "views": scene["views"],
+            }
+        rng = self._rng(index)
         if rng.random() < self.cfg.transition_prob:
             return self._attach_legacy_frame_labels(self._make_transition_sample(rng))
         if rng.random() < self.cfg.target_present_prob:
@@ -705,16 +867,24 @@ def collate_mixer_batch(batch: Sequence[dict]) -> dict:
     the batch share the same segment / enrollment length, which is
     the case for a single ``WulfeniteMixer`` instance.
     """
+    if batch and "views" in batch[0]:
+        flattened: list[dict] = []
+        for scene in batch:
+            flattened.extend(scene["views"])
+        batch = flattened
+
     enrollment = torch.stack([b["enrollment"] for b in batch], dim=0)
     enrollment_fbank = compute_fbank_batch(enrollment)
 
     def _stack_frame_labels(key: str) -> torch.Tensor:
+        if key not in batch[0]:
+            return torch.zeros((len(batch), 0), dtype=torch.bool)
         labels = [b[key] for b in batch]
         if any(torch.is_floating_point(v) for v in labels):
             return torch.stack([v.to(torch.float32) for v in labels], dim=0)
         return torch.stack([v.to(torch.bool) for v in labels], dim=0)
 
-    return {
+    collated = {
         "mixture": torch.stack([b["mixture"] for b in batch], dim=0),
         "target": torch.stack([b["target"] for b in batch], dim=0),
         "enrollment": enrollment,
@@ -727,4 +897,13 @@ def collate_mixer_batch(batch: Sequence[dict]) -> dict:
         "target_active_frames": _stack_frame_labels("target_active_frames"),
         "nontarget_active_frames": _stack_frame_labels("nontarget_active_frames"),
         "overlap_frames": _stack_frame_labels("overlap_frames"),
+        "background_frames": _stack_frame_labels("background_frames"),
     }
+    if "scene_id" in batch[0]:
+        collated["scene_id"] = torch.stack([b["scene_id"] for b in batch], dim=0)
+    if "view_role_id" in batch[0]:
+        collated["view_role_id"] = torch.stack(
+            [b["view_role_id"] for b in batch], dim=0,
+        )
+        collated["view_role"] = [str(b["view_role"]) for b in batch]
+    return collated

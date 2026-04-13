@@ -14,7 +14,6 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from ..data import (
-    ClipFamily,
     ComposerConfig,
     MixerConfig,
     ReverbConfig,
@@ -30,6 +29,7 @@ from ..data import (
 from ..losses import (
     LossWeights,
     WulfeniteLoss,
+    compute_scene_routing_stats,
     compute_sdr_db,
     compute_sdri_db,
 )
@@ -121,15 +121,19 @@ def build_dataset(cfg: TrainingConfig) -> tuple[WulfeniteMixer, WulfeniteMixer]:
         composer_cfg = ComposerConfig(
             sample_rate=16000,
             segment_seconds=cfg.segment_seconds,
-            family_weights={
-                ClipFamily.MULTI_TURN_TARGET_PRESENT: cfg.family_multiturn_weight,
-                ClipFamily.OVERLAP_HEAVY: cfg.family_overlap_heavy_weight,
-                ClipFamily.HARD_NEGATIVE_ABSENT: cfg.family_hard_negative_weight,
-            },
-            min_events=cfg.min_events,
-            max_events=cfg.max_events,
-            min_event_frames=max(1, int(round(cfg.min_event_seconds * 100))),
-            max_event_frames=max(1, int(round(cfg.max_event_seconds * 100))),
+            target_only_min_frames=max(
+                1, int(round(cfg.scene_target_only_min_seconds * 100)),
+            ),
+            nontarget_only_min_frames=max(
+                1, int(round(cfg.scene_nontarget_only_min_seconds * 100)),
+            ),
+            overlap_min_frames=max(1, int(round(cfg.scene_overlap_min_seconds * 100))),
+            background_min_frames=max(
+                1, int(round(cfg.scene_background_min_seconds * 100)),
+            ),
+            absence_before_return_min_frames=max(
+                1, int(round(cfg.scene_absence_before_return_min_seconds * 100)),
+            ),
             crossfade_samples=max(0, int(round(cfg.crossfade_ms * 16))),
             optional_third_speaker_prob=cfg.optional_third_speaker_prob,
             gain_drift_db_range=tuple(cfg.gain_drift_db_range),
@@ -205,9 +209,17 @@ def build_loss(cfg: TrainingConfig) -> WulfeniteLoss:
             presence=cfg.loss_presence,
             recall=cfg.loss_recall,
             inactive=cfg.loss_inactive,
+            route=cfg.loss_route,
+            overlap_route=cfg.loss_overlap_route,
         ),
         recall_frame_size=cfg.recall_frame_size,
         recall_floor=cfg.recall_floor,
+        inactive_threshold=cfg.inactive_threshold,
+        inactive_topk_fraction=cfg.inactive_topk_fraction,
+        route_frame_size=cfg.route_frame_size,
+        route_margin=cfg.route_margin,
+        overlap_margin=cfg.overlap_margin,
+        overlap_dominance_margin=cfg.overlap_dominance_margin,
     )
 
 
@@ -287,15 +299,41 @@ def _format_lr(optimizer: torch.optim.Optimizer) -> str:
     return " ".join(parts)
 
 
+def compute_checkpoint_score(
+    metrics: dict[str, float],
+    cfg: TrainingConfig,
+) -> float:
+    return (
+        metrics["sdri_db"]
+        - cfg.checkpoint_other_only_alpha * metrics.get("other_only_energy_true", 0.0)
+        - cfg.checkpoint_wrong_enrollment_beta
+        * metrics.get("wrong_enrollment_leakage", 0.0)
+        - cfg.checkpoint_overlap_wrong_gamma
+        * metrics.get("overlap_energy_wrong", 0.0)
+    )
+
+
 def _should_update_best_checkpoint(
     sdri: float,
     inactive: float,
     *,
     best_sdri: float,
     best_inactive: float,
+    score: float | None = None,
+    best_score: float | None = None,
+    score_tolerance: float = 1e-4,
     sdri_tolerance: float = 0.05,
 ) -> bool:
-    """Return whether ``(sdri, inactive)`` beats the current best tuple."""
+    """Return whether the candidate beats the current best checkpoint."""
+    if score is not None and best_score is not None:
+        if score > best_score + score_tolerance:
+            return True
+        if abs(score - best_score) <= score_tolerance:
+            sdri_improved = sdri > best_sdri + sdri_tolerance
+            sdri_tied = abs(sdri - best_sdri) <= sdri_tolerance
+            inactive_improved = inactive < best_inactive
+            return sdri_improved or (sdri_tied and inactive_improved)
+        return False
     sdri_improved = sdri > best_sdri + sdri_tolerance
     sdri_tied = abs(sdri - best_sdri) <= sdri_tolerance
     inactive_improved = inactive < best_inactive
@@ -330,6 +368,30 @@ def compute_val_sdri_present(
         ).item()
     )
     return sdr_sum, sdri_sum, n_present
+
+
+@torch.no_grad()
+def compute_batch_routing_metrics(
+    batch: dict,
+    estimate: torch.Tensor,
+    criterion: WulfeniteLoss,
+) -> dict[str, float]:
+    stats = compute_scene_routing_stats(
+        estimate,
+        batch["target"],
+        batch["mixture"],
+        target_active_frames=batch.get("target_active_frames"),
+        nontarget_active_frames=batch.get("nontarget_active_frames"),
+        overlap_frames=batch.get("overlap_frames"),
+        background_frames=batch.get("background_frames"),
+        scene_id=batch.get("scene_id"),
+        view_role_id=batch.get("view_role_id"),
+        frame_size=criterion.route_frame_size,
+        route_margin=criterion.route_margin,
+        overlap_margin=criterion.overlap_margin,
+        overlap_dominance_margin=criterion.overlap_dominance_margin,
+    )
+    return {key: float(value.item()) for key, value in stats.items()}
 
 
 @torch.no_grad()
@@ -470,6 +532,9 @@ def train_one_epoch(
             target_active_frames=batch.get("target_active_frames"),
             nontarget_active_frames=batch.get("nontarget_active_frames"),
             overlap_frames=batch.get("overlap_frames"),
+            background_frames=batch.get("background_frames"),
+            scene_id=batch.get("scene_id"),
+            view_role_id=batch.get("view_role_id"),
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -491,6 +556,7 @@ def train_one_epoch(
             "stft": f"{parts.mr_stft:.3f}",
             "recall": f"{parts.recall:.3f}",
             "inactive": f"{parts.inactive:.3f}",
+            "route": f"{parts.route:.3f}",
             "lr_s": f"{optimizer.param_groups[-1]['lr']:.1e}",
         }
         pbar.set_postfix(refresh=False, **postfix)
@@ -500,10 +566,12 @@ def train_one_epoch(
                 f"epoch {epoch} step {step + 1}/{len(loader)} "
                 f"loss={parts.total:+.4f} sdr={parts.sdr:+.3f} "
                 f"stft={parts.mr_stft:.4f} recall={parts.recall:.4f} "
-                f"inactive={parts.inactive:.4f} "
+                f"inactive={parts.inactive:.4f} route={parts.route:.4f} "
+                f"overlap_route={parts.overlap_route:.4f} "
                 f"absent={parts.absent:.4f} "
                 f"presence={parts.presence:.4f} "
                 f"present={parts.n_present}/{parts.n_present + parts.n_absent} "
+                f"route_pairs={parts.n_route_pairs} "
                 f"{_format_lr(optimizer)}"
             )
 
@@ -530,8 +598,21 @@ def validate(
     inactive_sum = 0.0
     absent_sum = 0.0
     presence_sum = 0.0
+    route_sum = 0.0
+    overlap_route_sum = 0.0
     sdr_db_sum = 0.0
     sdri_db_sum = 0.0
+    routing_weight_sum = 0.0
+    routing_metric_sums = {
+        "target_only_energy_true": 0.0,
+        "target_only_energy_wrong": 0.0,
+        "other_only_energy_true": 0.0,
+        "overlap_energy_true": 0.0,
+        "overlap_energy_wrong": 0.0,
+        "route_margin_target_only": 0.0,
+        "route_margin_overlap": 0.0,
+        "wrong_enrollment_leakage": 0.0,
+    }
     n = 0
     n_present = 0
     pin = device.type == "cuda"
@@ -560,6 +641,9 @@ def validate(
             target_active_frames=batch.get("target_active_frames"),
             nontarget_active_frames=batch.get("nontarget_active_frames"),
             overlap_frames=batch.get("overlap_frames"),
+            background_frames=batch.get("background_frames"),
+            scene_id=batch.get("scene_id"),
+            view_role_id=batch.get("view_role_id"),
         )
         total += parts.total
         sdr_loss_sum += parts.sdr
@@ -568,12 +652,20 @@ def validate(
         inactive_sum += parts.inactive
         absent_sum += parts.absent
         presence_sum += parts.presence
+        route_sum += parts.route
+        overlap_route_sum += parts.overlap_route
         batch_sdr_db, batch_sdri_db, batch_n_present = compute_val_sdri_present(
             outputs["clean"],
             batch["target"],
             batch["mixture"],
             batch["target_present"],
         )
+        routing = compute_batch_routing_metrics(batch, outputs["clean"], criterion)
+        pair_count = routing["n_pairs"]
+        if pair_count > 0.0:
+            routing_weight_sum += pair_count
+            for key in routing_metric_sums:
+                routing_metric_sums[key] += routing[key] * pair_count
         sdr_db_sum += batch_sdr_db
         sdri_db_sum += batch_sdri_db
         n_present += batch_n_present
@@ -588,9 +680,18 @@ def validate(
         "inactive": inactive_sum / n_safe,
         "absent": absent_sum / n_safe,
         "presence": presence_sum / n_safe,
+        "route": route_sum / n_safe,
+        "overlap_route": overlap_route_sum / n_safe,
         "sdr_db": sdr_db_sum / n_present_safe,
         "sdri_db": sdri_db_sum / n_present_safe,
         "n_present": float(n_present),
+        "routing_pairs": routing_weight_sum,
+        **{
+            key: (
+                value / routing_weight_sum if routing_weight_sum > 0.0 else 0.0
+            )
+            for key, value in routing_metric_sums.items()
+        },
     }
 
 
@@ -683,6 +784,7 @@ def run_training(
 
     best_sdri = float("-inf")
     best_inactive = float("inf")
+    best_score = float("-inf")
     epochs_without_improvement = 0
     global_step = 0
     epoch_iter = tqdm(
@@ -727,12 +829,14 @@ def run_training(
         )
         if scheduler is not None:
             scheduler.step(val_parts["sdri_db"])
+        checkpoint_score = compute_checkpoint_score(val_parts, cfg)
 
         metrics = {
             "train_loss": train_loss,
             "val_loss": val_loss,
             "train_num_speakers": len(train_ds.speaker_ids),
             "absent_weight": eff_absent_weight,
+            "checkpoint_score": checkpoint_score,
             **{f"val_{k}": v for k, v in val_parts.items()},
         }
 
@@ -769,7 +873,13 @@ def run_training(
             f"val_stft={val_parts['mr_stft']:.4f} "
             f"val_recall={val_parts['recall']:.4f} "
             f"val_inactive={val_parts['inactive']:.4f} "
+            f"val_route={val_parts['route']:.4f} "
+            f"val_overlap_route={val_parts['overlap_route']:.4f} "
             f"val_absent={val_parts['absent']:.4f} time={train_time:.1f}s "
+            f"other_only={val_parts['other_only_energy_true']:.4f} "
+            f"wrong_leak={val_parts['wrong_enrollment_leakage']:.4f} "
+            f"overlap_wrong={val_parts['overlap_energy_wrong']:.4f} "
+            f"score={checkpoint_score:+.4f} "
             f"shuffle_drop={shuffle_drop:.3f} "
             f"same_cos={same:.3f} diff_cos={diff:.3f} cos_gap={gap:.3f}"
         )
@@ -792,9 +902,12 @@ def run_training(
             inactive_val,
             best_sdri=best_sdri,
             best_inactive=best_inactive,
+            score=checkpoint_score,
+            best_score=best_score,
         ):
             best_sdri = max(best_sdri, sdri)
             best_inactive = inactive_val
+            best_score = max(best_score, checkpoint_score)
             epochs_without_improvement = 0
             save_checkpoint(
                 out_dir / "best.pt",
@@ -807,8 +920,8 @@ def run_training(
                 metrics=metrics,
             )
             log(
-                f"[best] val_sdri_db={sdri:+.4f} "
-                f"val_inactive={inactive_val:.4f} -> saved best.pt"
+                f"[best] val_sdri_db={sdri:+.4f} val_inactive={inactive_val:.4f} "
+                f"checkpoint_score={checkpoint_score:+.4f} -> saved best.pt"
             )
         else:
             epochs_without_improvement += 1
@@ -816,14 +929,14 @@ def run_training(
         epoch_iter.set_postfix(
             train=f"{train_loss:+.3f}",
             sdri=f"{val_parts['sdri_db']:+.3f}",
-            best=f"{best_sdri:+.3f}",
+            best=f"{best_score:+.3f}",
             refresh=False,
         )
         if epochs_without_improvement >= cfg.early_stopping_patience:
             log(
                 "[early-stop] "
-                f"no val_sdri_db improvement for {epochs_without_improvement} epochs "
-                f"(best={best_sdri:+.4f}); stopping at epoch {epoch}"
+                f"no checkpoint_score improvement for {epochs_without_improvement} "
+                f"epochs (best={best_score:+.4f}); stopping at epoch {epoch}"
             )
             break
     epoch_iter.close()
@@ -837,7 +950,7 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--cnceleb-root", type=Path, default=None)
     parser.add_argument("--noise-root", type=Path, default=None)
 
-    parser.add_argument("--segment-seconds", type=float, default=4.0)
+    parser.add_argument("--segment-seconds", type=float, default=8.0)
     parser.add_argument("--enrollment-seconds", type=float, default=4.0)
     parser.add_argument("--snr-range-db", type=float, nargs=2, default=(-5.0, 5.0))
     parser.add_argument(
@@ -856,6 +969,13 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--optional-third-speaker-prob", type=float, default=0.35)
     parser.add_argument(
         "--gain-drift-db-range", type=float, nargs=2, default=(-1.5, 1.5),
+    )
+    parser.add_argument("--scene-target-only-min-seconds", type=float, default=0.8)
+    parser.add_argument("--scene-nontarget-only-min-seconds", type=float, default=0.8)
+    parser.add_argument("--scene-overlap-min-seconds", type=float, default=0.4)
+    parser.add_argument("--scene-background-min-seconds", type=float, default=0.3)
+    parser.add_argument(
+        "--scene-absence-before-return-min-seconds", type=float, default=1.0,
     )
     parser.add_argument("--target-present-prob", type=float, default=0.85)
     parser.add_argument("--transition-prob", type=float, default=0.0)
@@ -907,8 +1027,21 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--loss-presence", type=float, default=0.1)
     parser.add_argument("--loss-recall", type=float, default=0.0)
     parser.add_argument("--loss-inactive", type=float, default=0.25)
+    parser.add_argument("--loss-route", type=float, default=0.5)
+    parser.add_argument("--loss-overlap-route", type=float, default=0.25)
     parser.add_argument("--recall-floor", type=float, default=0.3)
     parser.add_argument("--recall-frame-size", type=int, default=320)
+    parser.add_argument("--inactive-threshold", type=float, default=0.05)
+    parser.add_argument("--inactive-topk-fraction", type=float, default=0.25)
+    parser.add_argument("--route-frame-size", type=int, default=160)
+    parser.add_argument("--route-margin", type=float, default=0.05)
+    parser.add_argument("--overlap-margin", type=float, default=0.02)
+    parser.add_argument("--overlap-dominance-margin", type=float, default=0.02)
+    parser.add_argument("--checkpoint-other-only-alpha", type=float, default=4.0)
+    parser.add_argument(
+        "--checkpoint-wrong-enrollment-beta", type=float, default=2.0,
+    )
+    parser.add_argument("--checkpoint-overlap-wrong-gamma", type=float, default=1.5)
 
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--prefetch-factor", type=int, default=4)
@@ -943,6 +1076,13 @@ def _parse_args() -> TrainingConfig:
         crossfade_ms=args.crossfade_ms,
         optional_third_speaker_prob=args.optional_third_speaker_prob,
         gain_drift_db_range=tuple(args.gain_drift_db_range),
+        scene_target_only_min_seconds=args.scene_target_only_min_seconds,
+        scene_nontarget_only_min_seconds=args.scene_nontarget_only_min_seconds,
+        scene_overlap_min_seconds=args.scene_overlap_min_seconds,
+        scene_background_min_seconds=args.scene_background_min_seconds,
+        scene_absence_before_return_min_seconds=(
+            args.scene_absence_before_return_min_seconds
+        ),
         target_present_prob=args.target_present_prob,
         transition_prob=args.transition_prob,
         transition_warmup_ratio=args.transition_warmup_ratio,
@@ -983,8 +1123,19 @@ def _parse_args() -> TrainingConfig:
         loss_presence=args.loss_presence,
         loss_recall=args.loss_recall,
         loss_inactive=args.loss_inactive,
+        loss_route=args.loss_route,
+        loss_overlap_route=args.loss_overlap_route,
         recall_floor=args.recall_floor,
         recall_frame_size=args.recall_frame_size,
+        inactive_threshold=args.inactive_threshold,
+        inactive_topk_fraction=args.inactive_topk_fraction,
+        route_frame_size=args.route_frame_size,
+        route_margin=args.route_margin,
+        overlap_margin=args.overlap_margin,
+        overlap_dominance_margin=args.overlap_dominance_margin,
+        checkpoint_other_only_alpha=args.checkpoint_other_only_alpha,
+        checkpoint_wrong_enrollment_beta=args.checkpoint_wrong_enrollment_beta,
+        checkpoint_overlap_wrong_gamma=args.checkpoint_overlap_wrong_gamma,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         val_speaker_ratio=args.val_speaker_ratio,

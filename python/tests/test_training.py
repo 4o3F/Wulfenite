@@ -78,7 +78,13 @@ def _small_tse(device: torch.device | str = "cpu") -> WulfeniteTSE:
 def _small_loss() -> WulfeniteLoss:
     return WulfeniteLoss(
         weights=LossWeights(
-            sdr=1.0, mr_stft=0.5, absent=1.0, presence=0.1, inactive=0.25,
+            sdr=1.0,
+            mr_stft=0.5,
+            absent=1.0,
+            presence=0.1,
+            inactive=0.25,
+            route=0.5,
+            overlap_route=0.25,
         ),
         mr_stft_loss=MultiResolutionSTFTLoss(
             fft_sizes=(256,), hop_sizes=(64,), win_lengths=(256,),
@@ -117,21 +123,23 @@ def _small_mixer(
 def test_training_config_defaults() -> None:
     cfg = TrainingConfig()
     assert cfg.batch_size > 0
-    assert cfg.segment_seconds == 4.0
+    assert cfg.segment_seconds == 8.0
     assert cfg.enrollment_seconds == 4.0
     assert cfg.composition_mode == "clip_composer"
-    assert cfg.family_multiturn_weight == pytest.approx(0.60)
-    assert cfg.family_overlap_heavy_weight == pytest.approx(0.25)
-    assert cfg.family_hard_negative_weight == pytest.approx(0.15)
-    assert cfg.min_events == 4
-    assert cfg.max_events == 8
-    assert cfg.min_event_seconds == pytest.approx(0.30)
-    assert cfg.max_event_seconds == pytest.approx(1.20)
     assert cfg.crossfade_ms == pytest.approx(5.0)
     assert cfg.optional_third_speaker_prob == pytest.approx(0.35)
     assert cfg.gain_drift_db_range == pytest.approx((-1.5, 1.5))
+    assert cfg.scene_target_only_min_seconds == pytest.approx(0.8)
+    assert cfg.scene_nontarget_only_min_seconds == pytest.approx(0.8)
+    assert cfg.scene_overlap_min_seconds == pytest.approx(0.4)
+    assert cfg.scene_background_min_seconds == pytest.approx(0.3)
+    assert cfg.scene_absence_before_return_min_seconds == pytest.approx(1.0)
     assert cfg.loss_sdr == 1.0
     assert cfg.loss_inactive == pytest.approx(0.25)
+    assert cfg.loss_route == pytest.approx(0.5)
+    assert cfg.loss_overlap_route == pytest.approx(0.25)
+    assert cfg.inactive_threshold == pytest.approx(0.05)
+    assert cfg.inactive_topk_fraction == pytest.approx(0.25)
     assert cfg.learning_rate == pytest.approx(5e-4)
     assert cfg.encoder_lr == pytest.approx(3e-5)
     assert cfg.speaker_modulation_lr_scale == pytest.approx(2.0)
@@ -145,6 +153,10 @@ def test_training_config_defaults() -> None:
     assert cfg.loss_recall == pytest.approx(0.0)
     assert cfg.recall_floor == pytest.approx(0.3)
     assert cfg.recall_frame_size == 320
+    assert cfg.route_frame_size == 160
+    assert cfg.route_margin == pytest.approx(0.05)
+    assert cfg.overlap_margin == pytest.approx(0.02)
+    assert cfg.overlap_dominance_margin == pytest.approx(0.02)
     assert cfg.use_plateau_scheduler is True
     assert cfg.plateau_patience == 5
     assert cfg.early_stopping_patience == 20
@@ -402,8 +414,12 @@ def test_build_loss_matches_config_weights() -> None:
         loss_presence=0.05,
         loss_recall=0.6,
         loss_inactive=0.4,
+        loss_route=0.3,
+        loss_overlap_route=0.2,
         recall_floor=0.4,
         recall_frame_size=160,
+        inactive_threshold=0.07,
+        inactive_topk_fraction=0.5,
     )
 
     loss = build_loss(cfg)
@@ -415,9 +431,13 @@ def test_build_loss_matches_config_weights() -> None:
         presence=0.05,
         recall=0.6,
         inactive=0.4,
+        route=0.3,
+        overlap_route=0.2,
     )
     assert loss.recall_floor == pytest.approx(0.4)
     assert loss.recall_frame_size == 160
+    assert loss.inactive_threshold == pytest.approx(0.07)
+    assert loss.inactive_topk_fraction == pytest.approx(0.5)
 
 
 def test_train_one_epoch_runs(tmp_path: Path) -> None:
@@ -456,7 +476,7 @@ def test_training_step_with_composer_labels(tmp_path: Path) -> None:
         tmp_path,
         samples=2,
         composition_mode="clip_composer",
-        segment_seconds=4.0,
+        segment_seconds=8.0,
     )
     model = _small_tse()
     criterion = _small_loss()
@@ -474,6 +494,9 @@ def test_training_step_with_composer_labels(tmp_path: Path) -> None:
         target_active_frames=batch["target_active_frames"],
         nontarget_active_frames=batch["nontarget_active_frames"],
         overlap_frames=batch["overlap_frames"],
+        background_frames=batch["background_frames"],
+        scene_id=batch["scene_id"],
+        view_role_id=batch["view_role_id"],
     )
     assert torch.isfinite(loss)
 

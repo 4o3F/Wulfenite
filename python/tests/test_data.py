@@ -35,6 +35,7 @@ from wulfenite.data import (
 )
 from wulfenite.data.augmentation import ReverbConfig
 from wulfenite.models import compute_fbank_batch
+from wulfenite.scripts.sample_scenes import export_scene_samples
 
 
 SR = 16000
@@ -335,18 +336,22 @@ def test_mixer_composer_sample_shapes(tmp_path: Path) -> None:
     mixer = _build_mixer(
         tmp_path,
         composition_mode="clip_composer",
-        segment_seconds=4.0,
+        segment_seconds=8.0,
     )
     sample = mixer[0]
-    expected_len = int(4.0 * SR)
+    expected_len = int(8.0 * SR)
     expected_frames = expected_len // 160
-    assert sample["mixture"].shape == (expected_len,)
-    assert sample["target"].shape == (expected_len,)
-    assert sample["enrollment"].shape == (expected_len,)
-    assert sample["target_active_frames"].shape == (expected_frames,)
-    assert sample["nontarget_active_frames"].shape == (expected_frames,)
-    assert sample["overlap_frames"].shape == (expected_frames,)
-    assert sample["target_active_frames"].dtype == torch.bool
+    assert sample["scene_id"].shape == ()
+    assert len(sample["views"]) == 3
+    for view in sample["views"]:
+        assert view["mixture"].shape == (expected_len,)
+        assert view["target"].shape == (expected_len,)
+        assert view["enrollment"].shape == (int(8.0 * SR),)
+        assert view["target_active_frames"].shape == (expected_frames,)
+        assert view["nontarget_active_frames"].shape == (expected_frames,)
+        assert view["overlap_frames"].shape == (expected_frames,)
+        assert view["background_frames"].shape == (expected_frames,)
+        assert view["target_active_frames"].dtype == torch.bool
 
 
 def test_mixer_legacy_mode_backward_compat(tmp_path: Path) -> None:
@@ -400,9 +405,15 @@ def test_mixer_finite_values(tmp_path: Path) -> None:
     mixer = _build_mixer(tmp_path)
     for i in range(20):
         s = mixer[i]
-        assert torch.isfinite(s["mixture"]).all()
-        assert torch.isfinite(s["target"]).all()
-        assert torch.isfinite(s["enrollment"]).all()
+        if "views" in s:
+            for view in s["views"]:
+                assert torch.isfinite(view["mixture"]).all()
+                assert torch.isfinite(view["target"]).all()
+                assert torch.isfinite(view["enrollment"]).all()
+        else:
+            assert torch.isfinite(s["mixture"]).all()
+            assert torch.isfinite(s["target"]).all()
+            assert torch.isfinite(s["enrollment"]).all()
 
 
 def test_mixer_collate(tmp_path: Path) -> None:
@@ -421,13 +432,39 @@ def test_mixer_composer_collate_framewise(tmp_path: Path) -> None:
     mixer = _build_mixer(
         tmp_path,
         composition_mode="clip_composer",
-        segment_seconds=4.0,
+        segment_seconds=8.0,
     )
     batch = [mixer[i] for i in range(2)]
     collated = collate_mixer_batch(batch)
-    assert collated["target_active_frames"].shape == (2, int(4.0 * SR) // 160)
-    assert collated["nontarget_active_frames"].shape == (2, int(4.0 * SR) // 160)
-    assert collated["overlap_frames"].shape == (2, int(4.0 * SR) // 160)
+    assert collated["mixture"].shape == (6, int(8.0 * SR))
+    assert collated["target_active_frames"].shape == (6, int(8.0 * SR) // 160)
+    assert collated["nontarget_active_frames"].shape == (6, int(8.0 * SR) // 160)
+    assert collated["overlap_frames"].shape == (6, int(8.0 * SR) // 160)
+    assert collated["background_frames"].shape == (6, int(8.0 * SR) // 160)
+    assert collated["scene_id"].shape == (6,)
+    assert collated["view_role_id"].shape == (6,)
+
+
+def test_sample_scene_export_writes_audio_inventory(tmp_path: Path) -> None:
+    mixer = _build_mixer(
+        tmp_path,
+        composition_mode="clip_composer",
+        segment_seconds=8.0,
+    )
+    out_dir = tmp_path / "scene_export"
+    manifest = export_scene_samples(mixer, out_dir, max_scenes=2)
+
+    assert len(manifest) == 2
+    scene0 = out_dir / "scene_000"
+    assert (scene0 / "mixture.wav").exists()
+    assert (scene0 / "preview.wav").exists()
+    assert (scene0 / "role_A.wav").exists()
+    assert (scene0 / "role_B.wav").exists()
+    assert (scene0 / "enrollment_a_dense.wav").exists()
+    assert (scene0 / "enrollment_b_dense.wav").exists()
+    assert (scene0 / "enrollment_outsider_dense.wav").exists()
+    assert (scene0 / "metadata.json").exists()
+    assert (out_dir / "manifest.json").exists()
 
 
 def test_mixer_collate_recomputes_fbank(tmp_path: Path) -> None:

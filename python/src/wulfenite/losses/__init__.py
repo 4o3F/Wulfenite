@@ -12,7 +12,12 @@ Public entry points:
 - :func:`presence_loss` — BCE on the target-presence head.
 """
 
-from .combined import LossParts, LossWeights, WulfeniteLoss
+from .combined import (
+    LossParts,
+    LossWeights,
+    WulfeniteLoss,
+    compute_scene_routing_stats,
+)
 from .inactive import target_inactive_loss
 from .mr_stft import MultiResolutionSTFTLoss, STFTLoss
 from .presence import presence_loss
@@ -24,6 +29,7 @@ __all__ = [
     "LossParts",
     "LossWeights",
     "WulfeniteLoss",
+    "compute_scene_routing_stats",
     "MultiResolutionSTFTLoss",
     "STFTLoss",
     "presence_loss",

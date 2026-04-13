@@ -19,7 +19,7 @@ class TrainingConfig:
     campplus_checkpoint: Path | None = None
 
     # --- Mixer ---
-    segment_seconds: float = 4.0
+    segment_seconds: float = 8.0
     enrollment_seconds: float = 4.0
     snr_range_db: tuple[float, float] = (-5.0, 5.0)
     composition_mode: str = "clip_composer"
@@ -33,6 +33,11 @@ class TrainingConfig:
     crossfade_ms: float = 5.0
     optional_third_speaker_prob: float = 0.35
     gain_drift_db_range: tuple[float, float] = (-1.5, 1.5)
+    scene_target_only_min_seconds: float = 0.8
+    scene_nontarget_only_min_seconds: float = 0.8
+    scene_overlap_min_seconds: float = 0.4
+    scene_background_min_seconds: float = 0.3
+    scene_absence_before_return_min_seconds: float = 1.0
     target_present_prob: float = 0.85
     transition_prob: float = 0.0
     transition_warmup_ratio: float = 0.0
@@ -79,8 +84,19 @@ class TrainingConfig:
     loss_presence: float = 0.1
     loss_recall: float = 0.0
     loss_inactive: float = 0.25
+    loss_route: float = 0.5
+    loss_overlap_route: float = 0.25
     recall_floor: float = 0.3
     recall_frame_size: int = 320
+    inactive_threshold: float = 0.05
+    inactive_topk_fraction: float = 0.25
+    route_frame_size: int = 160
+    route_margin: float = 0.05
+    overlap_margin: float = 0.02
+    overlap_dominance_margin: float = 0.02
+    checkpoint_other_only_alpha: float = 4.0
+    checkpoint_wrong_enrollment_beta: float = 2.0
+    checkpoint_overlap_wrong_gamma: float = 1.5
 
     # --- DataLoader ---
     num_workers: int = 8
@@ -112,6 +128,21 @@ class TrainingConfig:
                 "event duration bounds must satisfy 0 < min <= max; got "
                 f"{self.min_event_seconds}, {self.max_event_seconds}"
             )
+        for name, value in (
+            ("scene_target_only_min_seconds", self.scene_target_only_min_seconds),
+            (
+                "scene_nontarget_only_min_seconds",
+                self.scene_nontarget_only_min_seconds,
+            ),
+            ("scene_overlap_min_seconds", self.scene_overlap_min_seconds),
+            ("scene_background_min_seconds", self.scene_background_min_seconds),
+            (
+                "scene_absence_before_return_min_seconds",
+                self.scene_absence_before_return_min_seconds,
+            ),
+        ):
+            if value <= 0.0:
+                raise ValueError(f"{name} must be positive; got {value}")
         if self.crossfade_ms < 0.0:
             raise ValueError(
                 f"crossfade_ms must be non-negative; got {self.crossfade_ms}"
@@ -130,4 +161,9 @@ class TrainingConfig:
             raise ValueError(
                 "transition_warmup_ratio + transition_ramp_ratio must be <= 1.0; "
                 f"got {self.transition_warmup_ratio + self.transition_ramp_ratio}"
+            )
+        if not 0.0 < self.inactive_topk_fraction <= 1.0:
+            raise ValueError(
+                "inactive_topk_fraction must be in (0, 1]; got "
+                f"{self.inactive_topk_fraction}"
             )

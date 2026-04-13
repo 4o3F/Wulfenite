@@ -16,6 +16,7 @@ from wulfenite.losses import (
     MultiResolutionSTFTLoss,
     STFTLoss,
     WulfeniteLoss,
+    compute_scene_routing_stats,
     compute_sdr_db,
     compute_sdri_db,
     presence_loss,
@@ -284,22 +285,24 @@ def test_inactive_loss_excludes_low_energy_frames() -> None:
         frame_size=2,
     )
 
-    assert loss.item() == pytest.approx(1.0, abs=1e-6)
+    assert loss.item() == pytest.approx((1.0 - 0.05) ** 2, abs=1e-6)
 
 
-def test_inactive_loss_ratio_clamp() -> None:
-    estimate = torch.ones(1, 2)
-    mixture = torch.full((1, 2), 0.008)
-    inactive_frames = torch.tensor([[True]])
+def test_inactive_loss_topk_focuses_on_worst_frame() -> None:
+    estimate = torch.tensor([[1.0, 1.0, 0.5, 0.5]])
+    mixture = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+    inactive_frames = torch.tensor([[True, True]])
 
     loss = target_inactive_loss(
         estimate,
         mixture,
         inactive_frames=inactive_frames,
         frame_size=2,
+        threshold=0.0,
+        topk_fraction=0.5,
     )
 
-    assert loss.item() == pytest.approx(4.0, abs=1e-6)
+    assert loss.item() == pytest.approx(1.0, abs=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +458,8 @@ def test_combined_loss_inactive_uses_nontarget_mask() -> None:
         mr_stft_loss=MultiResolutionSTFTLoss(
             fft_sizes=(256,), hop_sizes=(64,), win_lengths=(256,),
         ),
+        inactive_threshold=0.0,
+        inactive_topk_fraction=1.0,
     )(
         clean,
         target,
@@ -522,3 +527,44 @@ def test_loss_dataclasses_no_longer_expose_speaker_cls() -> None:
     )(clean, target, mixture, present, presence_logit=None)
     assert torch.isfinite(total)
     assert not hasattr(parts, "speaker_cls")
+
+
+def test_scene_routing_stats_penalize_swapped_outputs() -> None:
+    frame = 160
+    target_a = torch.cat(
+        [torch.ones(frame), torch.zeros(frame), torch.full((frame,), 0.5)],
+    ).unsqueeze(0)
+    target_b = torch.cat(
+        [torch.zeros(frame), torch.ones(frame), torch.full((frame,), 1.0)],
+    ).unsqueeze(0)
+    mixture = target_a + target_b
+    estimate = torch.cat([target_b, target_a], dim=0)
+    target = torch.cat([target_a, target_b], dim=0)
+    target_active = torch.tensor([[True, False, True], [False, True, True]])
+    nontarget_active = torch.tensor([[False, True, True], [True, False, True]])
+    overlap = torch.tensor([[False, False, True], [False, False, True]])
+    background = torch.tensor([[False, False, False], [False, False, False]])
+    scene_id = torch.tensor([0, 0])
+    view_role_id = torch.tensor([0, 1])
+
+    stats = compute_scene_routing_stats(
+        estimate,
+        target,
+        mixture.repeat(2, 1),
+        target_active_frames=target_active,
+        nontarget_active_frames=nontarget_active,
+        overlap_frames=overlap,
+        background_frames=background,
+        scene_id=scene_id,
+        view_role_id=view_role_id,
+        frame_size=frame,
+        route_margin=0.05,
+        overlap_margin=0.02,
+        overlap_dominance_margin=0.01,
+    )
+
+    assert float(stats["route_loss"].item()) > 0.0
+    assert float(stats["overlap_route_loss"].item()) > 0.0
+    assert float(stats["target_only_energy_wrong"].item()) > float(
+        stats["target_only_energy_true"].item()
+    )
