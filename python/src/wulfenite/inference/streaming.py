@@ -190,10 +190,23 @@ def run_streaming(
                     refresh=False,
                 )
 
+    # Flush look-ahead delay: send zero hops so the final real frames emerge.
+    lookahead = separator.config.separator_lookahead_frames
+    if lookahead > 0:
+        with torch.no_grad():
+            for _ in range(lookahead):
+                flush_chunk = torch.zeros(1, chunk_size, device=dev)
+                flush_out, state = separator.streaming_step(
+                    flush_chunk, speaker_embedding, state,
+                    s4d_state_decay=s4d_decay,
+                )
+                clean_pieces.append(flush_out.cpu())
+
     clean = torch.cat(clean_pieces, dim=-1)[0].numpy()
-    # Trim any tail padding so output length matches original mixture.
-    original_len = clean.shape[0] - pad_len
-    clean = clean[:original_len]
+    # Trim startup delay (look-ahead zeros) and tail padding.
+    la_samples = lookahead * separator.config.enc_stride
+    original_len = clean.shape[0] - pad_len - la_samples
+    clean = clean[la_samples:la_samples + original_len]
 
     output.parent.mkdir(parents=True, exist_ok=True)
     # Use FLOAT subtype to avoid PCM_16 hard-clipping values outside [-1, 1].

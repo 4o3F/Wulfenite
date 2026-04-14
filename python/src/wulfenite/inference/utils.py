@@ -29,6 +29,8 @@ def _rebuild_separator_config(
         "r2_repeats": "r2_repeats",
         "conv_blocks_per_repeat": "conv_blocks_per_repeat",
         "s4d_ffn_multiplier": "s4d_ffn_multiplier",
+        "separator_lookahead_frames": "separator_lookahead_frames",
+        "lookahead_policy": "lookahead_policy",
         "target_presence_head": "target_presence_head",
         "mask_activation": "mask_activation",
     }

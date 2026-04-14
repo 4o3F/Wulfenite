@@ -93,6 +93,8 @@ class TrainingConfig:
     conv_blocks_per_repeat: int = 2
     s4d_state_dim: int = 32
     s4d_ffn_multiplier: int = 4
+    separator_lookahead_frames: int = 0
+    lookahead_policy: str = "post_fusion_frontloaded"
     target_presence_head: bool = False
     mask_activation: str = "scaled_sigmoid"
 
@@ -195,4 +197,15 @@ class TrainingConfig:
             raise ValueError(
                 "inactive_topk_fraction must be in (0, 1]; got "
                 f"{self.inactive_topk_fraction}"
+            )
+        total_blocks = (self.r1_repeats + self.r2_repeats) * self.conv_blocks_per_repeat
+        if not 0 <= self.separator_lookahead_frames <= total_blocks:
+            raise ValueError(
+                "separator_lookahead_frames must be between 0 and "
+                f"{total_blocks}; got {self.separator_lookahead_frames}"
+            )
+        if self.lookahead_policy != "post_fusion_frontloaded":
+            raise ValueError(
+                "lookahead_policy must be 'post_fusion_frontloaded'; got "
+                f"{self.lookahead_policy!r}"
             )

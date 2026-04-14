@@ -31,7 +31,7 @@ def _tiny_separator_config() -> SpeakerBeamSSConfig:
 
 def _separator_checkpoint_config(
     separator_config: SpeakerBeamSSConfig,
-) -> dict[str, int]:
+) -> dict[str, int | str | bool]:
     return {
         "enc_channels": separator_config.enc_channels,
         "bottleneck_channels": separator_config.bottleneck_channels,
@@ -42,6 +42,8 @@ def _separator_checkpoint_config(
         "conv_blocks_per_repeat": separator_config.conv_blocks_per_repeat,
         "s4d_state_dim": separator_config.s4d_state_dim,
         "s4d_ffn_multiplier": separator_config.s4d_ffn_multiplier,
+        "separator_lookahead_frames": separator_config.separator_lookahead_frames,
+        "lookahead_policy": separator_config.lookahead_policy,
         "target_presence_head": separator_config.target_presence_head,
         "mask_activation": separator_config.mask_activation,
     }
@@ -202,9 +204,34 @@ def test_streaming_state_initializes_to_zero() -> None:
     state = tse.separator.initial_streaming_state(batch_size=2)
     assert torch.all(state["encoder_buffer"] == 0)
     assert torch.all(state["decoder_overlap"] == 0)
+    assert torch.all(state["skip_buffer"] == 0)
+    assert torch.all(state["output_buffer"] == 0)
+    assert state["block_startup_remaining"] == [
+        block.tcn_right_context for block in tse.separator._all_blocks()
+    ]
     for block_state in state["block_states"]:
         if torch.is_tensor(block_state):
             assert torch.all(block_state == 0)
         elif isinstance(block_state, tuple):
             for part in block_state:
                 assert torch.all(part == 0)
+
+
+def test_checkpoint_roundtrip_preserves_separator_lookahead(tmp_path: Path) -> None:
+    cfg = _tiny_separator_config()
+    cfg.separator_lookahead_frames = 1
+    tse = WulfeniteTSE.from_campplus(
+        campplus_checkpoint=None,
+        separator_config=cfg,
+    ).eval()
+
+    ckpt_path = tmp_path / "lookahead.pt"
+    save_checkpoint(
+        ckpt_path,
+        model=tse,
+        config=_separator_checkpoint_config(cfg),
+    )
+
+    loaded, _ = build_model_from_checkpoint(ckpt_path)
+    assert loaded.separator.config.separator_lookahead_frames == 1
+    assert loaded.separator.config.lookahead_policy == "post_fusion_frontloaded"

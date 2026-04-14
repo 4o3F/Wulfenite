@@ -222,9 +222,19 @@ def _stream_one(
                 "mask_min": float(state["mask_min"]),
             }
         )
+    # Flush look-ahead delay.
+    lookahead = separator.config.separator_lookahead_frames
+    if lookahead > 0:
+        for _ in range(lookahead):
+            flush = torch.zeros(1, chunk_size, device=dev)
+            flush_out, state = separator.streaming_step(
+                flush, embedding, state,
+            )
+            clean_pieces.append(flush_out)
     clean = torch.cat(clean_pieces, dim=-1)
-    if pad_len:
-        clean = clean[:-pad_len]
+    la_samples = lookahead * separator.config.enc_stride
+    original_len = clean.shape[-1] - pad_len - la_samples
+    clean = clean[..., la_samples:la_samples + original_len]
     return clean, rows
 
 

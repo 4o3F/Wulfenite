@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from wulfenite.models.speakerbeam_ss import (
     SpeakerBeamSS,
     SpeakerBeamSSConfig,
+    _build_lookahead_plan,
 )
 
 
@@ -31,6 +33,50 @@ def _s4d_state_norm(model: SpeakerBeamSS, state: dict) -> float:
         _, s4d_state = block_state
         total = total + s4d_state.pow(2).sum().cpu()
     return float(total.sqrt().item())
+
+
+def _run_streaming(
+    model: SpeakerBeamSS,
+    mixture: torch.Tensor,
+    embedding: torch.Tensor,
+    *,
+    chunk_size: int,
+    s4d_state_decay: float = 1.0,
+) -> torch.Tensor:
+    state = model.initial_streaming_state(batch_size=mixture.size(0))
+    pieces = []
+    total = mixture.size(-1)
+    for start in range(0, total, chunk_size):
+        chunk = mixture[..., start:start + chunk_size]
+        if chunk.shape[-1] != chunk_size:
+            continue
+        y, state = model.streaming_step(
+            chunk,
+            embedding,
+            state,
+            s4d_state_decay=s4d_state_decay,
+        )
+        pieces.append(y)
+
+    if model.config.separator_lookahead_frames > 0:
+        zero_hop = torch.zeros(
+            mixture.size(0),
+            model.config.enc_stride,
+            device=mixture.device,
+            dtype=mixture.dtype,
+        )
+        for _ in range(model.config.separator_lookahead_frames):
+            y, state = model.streaming_hop(
+                zero_hop,
+                embedding,
+                state,
+                s4d_state_decay=s4d_state_decay,
+            )
+            pieces.append(y)
+
+    out_stream = torch.cat(pieces, dim=-1)
+    la_samples = model.config.separator_lookahead_frames * model.config.enc_stride
+    return out_stream[..., la_samples:la_samples + total]
 
 
 def test_speakerbeam_forward_shape() -> None:
@@ -66,9 +112,15 @@ def test_speakerbeam_initial_state_shapes() -> None:
     assert len(state) == len(model._all_blocks())
 
 
-def test_speakerbeam_streaming_matches_forward() -> None:
+@pytest.mark.parametrize("separator_lookahead_frames", [0, 1])
+@pytest.mark.parametrize("chunk_size_factor", [1, 2, 4])
+def test_speakerbeam_streaming_matches_forward(
+    separator_lookahead_frames: int,
+    chunk_size_factor: int,
+) -> None:
     torch.manual_seed(0)
     cfg = _small_config()
+    cfg.separator_lookahead_frames = separator_lookahead_frames
     model = SpeakerBeamSS(cfg).eval()
 
     stride = cfg.enc_stride
@@ -81,22 +133,16 @@ def test_speakerbeam_streaming_matches_forward() -> None:
 
     with torch.no_grad():
         out_whole = model(mixture, embedding)["clean"]
+        out_stream = _run_streaming(
+            model,
+            mixture,
+            embedding,
+            chunk_size=chunk_size_factor * stride,
+        )
 
-        for chunk_size in (stride, 2 * stride, 4 * stride):
-            state = model.initial_streaming_state(batch_size=batch)
-            pieces = []
-            for start in range(0, t, chunk_size):
-                chunk = mixture[..., start:start + chunk_size]
-                if chunk.shape[-1] != chunk_size:
-                    continue
-                y, state = model.streaming_step(
-                    chunk, embedding, state, s4d_state_decay=1.0,
-                )
-                pieces.append(y)
-            out_stream = torch.cat(pieces, dim=-1)
-            assert out_stream.shape == out_whole.shape
-            diff = (out_stream - out_whole).abs().max().item()
-            assert diff < 1e-4
+    assert out_stream.shape == out_whole.shape
+    diff = (out_stream - out_whole).abs().max().item()
+    assert diff < 1e-4
 
 
 def test_streaming_s4d_decay_bounds_state() -> None:
@@ -270,6 +316,7 @@ def test_streaming_equivalence_scaled_sigmoid() -> None:
     torch.manual_seed(12)
     cfg = _small_config()
     cfg.mask_activation = "scaled_sigmoid"
+    cfg.separator_lookahead_frames = 1
     model = SpeakerBeamSS(cfg).eval()
 
     batch = 1
@@ -282,18 +329,111 @@ def test_streaming_equivalence_scaled_sigmoid() -> None:
 
     with torch.no_grad():
         out_whole = model(mixture, embedding)["clean"]
-        state = model.initial_streaming_state(batch_size=batch)
-        pieces = []
-        for start in range(0, t, stride):
-            chunk = mixture[..., start:start + stride]
-            y, state = model.streaming_step(
-                chunk, embedding, state, s4d_state_decay=1.0,
-            )
-            pieces.append(y)
-        out_stream = torch.cat(pieces, dim=-1)
+        out_stream = _run_streaming(
+            model,
+            mixture,
+            embedding,
+            chunk_size=stride,
+        )
 
     diff = (out_stream - out_whole).abs().max().item()
     assert diff < 1e-4
+
+
+def test_streaming_equivalence_with_separator_lookahead() -> None:
+    torch.manual_seed(13)
+    cfg = _small_config()
+    cfg.separator_lookahead_frames = 1
+    model = SpeakerBeamSS(cfg).eval()
+
+    batch = 2
+    stride = cfg.enc_stride
+    t = 12 * stride
+    mixture = torch.randn(batch, t)
+    embedding = torch.nn.functional.normalize(
+        torch.randn(batch, cfg.speaker_embed_dim), p=2, dim=-1,
+    )
+
+    with torch.no_grad():
+        out_whole = model(mixture, embedding)["clean"]
+        out_stream = _run_streaming(
+            model,
+            mixture,
+            embedding,
+            chunk_size=4 * stride,
+        )
+
+    diff = (out_stream - out_whole).abs().max().item()
+    assert diff < 1e-4
+
+
+def test_lookahead_first_hop_is_zeros() -> None:
+    torch.manual_seed(14)
+    cfg = _small_config()
+    cfg.separator_lookahead_frames = 1
+    model = SpeakerBeamSS(cfg).eval()
+
+    mixture = torch.randn(1, cfg.enc_stride)
+    embedding = torch.nn.functional.normalize(
+        torch.randn(1, cfg.speaker_embed_dim), p=2, dim=-1,
+    )
+
+    state = model.initial_streaming_state(batch_size=1)
+    with torch.no_grad():
+        first, _ = model.streaming_hop(
+            mixture,
+            embedding,
+            state,
+            s4d_state_decay=1.0,
+        )
+
+    assert torch.allclose(first, torch.zeros_like(first))
+
+
+def test_lookahead_plan_allocation() -> None:
+    plan = _build_lookahead_plan(
+        separator_lookahead_frames=1,
+        policy="post_fusion_frontloaded",
+        n_pre_blocks=1,
+        n_post_blocks=1,
+    )
+    assert sum(plan) == 1
+    assert plan == (0, 1)
+
+
+def test_lookahead_zero_backward_compat() -> None:
+    torch.manual_seed(15)
+    cfg = _small_config()
+    model_base = SpeakerBeamSS(cfg).eval()
+    cfg_zero = _small_config()
+    cfg_zero.separator_lookahead_frames = 0
+    cfg_zero.lookahead_policy = "post_fusion_frontloaded"
+    model_zero = SpeakerBeamSS(cfg_zero).eval()
+    model_zero.load_state_dict(model_base.state_dict())
+
+    mixture = torch.randn(2, 8 * cfg.enc_stride)
+    embedding = torch.nn.functional.normalize(
+        torch.randn(2, cfg.speaker_embed_dim), p=2, dim=-1,
+    )
+
+    with torch.no_grad():
+        out_base = model_base(mixture, embedding)["clean"]
+        out_zero = model_zero(mixture, embedding)["clean"]
+        stream_base = _run_streaming(
+            model_base,
+            mixture,
+            embedding,
+            chunk_size=2 * cfg.enc_stride,
+        )
+        stream_zero = _run_streaming(
+            model_zero,
+            mixture,
+            embedding,
+            chunk_size=2 * cfg.enc_stride,
+        )
+
+    assert torch.equal(out_base, out_zero)
+    assert torch.equal(stream_base, stream_zero)
 
 
 def test_invalid_mask_activation_raises() -> None:
@@ -303,6 +443,5 @@ def test_invalid_mask_activation_raises() -> None:
     model = SpeakerBeamSS(cfg)
     logits = torch.randn(1, cfg.enc_channels, 4)
 
-    import pytest
     with pytest.raises(ValueError, match="unsupported mask_activation"):
         model._apply_mask_activation(logits)

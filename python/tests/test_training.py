@@ -152,6 +152,8 @@ def test_training_config_defaults() -> None:
     assert cfg.overlap_route_warmup_epochs == 20
     assert cfg.ae_warmup_epochs == 2
     assert cfg.speaker_embed_dim == 192
+    assert cfg.separator_lookahead_frames == 0
+    assert cfg.lookahead_policy == "post_fusion_frontloaded"
     assert cfg.mask_activation == "scaled_sigmoid"
     assert cfg.transition_prob == pytest.approx(0.0)
     assert cfg.transition_warmup_ratio == pytest.approx(0.0)

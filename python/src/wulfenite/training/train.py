@@ -219,6 +219,8 @@ def build_model(cfg: TrainingConfig) -> WulfeniteTSE:
         conv_blocks_per_repeat=cfg.conv_blocks_per_repeat,
         s4d_state_dim=cfg.s4d_state_dim,
         s4d_ffn_multiplier=cfg.s4d_ffn_multiplier,
+        separator_lookahead_frames=cfg.separator_lookahead_frames,
+        lookahead_policy=cfg.lookahead_policy,
         target_presence_head=cfg.target_presence_head,
         mask_activation=cfg.mask_activation,
     )
@@ -1111,6 +1113,13 @@ def _parse_args() -> TrainingConfig:
     parser.add_argument("--conv-blocks-per-repeat", type=int, default=2)
     parser.add_argument("--s4d-state-dim", type=int, default=32)
     parser.add_argument("--s4d-ffn-multiplier", type=int, default=4)
+    parser.add_argument("--separator-lookahead-frames", type=int, default=0)
+    parser.add_argument(
+        "--lookahead-policy",
+        type=str,
+        default="post_fusion_frontloaded",
+        choices=["post_fusion_frontloaded"],
+    )
     parser.add_argument("--target-presence-head", action="store_true")
     parser.add_argument("--mask-activation", type=str, default="scaled_sigmoid",
                         choices=["relu", "scaled_sigmoid"])
@@ -1221,6 +1230,8 @@ def _parse_args() -> TrainingConfig:
         conv_blocks_per_repeat=args.conv_blocks_per_repeat,
         s4d_state_dim=args.s4d_state_dim,
         s4d_ffn_multiplier=args.s4d_ffn_multiplier,
+        separator_lookahead_frames=args.separator_lookahead_frames,
+        lookahead_policy=args.lookahead_policy,
         target_presence_head=args.target_presence_head,
         mask_activation=args.mask_activation,
         loss_sdr=args.loss_sdr,

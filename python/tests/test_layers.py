@@ -39,6 +39,47 @@ def test_causal_conv_whole_vs_chunked() -> None:
     assert diff < 1e-5, f"whole vs chunked causal conv disagreement: {diff:.2e}"
 
 
+def test_causal_conv_right_context_1_whole_vs_streaming() -> None:
+    torch.manual_seed(2)
+    conv = CausalConv1d(
+        in_channels=3,
+        out_channels=5,
+        kernel_size=3,
+        right_context=1,
+    ).eval()
+
+    x = torch.randn(1, 3, 40)
+    chunk_size = 10
+
+    with torch.no_grad():
+        y_whole = conv(x)
+        state = conv.zero_state(batch_size=1, device=x.device)
+        pieces = []
+        for chunk in x.split(chunk_size, dim=-1):
+            y_chunk, state = conv.forward_step(chunk, state)
+            pieces.append(y_chunk)
+        zero_chunk = torch.zeros(1, 3, chunk_size, device=x.device)
+        y_flush, _ = conv.forward_step(zero_chunk, state)
+        pieces.append(y_flush)
+        y_stream = torch.cat(pieces, dim=-1)
+
+    aligned = y_stream[..., conv.right_context:conv.right_context + x.shape[-1]]
+    diff = (y_whole - aligned).abs().max().item()
+    assert diff < 1e-5, f"whole vs streaming right-context disagreement: {diff:.2e}"
+
+
+def test_causal_conv_right_context_0_backward_compat() -> None:
+    conv = CausalConv1d(
+        in_channels=4,
+        out_channels=6,
+        kernel_size=5,
+        dilation=2,
+        right_context=0,
+    )
+    assert conv.pad_left == conv.pad_len
+    assert conv.pad_right == 0
+
+
 def test_causal_conv_is_causal() -> None:
     """Modifying input at time t must not change output at times < t."""
     torch.manual_seed(1)

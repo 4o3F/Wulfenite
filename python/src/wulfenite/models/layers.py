@@ -1,7 +1,6 @@
-"""Causal layers shared by the SpeakerBeam-SS separator.
+"""Streaming-friendly layers shared by the SpeakerBeam-SS separator.
 
-Every layer in this module is strictly causal (uses past context only)
-and supports two forward modes:
+Every layer in this module supports two forward modes:
 
 - ``forward(x)`` — whole-sequence mode for training, takes the whole
   input sequence and returns the whole output sequence.
@@ -30,15 +29,20 @@ from torch import nn
 
 
 class CausalConv1d(nn.Module):
-    """1D convolution that only sees past samples (left padding only).
+    """1D convolution with configurable right context.
 
-    Given kernel size ``k`` and dilation ``d``, the layer left-pads the
-    input by ``(k - 1) * d`` zeros so the output at time ``t`` depends on
-    inputs from ``[t - (k - 1) * d, t]`` inclusive. No future samples
-    are consulted, so the layer is safe for streaming.
+    Given kernel size ``k`` and dilation ``d``, the layer uses a total
+    padding budget of ``(k - 1) * d`` samples. By default that entire
+    budget is assigned to the left side, making the layer strictly
+    causal. When ``right_context > 0``, some of the padding budget moves
+    to the right side so the whole-sequence path can consult bounded
+    future context.
 
-    Streaming state: the last ``pad_len = (k - 1) * d`` input samples
-    of the previous call, kept as a ``[B, C, pad_len]`` tensor.
+    Streaming state always stores the last ``pad_total = (k - 1) * d``
+    input samples of the previous call as a ``[B, C, pad_total]``
+    tensor. The streaming caller is responsible for model-level
+    alignment when ``right_context > 0`` because the first
+    ``right_context`` outputs are startup transients.
     """
 
     def __init__(
@@ -50,6 +54,7 @@ class CausalConv1d(nn.Module):
         dilation: int = 1,
         groups: int = 1,
         bias: bool = True,
+        right_context: int = 0,
     ) -> None:
         super().__init__()
         if stride != 1:
@@ -62,7 +67,18 @@ class CausalConv1d(nn.Module):
         self.out_channels = out_channels
         self.kernel_size = kernel_size
         self.dilation = dilation
-        self.pad_len = (kernel_size - 1) * dilation
+        self.pad_total = (kernel_size - 1) * dilation
+        if not 0 <= right_context <= self.pad_total:
+            raise ValueError(
+                "right_context must be between 0 and "
+                f"{self.pad_total}; got {right_context}"
+            )
+        self.right_context = right_context
+        self.pad_left = self.pad_total - right_context
+        self.pad_right = right_context
+        # Keep the legacy attribute name for backward compatibility with
+        # tests and any external callers.
+        self.pad_len = self.pad_total
         self.conv = nn.Conv1d(
             in_channels,
             out_channels,
@@ -81,11 +97,11 @@ class CausalConv1d(nn.Module):
             x: ``[B, in_channels, T]``.
 
         Returns:
-            ``[B, out_channels, T]`` (same time length — left padding
-            keeps output aligned with input).
+            ``[B, out_channels, T]`` (same time length — the total
+            padding budget keeps the output aligned with the input).
         """
-        if self.pad_len > 0:
-            x = F.pad(x, (self.pad_len, 0))
+        if self.pad_total > 0:
+            x = F.pad(x, (self.pad_left, self.pad_right))
         return self.conv(x)
 
     def zero_state(self, batch_size: int, device: torch.device,
@@ -116,8 +132,8 @@ class CausalConv1d(nn.Module):
         Returns:
             Tuple of:
             - ``[B, out_channels, T_new]`` output covering exactly the
-              new samples (no boundary artifacts — the state carries
-              enough left context).
+              new samples. When ``right_context > 0`` the leading outputs
+              are startup transients that the caller must align away.
             - updated state ``[B, in_channels, pad_len]`` to feed into
               the next call.
         """
