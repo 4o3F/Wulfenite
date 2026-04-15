@@ -143,8 +143,8 @@ def _group_by_speaker(
     """Group a flat entry list by speaker, dropping sparse speakers.
 
     Speakers with fewer than ``min_utts_per_speaker`` utterances are
-    dropped because the mixer needs at least two distinct utterances
-    per target speaker (one for clean / target, one for enrollment).
+    dropped because the downstream training pipeline generally needs
+    more than one utterance per speaker.
     """
     by_spk: dict[str, list[AudioEntry]] = {}
     for e in entries:
@@ -206,8 +206,7 @@ def scan_aishell1(
             "AISHELL-1", scanned_dirs, diagnostics,
             extra_hint=(
                 "Check that the archive was extracted and the per-speaker "
-                ".tar.gz files inside wav/{train,dev,test}/ were unpacked "
-                "(see TRAIN.md section 2)."
+                ".tar.gz files inside wav/{train,dev,test}/ were unpacked."
             ),
         ))
     return _group_by_speaker(entries, min_utts_per_speaker)
@@ -264,8 +263,7 @@ def scan_aishell3(
             extra_hint=(
                 "AISHELL-3 is distributed at 44.1 kHz; Wulfenite needs 16 kHz "
                 "mono. Run `python -m wulfenite.scripts.resample_aishell3 "
-                "--root ../assets/aishell3` once to convert in place, then "
-                "re-run training. See docs/TRAIN.md section 2."
+                "--root ../assets/aishell3` once to convert in place."
             ),
         ))
     return _group_by_speaker(entries, min_utts_per_speaker)

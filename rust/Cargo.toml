@@ -3,7 +3,7 @@ name = "wulfenite"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "Real-time target speaker extraction — engineering / deployment crate"
+description = "Real-time speech enhancement runtime scaffold"
 
 [dependencies]
 # Error handling + CLI + logging

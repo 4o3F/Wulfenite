@@ -1,22 +1,27 @@
-"""wulfenite.training — training loop, config, and checkpoint utilities.
+"""wulfenite.training — PSE training entry points."""
 
-Library-level re-exports. ``train.py`` is NOT imported here because
-it is an entry-point module meant to be run as ``python -m
-wulfenite.training.train``; importing it at package-init time would
-preload it into ``sys.modules`` and trigger a ``runpy`` warning
-("found in sys.modules after import of package ..."). Code that
-wants the training loop from Python should do::
-
-    from wulfenite.training.train import run_training
-
-instead of ``from wulfenite.training import run_training``.
-"""
-
-from .checkpoint import load_checkpoint, save_checkpoint
-from .config import TrainingConfig
+from .config import TrainConfig
+from .kd_dataset import TinyECAPAKDBatch, TinyECAPAKDDataset, split_speakers_for_kd
+from .train_pdfnet2 import run_pdfnet2_epoch, scheduled_batch_size, train_pdfnet2
+from .train_tiny_ecapa import (
+    ContrastiveKDLoss,
+    augment_speaker_batch,
+    load_tiny_ecapa_checkpoint,
+    run_tiny_ecapa_epoch,
+    train_tiny_ecapa,
+)
 
 __all__ = [
-    "TrainingConfig",
-    "load_checkpoint",
-    "save_checkpoint",
+    "TrainConfig",
+    "TinyECAPAKDBatch",
+    "TinyECAPAKDDataset",
+    "split_speakers_for_kd",
+    "scheduled_batch_size",
+    "run_pdfnet2_epoch",
+    "train_pdfnet2",
+    "ContrastiveKDLoss",
+    "augment_speaker_batch",
+    "load_tiny_ecapa_checkpoint",
+    "run_tiny_ecapa_epoch",
+    "train_tiny_ecapa",
 ]

@@ -79,6 +79,7 @@ class STFTLoss(nn.Module):
         self.hop_length = hop_length
         self.win_length = win_length
         self.eps = eps
+        self.window: torch.Tensor
         self.register_buffer(
             "window",
             torch.hann_window(win_length),

@@ -1,7 +1,7 @@
 [project]
 name = "wulfenite"
 version = "0.1.0"
-description = "Wulfenite research crate — SpeakerBeam-SS target speaker extraction"
+description = "Wulfenite research crate — reset state for real-time PSE redesign"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
@@ -22,6 +22,7 @@ packages = ["src/wulfenite"]
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "ty>=0.0.30",
 ]
 
 [tool.uv.sources]
@@ -34,7 +35,7 @@ torchaudio = { index = "pytorch" }
 
 # PyPI via Tsinghua mirror — much faster than pypi.org inside CN.
 [[tool.uv.index]]
-url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+url = "https://mirrors.bfsu.edu.cn/pypi/web/simple"
 
 [[tool.uv.index]]
 name = "pytorch"

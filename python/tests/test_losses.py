@@ -1,10 +1,4 @@
-"""Unit tests for wulfenite losses.
-
-The non-scale-invariant SDR tests encode the degenerate-case
-guarantees that make this loss family preferable to SI-SDR for our
-use case (see ``docs/architecture.md`` section 5). Read the
-comments in each test for the exact invariant being checked.
-"""
+"""Unit tests for retained generic enhancement losses."""
 
 from __future__ import annotations
 
@@ -12,69 +6,41 @@ import pytest
 import torch
 
 from wulfenite.losses import (
-    LossWeights,
+    MultiResolutionLoss,
     MultiResolutionSTFTLoss,
+    OverSuppressionLoss,
+    PDfNet2Loss,
+    SpectralLoss,
     STFTLoss,
-    WulfeniteLoss,
-    compute_scene_routing_stats,
     compute_sdr_db,
     compute_sdri_db,
-    presence_loss,
     sdr_loss,
-    target_inactive_loss,
-    target_recall_loss,
-    target_absent_loss,
 )
 
 
-# ---------------------------------------------------------------------------
-# sdr_loss
-# ---------------------------------------------------------------------------
-
-
 def test_sdr_perfect_estimate_is_very_negative() -> None:
-    """Perfect estimate → SDR → very high → loss very negative."""
     target = torch.randn(2, 16000)
     loss = sdr_loss(target.clone(), target)
-    # Eps-limited; should be well below -40 dB.
-    assert loss.item() < -40.0, f"expected loss << -40, got {loss.item()}"
+    assert loss.item() < -40.0
 
 
-def test_sdr_passthrough_on_mixture_gives_zero_dB() -> None:
-    """When ``estimate = mixture = target + interferer`` at 0 dB input SNR,
-    SDR is approximately 0 dB. This is the key anti-pass-through
-    property that SI-SDR lacks.
-    """
+def test_sdr_passthrough_on_mixture_gives_zero_db() -> None:
     torch.manual_seed(0)
     target = torch.randn(4, 16000)
     interferer = torch.randn(4, 16000)
-    # Both at unit RMS so input SNR ≈ 0 dB
     target = target / target.std(dim=-1, keepdim=True)
     interferer = interferer / interferer.std(dim=-1, keepdim=True)
     mixture = target + interferer
     loss = sdr_loss(mixture, target)
-    # 0 dB SDR means loss ≈ 0. Allow slack for finite-sample variance.
-    assert -1.0 < loss.item() < 1.0, (
-        f"pass-through SDR should be ~0 dB, got loss {loss.item():.3f}"
-    )
+    assert -1.0 < loss.item() < 1.0
 
 
 def test_sdr_tiny_output_is_not_rewarded() -> None:
-    """Tiny output (estimate ≈ 0) should give loss ≈ 0 dB.
-
-    This is the critical SDR property that SI-SDR lacks: SI-SDR would
-    return -infinity for estimate = α·target with α → 0 (perfect
-    shape match ignored scale). Direct SDR instead penalizes the
-    shape error AND the scale error.
-    """
     torch.manual_seed(1)
     target = torch.randn(4, 16000)
     tiny = target * 1e-6
     loss = sdr_loss(tiny, target)
-    # Very tiny estimate means error ≈ -target, so SDR ≈ 0 dB.
-    assert -1.0 < loss.item() < 1.0, (
-        f"tiny-output SDR should be ~0 dB, got loss {loss.item():.3f}"
-    )
+    assert -1.0 < loss.item() < 1.0
 
 
 def test_sdr_per_sample_reduction() -> None:
@@ -103,18 +69,13 @@ def test_compute_sdri_db_zero_for_passthrough() -> None:
     assert abs(float(sdri.item())) < 1e-5
 
 
-# ---------------------------------------------------------------------------
-# MR-STFT
-# ---------------------------------------------------------------------------
-
-
 def test_stft_loss_perfect_is_near_zero() -> None:
     torch.manual_seed(0)
     x = torch.randn(2, 16000)
     loss_fn = STFTLoss(n_fft=512, hop_length=128, win_length=512)
     sc, lm = loss_fn(x, x)
-    assert sc.item() < 1e-5, f"sc on identical signals {sc.item():.3e}"
-    assert lm.item() < 1e-5, f"log_mag on identical signals {lm.item():.3e}"
+    assert sc.item() < 1e-5
+    assert lm.item() < 1e-5
 
 
 def test_stft_sc_clamp() -> None:
@@ -145,501 +106,32 @@ def test_mr_stft_loss_runs_and_is_positive() -> None:
 
 def test_mr_stft_buffers_move_with_device() -> None:
     loss_fn = MultiResolutionSTFTLoss()
-    # Hann windows should be registered as buffers and follow .to(...)
-    for m in loss_fn.stft_losses:
-        assert m.window.dtype == torch.float32
+    for module in loss_fn.stft_losses:
+        assert module.window.dtype == torch.float32
 
 
-# ---------------------------------------------------------------------------
-# recall
-# ---------------------------------------------------------------------------
+def test_spectral_loss_perfect_is_near_zero() -> None:
+    spec = torch.view_as_real(torch.randn(2, 8, 161, dtype=torch.complex64))
+    loss = SpectralLoss()(spec, spec)
+    assert loss.item() < 1e-6
 
 
-def test_recall_loss_penalizes_under_estimation() -> None:
-    target = torch.ones(2, 8)
-    estimate = torch.stack([target[0].clone(), torch.zeros_like(target[1])], dim=0)
-
-    per_sample = target_recall_loss(
-        estimate,
-        target,
-        frame_size=4,
-        floor=0.3,
-        reduction="none",
-    )
-
-    assert per_sample.shape == (2,)
-    assert per_sample.mean().item() > 0.0
-    assert per_sample[0].item() < 1e-6
-    assert per_sample[1].item() > per_sample[0].item()
+def test_multi_resolution_loss_perfect_is_zero() -> None:
+    wav = torch.randn(2, 16000)
+    loss = MultiResolutionLoss()(wav, wav)
+    assert loss.item() < 1e-6
 
 
-def test_recall_loss_ignores_silent_frames() -> None:
-    target = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+def test_over_suppression_loss_penalizes_quiet_estimate() -> None:
+    target = torch.view_as_real(torch.randn(2, 8, 161, dtype=torch.complex64))
     estimate = torch.zeros_like(target)
-
-    loss = target_recall_loss(
-        estimate,
-        target,
-        frame_size=2,
-        floor=0.3,
-    )
-
-    assert loss.item() == pytest.approx(0.3, abs=1e-6)
-
-
-def test_recall_loss_no_penalty_above_floor() -> None:
-    target = torch.ones(1, 8)
-    estimate = target * 0.7
-
-    loss = target_recall_loss(
-        estimate,
-        target,
-        frame_size=4,
-        floor=0.3,
-    )
-
-    assert loss.item() == pytest.approx(0.0, abs=1e-6)
-
-
-def test_recall_loss_with_ground_truth_active_frames() -> None:
-    target = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
-    estimate = torch.zeros_like(target)
-    active_frames = torch.tensor([[True, False]])
-
-    loss = target_recall_loss(
-        estimate,
-        target,
-        frame_size=2,
-        active_frames=active_frames,
-        floor=0.3,
-    )
-
-    assert loss.item() == pytest.approx(0.3, abs=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# silence / absent
-# ---------------------------------------------------------------------------
-
-
-def test_target_absent_zero_estimate_is_zero_loss() -> None:
-    mixture = torch.randn(3, 8000)
-    estimate = torch.zeros(3, 8000)
-    loss = target_absent_loss(estimate, mixture)
-    assert loss.item() < 1e-6, f"expected ~0, got {loss.item()}"
-
-
-def test_target_absent_passthrough_is_one() -> None:
-    mixture = torch.randn(3, 8000)
-    loss = target_absent_loss(mixture, mixture)
-    # est_energy / mix_energy == 1
-    assert abs(loss.item() - 1.0) < 1e-4
-
-
-def test_target_absent_larger_than_mixture_is_penalized() -> None:
-    mixture = torch.randn(3, 8000)
-    loud = mixture * 3.0
-    loss = target_absent_loss(loud, mixture)
-    assert loss.item() > 8.5, f"expected > 8.5, got {loss.item()}"
-
-
-def test_inactive_loss_penalizes_output_on_silent_frames() -> None:
-    estimate = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
-    mixture = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
-    inactive_frames = torch.tensor([[True, False]])
-
-    loss = target_inactive_loss(
-        estimate,
-        mixture,
-        inactive_frames=inactive_frames,
-        frame_size=2,
-    )
-
+    loss = OverSuppressionLoss()(estimate, target)
     assert loss.item() > 0.0
 
 
-def test_inactive_loss_zero_when_output_silent() -> None:
-    estimate = torch.zeros(1, 4)
-    mixture = torch.ones(1, 4)
-    inactive_frames = torch.tensor([[True, True]])
-
-    loss = target_inactive_loss(
-        estimate,
-        mixture,
-        inactive_frames=inactive_frames,
-        frame_size=2,
-    )
-
-    assert loss.item() == pytest.approx(0.0, abs=1e-6)
-
-
-def test_inactive_loss_excludes_low_energy_frames() -> None:
-    estimate = torch.tensor([[10.0, 10.0, 1.0, 1.0]])
-    mixture = torch.tensor([[1e-3, 1e-3, 1.0, 1.0]])
-    inactive_frames = torch.tensor([[True, True]])
-
-    loss = target_inactive_loss(
-        estimate,
-        mixture,
-        inactive_frames=inactive_frames,
-        frame_size=2,
-    )
-
-    assert loss.item() == pytest.approx((1.0 - 0.05) ** 2, abs=1e-6)
-
-
-def test_inactive_loss_topk_focuses_on_worst_frame() -> None:
-    estimate = torch.tensor([[1.0, 1.0, 0.5, 0.5]])
-    mixture = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
-    inactive_frames = torch.tensor([[True, True]])
-
-    loss = target_inactive_loss(
-        estimate,
-        mixture,
-        inactive_frames=inactive_frames,
-        frame_size=2,
-        threshold=0.0,
-        topk_fraction=0.5,
-    )
-
-    assert loss.item() == pytest.approx(1.0, abs=1e-6)
-
-
-def test_inactive_loss_clamps_extreme_ratio_before_squaring() -> None:
-    estimate = torch.tensor([[10.0, 10.0]])
-    mixture = torch.tensor([[1e-2, 1e-2]])
-    inactive_frames = torch.tensor([[True]])
-
-    loss = target_inactive_loss(
-        estimate,
-        mixture,
-        inactive_frames=inactive_frames,
-        frame_size=2,
-        threshold=0.0,
-        topk_fraction=1.0,
-    )
-
-    assert loss.item() == pytest.approx(16.0, abs=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# presence
-# ---------------------------------------------------------------------------
-
-
-def test_presence_correct_labels_small_loss() -> None:
-    # Very confident correct predictions.
-    logits = torch.tensor([10.0, -10.0, 10.0, -10.0])
-    labels = torch.tensor([1.0, 0.0, 1.0, 0.0])
-    loss = presence_loss(logits, labels)
-    assert loss.item() < 1e-3
-
-
-def test_presence_wrong_labels_large_loss() -> None:
-    logits = torch.tensor([10.0, -10.0])
-    labels = torch.tensor([0.0, 1.0])
-    loss = presence_loss(logits, labels)
-    assert loss.item() > 5.0
-
-
-# ---------------------------------------------------------------------------
-# combined
-# ---------------------------------------------------------------------------
-
-
-def test_combined_loss_all_present() -> None:
-    """All samples target-present → SDR + MR-STFT branches active, absent = 0."""
-    torch.manual_seed(3)
-    B, T = 2, 2048
-    clean = torch.randn(B, T, requires_grad=True)
-    target = torch.randn(B, T)
-    mixture = torch.randn(B, T)
-    present = torch.ones(B)
-    logits = torch.zeros(B, requires_grad=True)
-
-    loss_fn = WulfeniteLoss(
-        weights=LossWeights(sdr=1.0, mr_stft=0.5, absent=1.0, presence=0.1),
-        mr_stft_loss=MultiResolutionSTFTLoss(
-            fft_sizes=(256,), hop_sizes=(64,), win_lengths=(256,),
-        ),
-    )
-    total, parts = loss_fn(clean, target, mixture, present, logits)
-    assert parts.n_present == B
-    assert parts.n_absent == 0
-    assert parts.absent == 0.0
-    assert parts.recall >= 0.0
-    assert parts.inactive >= 0.0
-    assert torch.isfinite(total)
-    total.backward()
-    assert clean.grad is not None and torch.isfinite(clean.grad).all()
-
-
-def test_combined_loss_all_absent() -> None:
-    """All samples target-absent → SDR/STFT = 0, only absent branch active."""
-    torch.manual_seed(4)
-    B, T = 2, 2048
-    clean = torch.randn(B, T, requires_grad=True)
-    target = torch.zeros(B, T)        # silent target
-    mixture = torch.randn(B, T)
-    present = torch.zeros(B)
-    logits = torch.zeros(B, requires_grad=True)
-
-    loss_fn = WulfeniteLoss(
-        mr_stft_loss=MultiResolutionSTFTLoss(
-            fft_sizes=(256,), hop_sizes=(64,), win_lengths=(256,),
-        ),
-    )
-    total, parts = loss_fn(clean, target, mixture, present, logits)
-    assert parts.n_present == 0
-    assert parts.n_absent == B
-    assert parts.sdr == 0.0
-    assert parts.mr_stft == 0.0
-    assert parts.recall == 0.0
-    assert parts.inactive == 0.0
-    assert parts.absent > 0.0
-    total.backward()
-    assert clean.grad is not None and torch.isfinite(clean.grad).all()
-
-
-def test_combined_loss_mixed_batch() -> None:
-    """Mixed batch → both branches contribute, per-sample masking is clean."""
-    torch.manual_seed(5)
-    B, T = 4, 2048
-    clean = torch.randn(B, T, requires_grad=True)
-    target = torch.randn(B, T)
-    # Half the batch has zero target
-    present = torch.tensor([1.0, 0.0, 1.0, 0.0])
-    target = target * present.view(-1, 1)  # zero out absent-target rows
-    mixture = torch.randn(B, T)
-    logits = torch.zeros(B, requires_grad=True)
-
-    loss_fn = WulfeniteLoss(
-        mr_stft_loss=MultiResolutionSTFTLoss(
-            fft_sizes=(256,), hop_sizes=(64,), win_lengths=(256,),
-        ),
-    )
-    total, parts = loss_fn(clean, target, mixture, present, logits)
-    assert parts.n_present == 2
-    assert parts.n_absent == 2
-    assert parts.sdr != 0.0  # present branch active
-    assert parts.recall >= 0.0
-    assert parts.inactive >= 0.0
-    assert parts.absent > 0.0
-    total.backward()
-    assert clean.grad is not None and torch.isfinite(clean.grad).all()
-
-
-def test_combined_loss_without_presence_head() -> None:
-    """presence_logit=None should skip presence branch cleanly."""
-    torch.manual_seed(6)
-    B, T = 2, 1024
-    clean = torch.randn(B, T, requires_grad=True)
-    target = torch.randn(B, T)
-    mixture = torch.randn(B, T)
-    present = torch.ones(B)
-
-    loss_fn = WulfeniteLoss(
-        mr_stft_loss=MultiResolutionSTFTLoss(
-            fft_sizes=(256,), hop_sizes=(64,), win_lengths=(256,),
-        ),
-    )
-    total, parts = loss_fn(clean, target, mixture, present, presence_logit=None)
-    assert parts.presence == 0.0
-    assert parts.inactive == 0.0
-    total.backward()
-    assert clean.grad is not None
-
-
-def test_combined_loss_inactive_uses_nontarget_mask() -> None:
-    frame = 160
-    clean = torch.zeros(1, frame * 3)
-    mixture = torch.ones(1, frame * 3)
-    target = torch.zeros(1, frame * 3)
-    present = torch.ones(1)
-
-    clean[:, frame:2 * frame] = 1.0
-    clean[:, 2 * frame:] = 2.0
-    target[:, :frame] = 1.0
-    target_active = torch.tensor([[True, False, False]])
-    nontarget_active = torch.tensor([[False, True, False]])
-
-    total, parts = WulfeniteLoss(
-        weights=LossWeights(
-            sdr=0.0,
-            mr_stft=0.0,
-            absent=0.0,
-            presence=0.0,
-            recall=0.0,
-            inactive=1.0,
-        ),
-        mr_stft_loss=MultiResolutionSTFTLoss(
-            fft_sizes=(256,), hop_sizes=(64,), win_lengths=(256,),
-        ),
-        inactive_threshold=0.0,
-        inactive_topk_fraction=1.0,
-    )(
-        clean,
-        target,
-        mixture,
-        present,
-        presence_logit=None,
-        target_active_frames=target_active,
-        nontarget_active_frames=nontarget_active,
-    )
-
-    assert total.item() == pytest.approx(1.0, abs=1e-6)
-    assert parts.inactive == pytest.approx(1.0, abs=1e-6)
-
-
-def test_combined_loss_recall_excludes_overlap_frames() -> None:
-    frame = 160
-    clean = torch.zeros(1, frame * 2)
-    target = torch.ones(1, frame * 2)
-    mixture = target.clone()
-    present = torch.ones(1)
-    target_active = torch.tensor([[True, True]])
-    overlap = torch.tensor([[False, True]])
-
-    total, parts = WulfeniteLoss(
-        weights=LossWeights(
-            sdr=0.0,
-            mr_stft=0.0,
-            absent=0.0,
-            presence=0.0,
-            recall=1.0,
-            inactive=0.0,
-        ),
-        mr_stft_loss=MultiResolutionSTFTLoss(
-            fft_sizes=(256,), hop_sizes=(64,), win_lengths=(256,),
-        ),
-        recall_frame_size=frame,
-        recall_floor=0.3,
-    )(
-        clean,
-        target,
-        mixture,
-        present,
-        presence_logit=None,
-        target_active_frames=target_active,
-        overlap_frames=overlap,
-    )
-
-    assert total.item() == pytest.approx(0.3, abs=1e-6)
-    assert parts.recall == pytest.approx(0.3, abs=1e-6)
-
-
-def test_loss_dataclasses_no_longer_expose_speaker_cls() -> None:
-    weights = LossWeights()
-    assert not hasattr(weights, "speaker_cls")
-
-    clean = torch.randn(1, 256, requires_grad=True)
-    target = torch.randn(1, 256)
-    mixture = torch.randn(1, 256)
-    present = torch.ones(1)
-
-    total, parts = WulfeniteLoss(
-        mr_stft_loss=MultiResolutionSTFTLoss(
-            fft_sizes=(128,), hop_sizes=(32,), win_lengths=(128,),
-        ),
-    )(clean, target, mixture, present, presence_logit=None)
-    assert torch.isfinite(total)
-    assert not hasattr(parts, "speaker_cls")
-
-
-def test_scene_routing_stats_penalize_swapped_outputs() -> None:
-    frame = 160
-    target_a = torch.cat(
-        [torch.ones(frame), torch.zeros(frame), torch.full((frame,), 0.5)],
-    ).unsqueeze(0)
-    target_b = torch.cat(
-        [torch.zeros(frame), torch.ones(frame), torch.full((frame,), 1.0)],
-    ).unsqueeze(0)
-    mixture = target_a + target_b
-    estimate = torch.cat([target_b, target_a], dim=0)
-    target = torch.cat([target_a, target_b], dim=0)
-    target_active = torch.tensor([[True, False, True], [False, True, True]])
-    nontarget_active = torch.tensor([[False, True, True], [True, False, True]])
-    overlap = torch.tensor([[False, False, True], [False, False, True]])
-    background = torch.tensor([[False, False, False], [False, False, False]])
-    scene_id = torch.tensor([0, 0])
-    view_role_id = torch.tensor([0, 1])
-
-    stats = compute_scene_routing_stats(
-        estimate,
-        target,
-        mixture.repeat(2, 1),
-        target_active_frames=target_active,
-        nontarget_active_frames=nontarget_active,
-        overlap_frames=overlap,
-        background_frames=background,
-        scene_id=scene_id,
-        view_role_id=view_role_id,
-        frame_size=frame,
-        route_margin=0.05,
-        overlap_margin=0.02,
-        overlap_dominance_margin=0.01,
-    )
-
-    assert float(stats["route_loss"].item()) > 0.0
-    assert float(stats["overlap_route_loss"].item()) > 0.0
-    assert float(stats["target_only_energy_wrong"].item()) > float(
-        stats["target_only_energy_true"].item()
-    )
-
-
-# ---------------------------------------------------------------------------
-# AE reconstruction loss
-# ---------------------------------------------------------------------------
-
-
-def test_ae_loss_perfect_reconstruction_is_zero() -> None:
-    torch.manual_seed(20)
-    mixture = torch.randn(2, 8000)
-    target = torch.randn(2, 8000)
-    clean = target.clone()
-    target_present = torch.ones(2)
-
-    loss_fn = WulfeniteLoss(weights=LossWeights(ae=1.0, sdr=0.0, mr_stft=0.0))
-    total, parts = loss_fn(
-        clean=clean,
-        target=target,
-        mixture=mixture,
-        target_present=target_present,
-        ae_reconstruction=mixture,  # perfect reconstruction
-    )
-    assert parts.ae < 1e-6
-
-
-def test_ae_loss_zero_reconstruction_matches_mixture_mean() -> None:
-    torch.manual_seed(21)
-    mixture = torch.randn(2, 8000)
-    target = torch.randn(2, 8000)
-    clean = target.clone()
-    target_present = torch.ones(2)
-
-    loss_fn = WulfeniteLoss(weights=LossWeights(ae=1.0, sdr=0.0, mr_stft=0.0))
-    total, parts = loss_fn(
-        clean=clean,
-        target=target,
-        mixture=mixture,
-        target_present=target_present,
-        ae_reconstruction=torch.zeros_like(mixture),
-    )
-    expected = mixture.abs().mean().item()
-    assert abs(parts.ae - expected) < 1e-5
-
-
-def test_ae_loss_raises_when_missing() -> None:
-    mixture = torch.randn(2, 8000)
-    target = torch.randn(2, 8000)
-    clean = target.clone()
-    target_present = torch.ones(2)
-
-    loss_fn = WulfeniteLoss(weights=LossWeights(ae=1.0, sdr=0.0, mr_stft=0.0))
-    with pytest.raises(ValueError, match="ae_reconstruction is required"):
-        loss_fn(
-            clean=clean,
-            target=target,
-            mixture=mixture,
-            target_present=target_present,
-        )
+def test_pdfnet2_loss_returns_components() -> None:
+    wav = torch.randn(2, 16000)
+    loss_fn = PDfNet2Loss()
+    total, terms = loss_fn(wav, wav)
+    assert total.item() < 1e-4
+    assert set(terms) == {"spectral", "multi_res", "over_suppression"}

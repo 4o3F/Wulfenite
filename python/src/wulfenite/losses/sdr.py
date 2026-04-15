@@ -125,9 +125,8 @@ def sdr_loss(
     Args:
         estimate: ``[B, T]`` time-domain estimate.
         target: ``[B, T]`` time-domain reference. Must have nonzero
-            energy per batch element — silent targets should be
-            routed through :func:`wulfenite.losses.silence.target_absent_loss`
-            instead.
+            energy per batch element; fully silent references should
+            be handled by the caller with a separate objective.
         eps: small constant added to the denominator and inside the
             log to keep the loss finite on near-perfect estimates.
         zero_mean: subtract per-signal mean before computing the

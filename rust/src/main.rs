@@ -1,6 +1,6 @@
 // Wulfenite — engineering / deployment crate.
 //
-// This is a clean slate after the v1 BSRNN+CAM++ branch was archived.
+// This is a clean slate after the TSE branch was archived on `v2`.
 // The new model architecture is being designed; this binary intentionally
 // has no model code yet. Reusable model-agnostic infrastructure lives in
 // the `audio` module (STFT, resampling, WAV I/O, FFT planner caching).
@@ -15,7 +15,7 @@ mod audio;
 
 #[derive(Debug, Parser)]
 #[command(name = "wulfenite")]
-#[command(about = "Wulfenite real-time target speaker extraction (engineering crate)")]
+#[command(about = "Wulfenite real-time speech enhancement runtime scaffold")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

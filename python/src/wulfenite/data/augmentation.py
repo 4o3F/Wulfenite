@@ -20,8 +20,12 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
+
+
+RoomPreset = Literal["small", "medium", "large", "mixed"]
 
 
 # ---------------------------------------------------------------------------
@@ -39,11 +43,42 @@ class ReverbConfig:
     """
 
     sample_rate: int = 16000
-    rt60_range: tuple[float, float] = (0.08, 0.25)
-    num_early_reflections_range: tuple[int, int] = (3, 6)
-    early_delay_range_ms: tuple[float, float] = (5.0, 35.0)
+    rt60_range: tuple[float, float] = (0.08, 0.80)
+    num_early_reflections_range: tuple[int, int] = (3, 12)
+    early_delay_range_ms: tuple[float, float] = (5.0, 80.0)
     early_amplitude_range: tuple[float, float] = (0.25, 0.70)
     diffuse_tail_scale: float = 0.10
+
+    @classmethod
+    def from_preset(
+        cls,
+        preset: RoomPreset,
+        sample_rate: int = 16000,
+    ) -> "ReverbConfig":
+        if preset == "small":
+            return cls(
+                sample_rate=sample_rate,
+                rt60_range=(0.08, 0.25),
+                num_early_reflections_range=(3, 6),
+                early_delay_range_ms=(5.0, 35.0),
+            )
+        if preset == "medium":
+            return cls(
+                sample_rate=sample_rate,
+                rt60_range=(0.20, 0.50),
+                num_early_reflections_range=(5, 9),
+                early_delay_range_ms=(10.0, 55.0),
+            )
+        if preset == "large":
+            return cls(
+                sample_rate=sample_rate,
+                rt60_range=(0.45, 0.80),
+                num_early_reflections_range=(8, 14),
+                early_delay_range_ms=(15.0, 80.0),
+            )
+        if preset == "mixed":
+            return cls(sample_rate=sample_rate)
+        raise ValueError(f"Unsupported room preset: {preset}")
 
 
 def synth_room_rir(
@@ -124,6 +159,49 @@ def apply_rir(signal: torch.Tensor, rir: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+def _fit_noise_length(
+    noise: torch.Tensor,
+    length: int,
+    rng: random.Random | None,
+) -> torch.Tensor:
+    if noise.dim() != 1:
+        raise ValueError(f"noise must be 1-D, got {tuple(noise.shape)}")
+    if length < 0:
+        raise ValueError(f"length must be >= 0, got {length}")
+    if noise.shape[-1] == length:
+        return noise
+    if noise.shape[-1] == 0:
+        return torch.zeros(length, device=noise.device, dtype=noise.dtype)
+    if noise.shape[-1] < length:
+        reps = (length + noise.shape[-1] - 1) // noise.shape[-1]
+        return noise.repeat(reps)[:length]
+    if rng is not None:
+        start = rng.randint(0, noise.shape[-1] - length)
+    else:
+        start = torch.randint(0, noise.shape[-1] - length + 1, (1,)).item()
+    return noise[start:start + length]
+
+
+def scale_noise_to_snr(
+    reference: torch.Tensor,
+    noise: torch.Tensor,
+    snr_db: float,
+    *,
+    rng: random.Random | None = None,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Scale ``noise`` to achieve the requested SNR relative to ``reference``."""
+    fitted_noise = _fit_noise_length(noise, reference.shape[-1], rng)
+    if float(reference.abs().max()) < eps or float(fitted_noise.abs().max()) < eps:
+        return torch.zeros_like(reference)
+    ref_rms = float(torch.sqrt((reference * reference).mean() + eps))
+    noise_rms = float(torch.sqrt((fitted_noise * fitted_noise).mean() + eps))
+    if ref_rms < eps or noise_rms < eps:
+        return torch.zeros_like(reference)
+    target_noise_rms = ref_rms / (10.0 ** (snr_db / 20.0))
+    return fitted_noise * (target_noise_rms / noise_rms)
+
+
 def add_noise_at_snr(
     signal: torch.Tensor,
     noise: torch.Tensor,
@@ -142,22 +220,8 @@ def add_noise_at_snr(
     matches the requested ``snr_db``. If ``noise`` is shorter than
     ``signal`` it is looped; if longer, a random window is taken.
     """
-    n = signal.shape[-1]
-    if noise.shape[-1] < n:
-        reps = (n + noise.shape[-1] - 1) // noise.shape[-1]
-        noise = noise.repeat(reps)[:n]
-    elif noise.shape[-1] > n:
-        start = torch.randint(0, noise.shape[-1] - n + 1, (1,)).item()
-        noise = noise[start:start + n]
-
-    sig_rms = float(torch.sqrt((signal * signal).mean() + eps))
-    noise_rms = float(torch.sqrt((noise * noise).mean() + eps))
-    if sig_rms < eps or noise_rms < eps:
-        return signal
-
-    target_noise_rms = sig_rms / (10.0 ** (snr_db / 20.0))
-    noise = noise * (target_noise_rms / noise_rms)
-    return signal + noise
+    scaled_noise = scale_noise_to_snr(signal, noise, snr_db, eps=eps)
+    return signal + scaled_noise
 
 
 def add_gaussian_noise(
@@ -174,3 +238,15 @@ def add_gaussian_noise(
         signal.shape, generator=generator, device=signal.device, dtype=signal.dtype,
     )
     return add_noise_at_snr(signal, noise, snr_db)
+
+
+__all__ = [
+    "RoomPreset",
+    "ReverbConfig",
+    "synth_room_rir",
+    "apply_rir",
+    "_fit_noise_length",
+    "scale_noise_to_snr",
+    "add_noise_at_snr",
+    "add_gaussian_noise",
+]
