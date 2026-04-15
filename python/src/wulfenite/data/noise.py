@@ -86,3 +86,31 @@ def scan_noise_dir(
             "recursive wav search finds your corpus layout."
         )
     return entries
+
+
+def scan_noise_dirs(
+    roots: dict[str, Path | str],
+    min_duration_seconds: float = 1.0,
+) -> dict[str, list[NoiseEntry]]:
+    """Scan multiple categorized noise roots.
+
+    Args:
+        roots: mapping of category name to directory path.
+        min_duration_seconds: minimum duration required per noise file.
+
+    Returns:
+        Dict of category name -> list of :class:`NoiseEntry`.
+
+    Raises:
+        ValueError: if ``roots`` is empty.
+        RuntimeError: if any configured category does not contain valid noise.
+    """
+    if not roots:
+        raise ValueError("roots must not be empty")
+    categorized: dict[str, list[NoiseEntry]] = {}
+    for category, root in roots.items():
+        categorized[category] = scan_noise_dir(
+            root,
+            min_duration_seconds=min_duration_seconds,
+        )
+    return categorized

@@ -22,13 +22,21 @@ from wulfenite.data import (
     scan_cnceleb,
     scan_magicdata,
     scan_noise_dir,
+    scan_noise_dirs,
     scale_noise_to_snr,
     synth_room_rir,
 )
 from wulfenite.data.augmentation import (
+    _estimate_signal_rms,
     _fit_noise_length,
     apply_bandwidth_limit,
     apply_random_gain,
+)
+from wulfenite.scripts.train_pdfnet2 import (
+    _build_mixer_kwargs,
+    _parse_bucket_table,
+    _scan_dataset_splits,
+    _scan_noise_inputs,
 )
 
 
@@ -255,6 +263,18 @@ def test_scan_noise_dir_drops_short_files(tmp_path: Path) -> None:
     assert noises[0].path.name == "long.wav"
 
 
+def test_scan_noise_dirs_returns_per_category_entries(tmp_path: Path) -> None:
+    room_root = _build_fake_noise_dir(tmp_path / "room", num_files=2)
+    keyboard_root = _build_fake_noise_dir(tmp_path / "keyboard", num_files=3)
+    categorized = scan_noise_dirs({
+        "room": room_root,
+        "keyboard": keyboard_root,
+    })
+    assert sorted(categorized) == ["keyboard", "room"]
+    assert len(categorized["room"]) == 2
+    assert len(categorized["keyboard"]) == 3
+
+
 def test_synth_rir_shape_and_peak() -> None:
     rng = random.Random(0)
     cfg = ReverbConfig()
@@ -305,6 +325,59 @@ def test_scale_noise_to_snr_handles_silent_reference() -> None:
     assert torch.allclose(scaled, torch.zeros_like(clean))
 
 
+def test_estimate_signal_rms_active_ignores_silent_tails() -> None:
+    signal = torch.cat([torch.ones(8000), torch.zeros(8000)])
+    full_rms = _estimate_signal_rms(signal, mode="full")
+    active_rms = _estimate_signal_rms(
+        signal,
+        mode="active",
+        frame_samples=512,
+        threshold_db=-20.0,
+    )
+    assert active_rms > full_rms
+    assert active_rms > 0.95
+
+
+def test_estimate_signal_rms_active_falls_back_to_full_when_all_frames_inactive() -> None:
+    signal = torch.zeros(16000)
+    full_rms = _estimate_signal_rms(signal, mode="full")
+    active_rms = _estimate_signal_rms(
+        signal,
+        mode="active",
+        frame_samples=512,
+        threshold_db=-20.0,
+    )
+    assert active_rms == pytest.approx(full_rms, abs=1e-6)
+
+
+def test_scale_noise_to_snr_active_mode_hits_requested_ratio_on_active_frames() -> None:
+    clean = torch.cat([torch.ones(8000), torch.zeros(8000)])
+    noise = torch.randn(16000)
+    scaled = scale_noise_to_snr(
+        clean,
+        noise,
+        snr_db=6.0,
+        rng=random.Random(0),
+        rms_mode="active",
+        activity_frame_samples=512,
+        activity_threshold_db=-20.0,
+    )
+    clean_rms = _estimate_signal_rms(
+        clean,
+        mode="active",
+        frame_samples=512,
+        threshold_db=-20.0,
+    )
+    noise_rms = _estimate_signal_rms(
+        scaled,
+        mode="active",
+        frame_samples=512,
+        threshold_db=-20.0,
+    )
+    snr = 20.0 * np.log10(clean_rms / noise_rms)
+    assert snr == pytest.approx(6.0, abs=0.8)
+
+
 def test_add_noise_at_snr_handles_zero_noise() -> None:
     clean = torch.ones(16000)
     noise = torch.zeros(16000)
@@ -352,9 +425,9 @@ def test_reverb_config_from_preset_produces_valid_ranges() -> None:
     medium = ReverbConfig.from_preset("medium")
     large = ReverbConfig.from_preset("large")
     mixed = ReverbConfig.from_preset("mixed")
-    assert small.rt60_range == (0.08, 0.25)
-    assert medium.rt60_range == (0.20, 0.50)
-    assert large.rt60_range == (0.45, 0.80)
+    assert small.rt60_range == (0.08, 0.20)
+    assert medium.rt60_range == (0.20, 0.40)
+    assert large.rt60_range == (0.40, 0.65)
     assert mixed.rt60_range == (0.08, 0.80)
 
 
@@ -392,3 +465,99 @@ def test_noise_entry_repr_is_stable(tmp_path: Path) -> None:
     text = repr(entry)
     assert "NoiseEntry" in text
     assert entry.path.name in text
+
+
+def test_parse_bucket_table_accepts_toml_like_entries() -> None:
+    buckets = _parse_bucket_table([
+        {"weight": 0.2, "min_db": -5.0, "max_db": 5.0},
+        {"weight": 0.8, "min_db": 5.0, "max_db": 15.0},
+    ])
+    assert buckets == ((0.2, -5.0, 5.0), (0.8, 5.0, 15.0))
+
+
+def test_parse_bucket_table_rejects_invalid_entries() -> None:
+    with pytest.raises(ValueError):
+        _parse_bucket_table([{"weight": 1.0, "min_db": 0.0}])
+
+
+def test_scan_dataset_splits_returns_per_dataset_maps(tmp_path: Path) -> None:
+    aishell1_root = _build_fake_aishell1(tmp_path / "aishell1", num_speakers=2)
+    aishell3_root = _build_fake_aishell3(tmp_path / "aishell3", num_speakers=2)
+    magicdata_root = _build_fake_magicdata(tmp_path / "magicdata", num_speakers=2)
+    train_datasets, val_datasets = _scan_dataset_splits({
+        "aishell1_root": str(aishell1_root),
+        "aishell3_root": str(aishell3_root),
+        "magicdata_root": str(magicdata_root),
+    })
+    assert sorted(train_datasets) == ["aishell1", "aishell3", "magicdata"]
+    assert val_datasets == {}
+
+
+def test_scan_noise_inputs_prefers_category_roots_when_present(tmp_path: Path) -> None:
+    room_root = _build_fake_noise_dir(tmp_path / "room", num_files=1)
+    keyboard_root = _build_fake_noise_dir(tmp_path / "keyboard", num_files=1)
+    noises = _scan_noise_inputs({
+        "noise_root": str(tmp_path / "unused"),
+        "noise": {
+            "category_roots": {
+                "room": str(room_root),
+                "keyboard": str(keyboard_root),
+            },
+            "min_duration_seconds": 1.0,
+        },
+    })
+    assert isinstance(noises, dict)
+    assert sorted(noises) == ["keyboard", "room"]
+
+
+def test_build_mixer_kwargs_reads_new_sections() -> None:
+    kwargs = _build_mixer_kwargs(
+        {
+            "sampling": {
+                "dataset_weights": {"magicdata": 0.5, "aishell1": 0.5},
+                "interferer_same_dataset_probability": 0.5,
+            },
+            "scene": {
+                "weights": {
+                    "target_only_degraded": 0.1,
+                    "noise": 0.2,
+                    "interference": 0.25,
+                    "both": 0.45,
+                },
+                "snr_buckets": [{"weight": 1.0, "min_db": -5.0, "max_db": 5.0}],
+                "sir_buckets": [{"weight": 1.0, "min_db": 0.0, "max_db": 10.0}],
+            },
+            "reverb": {"room_family_weights": {"small": 1.0, "medium": 0.0, "large": 0.0}},
+            "augmentation": {
+                "gain_probability": 0.4,
+                "gain_range_db": [-3.0, 3.0],
+                "bandwidth_limit_probability": 0.1,
+                "bandwidth_cutoff_range_hz": [4500.0, 6500.0],
+                "mixing_rms_mode": "active",
+                "activity_frame_ms": 24.0,
+                "activity_threshold_db": -35.0,
+            },
+            "noise": {"category_weights": {"room": 0.7, "keyboard": 0.3}},
+        },
+        epoch_size=10,
+        segment_length=8000,
+        enrollment_length=12000,
+        sample_rate=16000,
+        reverb_config=ReverbConfig(),
+        reverb_probability=0.3,
+        seed=42,
+    )
+    assert kwargs["dataset_weights"] == {"magicdata": 0.5, "aishell1": 0.5}
+    assert kwargs["interferer_same_dataset_probability"] == pytest.approx(0.5)
+    assert kwargs["scene_weights"] == {
+        "target_only_degraded": 0.1,
+        "noise": 0.2,
+        "interference": 0.25,
+        "both": 0.45,
+    }
+    assert kwargs["snr_buckets"] == ((1.0, -5.0, 5.0),)
+    assert kwargs["sir_buckets"] == ((1.0, 0.0, 10.0),)
+    assert kwargs["gain_range_db"] == (-3.0, 3.0)
+    assert kwargs["bandwidth_cutoff_range_hz"] == (4500.0, 6500.0)
+    assert kwargs["mixing_rms_mode"] == "active"
+    assert kwargs["noise_category_weights"] == {"room": 0.7, "keyboard": 0.3}

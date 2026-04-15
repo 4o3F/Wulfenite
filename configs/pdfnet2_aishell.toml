@@ -3,8 +3,8 @@
 
 [data]
 aishell1_root = "../assets/aishell1"
-# aishell3_root = "../assets/aishell3"
-# magicdata_root = "../assets/magicdata"
+aishell3_root = "../assets/aishell3"
+magicdata_root = "../assets/magicdata"
 noise_root = "../assets/musan/noise"
 sample_rate = 16000
 segment_seconds = 4.0
@@ -13,13 +13,49 @@ epoch_size = 5000
 val_size = 500
 seed = 42
 
+[data.sampling]
+# Default single-dataset behavior is implicit when this table is omitted.
+dataset_weights = { magicdata = 0.50, aishell1 = 0.30, aishell3 = 0.20 }
+interferer_same_dataset_probability = 0.50
+
+[data.scene]
+# Omit this table to keep the legacy 20/30/50 scene mix and Gaussian SNR/SIR.
+weights = { target_only_degraded = 0.10, noise = 0.20, interference = 0.25, both = 0.45 }
+snr_buckets = [
+  { weight = 0.20, min_db = -5.0, max_db = 5.0 },
+  { weight = 0.50, min_db = 5.0, max_db = 15.0 },
+  { weight = 0.30, min_db = 15.0, max_db = 30.0 },
+]
+sir_buckets = [
+  { weight = 0.30, min_db = -5.0, max_db = 0.0 },
+  { weight = 0.50, min_db = 0.0, max_db = 10.0 },
+  { weight = 0.20, min_db = 10.0, max_db = 20.0 },
+]
+
 [data.reverb]
 preset = "mixed"
 probability = 0.3
+room_family_weights = { small = 0.65, medium = 0.25, large = 0.10 }
+
+[data.augmentation]
+# Current mixer defaults are probability-only; these values make them explicit.
+gain_probability = 0.30
+gain_range_db = [-6.0, 6.0]
+bandwidth_limit_probability = 0.20
+bandwidth_cutoff_range_hz = [4000.0, 7000.0]
+mixing_rms_mode = "active"
+activity_frame_ms = 32.0
+activity_threshold_db = -40.0
+
+[data.noise]
+# category_roots = { stationary = "../assets/noise/stationary", impulsive = "../assets/noise/impulsive" }
+# category_weights = { stationary = 0.35, impulsive = 0.25, ambient = 0.20, playback = 0.20 }
+category_weights = { default = 1.0 }
+min_duration_seconds = 1.0
 
 [model]
 type = "pdfnet2"   # "dfnet" or "pdfnet2"
-# wespeaker_checkpoint = "path/to/model"
+wespeaker_checkpoint = "../assets/ecapa-tdnn.ckpt"
 
 [training]
 max_epochs = 200

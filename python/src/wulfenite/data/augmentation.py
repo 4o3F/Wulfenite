@@ -59,21 +59,21 @@ class ReverbConfig:
         if preset == "small":
             return cls(
                 sample_rate=sample_rate,
-                rt60_range=(0.08, 0.25),
+                rt60_range=(0.08, 0.20),
                 num_early_reflections_range=(3, 6),
                 early_delay_range_ms=(5.0, 35.0),
             )
         if preset == "medium":
             return cls(
                 sample_rate=sample_rate,
-                rt60_range=(0.20, 0.50),
+                rt60_range=(0.20, 0.40),
                 num_early_reflections_range=(5, 9),
                 early_delay_range_ms=(10.0, 55.0),
             )
         if preset == "large":
             return cls(
                 sample_rate=sample_rate,
-                rt60_range=(0.45, 0.80),
+                rt60_range=(0.40, 0.65),
                 num_early_reflections_range=(8, 14),
                 early_delay_range_ms=(15.0, 80.0),
             )
@@ -183,20 +183,70 @@ def _fit_noise_length(
     return noise[start:start + length]
 
 
+def _estimate_signal_rms(
+    signal: torch.Tensor,
+    *,
+    mode: Literal["full", "active"] = "full",
+    frame_samples: int = 512,
+    threshold_db: float = -40.0,
+    eps: float = 1e-12,
+) -> float:
+    """Estimate RMS from either the full signal or active frames only."""
+    if signal.dim() != 1:
+        raise ValueError(f"signal must be 1-D, got {tuple(signal.shape)}")
+    if frame_samples <= 0:
+        raise ValueError(f"frame_samples must be positive, got {frame_samples}")
+    if mode == "full":
+        return float(torch.sqrt((signal * signal).mean() + eps))
+    if mode != "active":
+        raise ValueError(f"Unsupported RMS mode: {mode}")
+
+    if signal.numel() == 0:
+        return 0.0
+
+    if signal.numel() < frame_samples:
+        frames = signal.unsqueeze(0)
+    else:
+        hop_samples = frame_samples
+        frames = signal.unfold(0, frame_samples, hop_samples)
+    frame_rms = torch.sqrt((frames * frames).mean(dim=-1) + eps)
+    frame_db = 20.0 * torch.log10(frame_rms + eps)
+    active_mask = frame_db >= threshold_db
+    if not bool(active_mask.any()):
+        return float(torch.sqrt((signal * signal).mean() + eps))
+    active_power = (frames[active_mask] * frames[active_mask]).mean()
+    return float(torch.sqrt(active_power + eps))
+
+
 def scale_noise_to_snr(
     reference: torch.Tensor,
     noise: torch.Tensor,
     snr_db: float,
     *,
     rng: random.Random | None = None,
+    rms_mode: Literal["full", "active"] = "full",
+    activity_frame_samples: int = 512,
+    activity_threshold_db: float = -40.0,
     eps: float = 1e-12,
 ) -> torch.Tensor:
     """Scale ``noise`` to achieve the requested SNR relative to ``reference``."""
     fitted_noise = _fit_noise_length(noise, reference.shape[-1], rng)
     if float(reference.abs().max()) < eps or float(fitted_noise.abs().max()) < eps:
         return torch.zeros_like(reference)
-    ref_rms = float(torch.sqrt((reference * reference).mean() + eps))
-    noise_rms = float(torch.sqrt((fitted_noise * fitted_noise).mean() + eps))
+    ref_rms = _estimate_signal_rms(
+        reference,
+        mode=rms_mode,
+        frame_samples=activity_frame_samples,
+        threshold_db=activity_threshold_db,
+        eps=eps,
+    )
+    noise_rms = _estimate_signal_rms(
+        fitted_noise,
+        mode=rms_mode,
+        frame_samples=activity_frame_samples,
+        threshold_db=activity_threshold_db,
+        eps=eps,
+    )
     if ref_rms < eps or noise_rms < eps:
         return torch.zeros_like(reference)
     target_noise_rms = ref_rms / (10.0 ** (snr_db / 20.0))
@@ -208,6 +258,10 @@ def add_noise_at_snr(
     noise: torch.Tensor,
     snr_db: float,
     eps: float = 1e-12,
+    *,
+    rms_mode: Literal["full", "active"] = "full",
+    activity_frame_samples: int = 512,
+    activity_threshold_db: float = -40.0,
 ) -> torch.Tensor:
     """Add pre-sampled noise to ``signal`` at the specified SNR.
 
@@ -221,7 +275,15 @@ def add_noise_at_snr(
     matches the requested ``snr_db``. If ``noise`` is shorter than
     ``signal`` it is looped; if longer, a random window is taken.
     """
-    scaled_noise = scale_noise_to_snr(signal, noise, snr_db, eps=eps)
+    scaled_noise = scale_noise_to_snr(
+        signal,
+        noise,
+        snr_db,
+        rms_mode=rms_mode,
+        activity_frame_samples=activity_frame_samples,
+        activity_threshold_db=activity_threshold_db,
+        eps=eps,
+    )
     return signal + scaled_noise
 
 
@@ -314,6 +376,7 @@ __all__ = [
     "synth_room_rir",
     "apply_rir",
     "_fit_noise_length",
+    "_estimate_signal_rms",
     "scale_noise_to_snr",
     "add_noise_at_snr",
     "add_gaussian_noise",
