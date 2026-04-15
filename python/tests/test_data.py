@@ -25,7 +25,11 @@ from wulfenite.data import (
     scale_noise_to_snr,
     synth_room_rir,
 )
-from wulfenite.data.augmentation import _fit_noise_length
+from wulfenite.data.augmentation import (
+    _fit_noise_length,
+    apply_bandwidth_limit,
+    apply_random_gain,
+)
 
 
 SR = 16000
@@ -306,6 +310,41 @@ def test_add_noise_at_snr_handles_zero_noise() -> None:
     noise = torch.zeros(16000)
     mixed = add_noise_at_snr(clean, noise, snr_db=5.0)
     assert torch.allclose(mixed, clean)
+
+
+def test_apply_random_gain_uses_requested_db_range() -> None:
+    signal = torch.ones(8)
+    gained = apply_random_gain(signal, gain_range_db=(6.0, 6.0), rng=random.Random(0))
+    assert torch.allclose(gained, torch.full_like(signal, 10.0 ** (6.0 / 20.0)))
+
+
+def test_apply_bandwidth_limit_preserves_low_freq_and_attenuates_high_freq() -> None:
+    duration_seconds = 1.0
+    t = torch.arange(int(SR * duration_seconds), dtype=torch.float32) / SR
+    low = torch.sin(2.0 * torch.pi * 1000.0 * t)
+    high = torch.sin(2.0 * torch.pi * 6000.0 * t)
+
+    filtered_low = apply_bandwidth_limit(
+        low,
+        sample_rate=SR,
+        cutoff_range_hz=(4000.0, 4000.0),
+        rng=random.Random(0),
+    )
+    filtered_high = apply_bandwidth_limit(
+        high,
+        sample_rate=SR,
+        cutoff_range_hz=(4000.0, 4000.0),
+        rng=random.Random(0),
+    )
+
+    region = slice(200, -200)
+    low_ratio = filtered_low[region].pow(2).mean() / low[region].pow(2).mean()
+    high_ratio = filtered_high[region].pow(2).mean() / high[region].pow(2).mean()
+
+    assert filtered_low.shape == low.shape
+    assert filtered_high.shape == high.shape
+    assert float(low_ratio) > 0.8
+    assert float(high_ratio) < 0.2
 
 
 def test_reverb_config_from_preset_produces_valid_ranges() -> None:

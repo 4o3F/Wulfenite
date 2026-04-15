@@ -13,6 +13,8 @@ from torch.utils.data import Dataset
 from .aishell import AudioEntry
 from .augmentation import (
     ReverbConfig,
+    apply_bandwidth_limit,
+    apply_random_gain,
     apply_rir,
     scale_noise_to_snr,
     synth_room_rir,
@@ -47,6 +49,8 @@ class PSEMixer(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]]):
         sample_rate: int = 16000,
         reverb_config: ReverbConfig | None = None,
         reverb_probability: float = 0.3,
+        gain_probability: float = 0.3,
+        bandwidth_limit_probability: float = 0.2,
         audio_cache_size: int = 128,
         seed: int = 0,
     ) -> None:
@@ -67,6 +71,8 @@ class PSEMixer(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]]):
         self.sample_rate = sample_rate
         self.reverb_config = reverb_config if reverb_config is not None else ReverbConfig(sample_rate=sample_rate)
         self.reverb_probability = reverb_probability
+        self.gain_probability = gain_probability
+        self.bandwidth_limit_probability = bandwidth_limit_probability
         self.audio_cache_size = audio_cache_size
         self.seed = seed
         self._epoch = 0
@@ -116,6 +122,24 @@ class PSEMixer(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]]):
         anchor_entry: AudioEntry | None = None,
         avoid_paths: set[Path] | None = None,
     ) -> torch.Tensor:
+        segment, _used_paths = self._sample_speaker_segment_tracked(
+            entries,
+            length,
+            rng,
+            anchor_entry=anchor_entry,
+            avoid_paths=avoid_paths,
+        )
+        return segment
+
+    def _sample_speaker_segment_tracked(
+        self,
+        entries: list[AudioEntry],
+        length: int,
+        rng: random.Random,
+        *,
+        anchor_entry: AudioEntry | None = None,
+        avoid_paths: set[Path] | None = None,
+    ) -> tuple[torch.Tensor, set[Path]]:
         blocked_paths = avoid_paths or set()
         available_entries = [entry for entry in entries if entry.path not in blocked_paths]
         if not available_entries:
@@ -140,8 +164,10 @@ class PSEMixer(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]]):
         if merged.numel() >= length:
             max_start = merged.numel() - length
             start = rng.randint(0, max_start) if max_start > 0 else 0
-            return merged[start : start + length].clone()
-        return torch.nn.functional.pad(merged, (0, length - merged.numel()))
+            segment = merged[start : start + length].clone()
+        else:
+            segment = torch.nn.functional.pad(merged, (0, length - merged.numel()))
+        return segment, {entry.path for entry in selected_entries}
 
     def _sample_noise(
         self,
@@ -206,18 +232,21 @@ class PSEMixer(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]]):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
         rng = self._rng(index)
         speaker_id, target_entry, enroll_entry = self._sample_target_pair(rng)
-        target = self._sample_speaker_segment(
+        # Reserve enrollment anchor so target sampling never consumes it.
+        # This guarantees enrollment always has at least one disjoint file.
+        target, target_paths = self._sample_speaker_segment_tracked(
             self.target_speakers[speaker_id],
             self.segment_length,
             rng,
             anchor_entry=target_entry,
+            avoid_paths={enroll_entry.path},
         )
         enrollment = self._sample_speaker_segment(
             self.target_speakers[speaker_id],
             self.enrollment_length,
             rng,
             anchor_entry=enroll_entry,
-            avoid_paths={target_entry.path},
+            avoid_paths=target_paths,
         )
         target = self._maybe_reverb(target, rng)
         mixture = target.clone()
@@ -242,6 +271,11 @@ class PSEMixer(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]]):
             if noise is not None:
                 snr_db = self._sample_snr_db(rng)
                 mixture = mixture + scale_noise_to_snr(target, noise, snr_db, rng=rng)
+
+        if rng.random() < self.gain_probability:
+            mixture = apply_random_gain(mixture, rng=rng)
+        if rng.random() < self.bandwidth_limit_probability:
+            mixture = apply_bandwidth_limit(mixture, sample_rate=self.sample_rate, rng=rng)
 
         peak = max(
             float(mixture.abs().max()),

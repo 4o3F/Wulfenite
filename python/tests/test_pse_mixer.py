@@ -55,6 +55,8 @@ def test_pse_mixer_returns_expected_shapes(tmp_path: Path) -> None:
         segment_length=16000,
         enrollment_length=24000,
         reverb_probability=0.0,
+        gain_probability=0.0,
+        bandwidth_limit_probability=0.0,
         seed=0,
     )
 
@@ -79,6 +81,8 @@ def test_pse_mixer_enrollment_matches_target_speaker(tmp_path: Path) -> None:
         segment_length=8000,
         enrollment_length=12000,
         reverb_probability=0.0,
+        gain_probability=0.0,
+        bandwidth_limit_probability=0.0,
         seed=1,
     )
     mixture, target, enrollment, speaker_id = mixer[0]
@@ -107,6 +111,8 @@ def test_pse_mixer_can_generate_nontrivial_mixtures(tmp_path: Path) -> None:
         segment_length=8000,
         enrollment_length=12000,
         reverb_probability=0.0,
+        gain_probability=0.0,
+        bandwidth_limit_probability=0.0,
         seed=7,
     )
 
@@ -132,6 +138,8 @@ def test_pse_mixer_is_deterministic_within_same_epoch(tmp_path: Path) -> None:
         segment_length=8000,
         enrollment_length=12000,
         reverb_probability=0.0,
+        gain_probability=0.0,
+        bandwidth_limit_probability=0.0,
         seed=11,
     )
     mixer.set_epoch(3)
@@ -158,6 +166,8 @@ def test_pse_mixer_changes_scene_when_epoch_changes(tmp_path: Path) -> None:
         segment_length=8000,
         enrollment_length=12000,
         reverb_probability=0.0,
+        gain_probability=0.0,
+        bandwidth_limit_probability=0.0,
         seed=13,
     )
     mixer.set_epoch(0)
@@ -187,6 +197,8 @@ def test_pse_mixer_uses_interferer_pool_when_provided(tmp_path: Path) -> None:
         segment_length=8000,
         enrollment_length=8000,
         reverb_probability=0.0,
+        gain_probability=0.0,
+        bandwidth_limit_probability=0.0,
         seed=17,
     )
     mixer._draw_scene_components = lambda rng: (False, True)  # type: ignore[method-assign]
@@ -224,6 +236,8 @@ def test_pse_mixer_scales_noise_against_target_not_mixture(tmp_path: Path) -> No
         segment_length=8000,
         enrollment_length=8000,
         reverb_probability=0.0,
+        gain_probability=0.0,
+        bandwidth_limit_probability=0.0,
         seed=23,
     )
     mixer._sample_snr_db = lambda rng: requested_snr  # type: ignore[method-assign]
@@ -272,9 +286,108 @@ def test_pse_mixer_concatenates_short_utterances(tmp_path: Path) -> None:
         segment_length=12000,
         enrollment_length=12000,
         reverb_probability=0.0,
+        gain_probability=0.0,
+        bandwidth_limit_probability=0.0,
         seed=19,
     )
     mixture, target, enrollment, _speaker_id = mixer[0]
     assert torch.allclose(mixture, target)
     assert target.abs().mean().item() == pytest.approx(0.2, abs=1e-4)
+    assert enrollment.abs().mean().item() == pytest.approx(0.2, abs=1e-4)
+
+
+def test_pse_mixer_excludes_all_target_paths_from_enrollment(tmp_path: Path) -> None:
+    speakers = {
+        "S0001": [
+            _write_constant_wav(tmp_path / "spk1" / "utt1.wav", 0.1, 0.25),
+            _write_constant_wav(tmp_path / "spk1" / "utt2.wav", 0.2, 0.25),
+            _write_constant_wav(tmp_path / "spk1" / "utt3.wav", 0.3, 0.25),
+            _write_constant_wav(tmp_path / "spk1" / "utt4.wav", 0.4, 0.25),
+        ],
+    }
+    mixer = PSEMixer(
+        speakers,
+        noises=[],
+        epoch_size=1,
+        segment_length=12000,
+        enrollment_length=8000,
+        reverb_probability=0.0,
+        gain_probability=0.0,
+        bandwidth_limit_probability=0.0,
+        seed=29,
+    )
+    target_entry = speakers["S0001"][0]
+    enroll_entry = speakers["S0001"][3]
+    expected_paths = {
+        speakers["S0001"][0].path,
+        speakers["S0001"][1].path,
+        speakers["S0001"][2].path,
+    }
+    captured_avoid_paths: dict[str, set[Path]] = {}
+
+    mixer._sample_target_pair = lambda rng: ("S0001", target_entry, enroll_entry)  # type: ignore[method-assign]
+
+    def fake_target_segment(
+        entries: list[AudioEntry],
+        length: int,
+        rng: object,
+        *,
+        anchor_entry: AudioEntry | None = None,
+        avoid_paths: set[Path] | None = None,
+    ) -> tuple[torch.Tensor, set[Path]]:
+        assert anchor_entry == target_entry
+        return torch.ones(length), expected_paths
+
+    def fake_enrollment_segment(
+        entries: list[AudioEntry],
+        length: int,
+        rng: object,
+        *,
+        anchor_entry: AudioEntry | None = None,
+        avoid_paths: set[Path] | None = None,
+    ) -> torch.Tensor:
+        assert anchor_entry == enroll_entry
+        captured_avoid_paths["value"] = set(avoid_paths or set())
+        return torch.zeros(length)
+
+    mixer._sample_speaker_segment_tracked = fake_target_segment  # type: ignore[method-assign]
+    mixer._sample_speaker_segment = fake_enrollment_segment  # type: ignore[method-assign]
+    mixer._draw_scene_components = lambda rng: (False, False)  # type: ignore[method-assign]
+
+    mixture, target, enrollment, speaker_id = mixer[0]
+
+    assert speaker_id == "S0001"
+    assert captured_avoid_paths["value"] == expected_paths
+    assert torch.allclose(mixture, torch.ones(12000))
+    assert torch.allclose(target, torch.ones(12000))
+    assert torch.allclose(enrollment, torch.zeros(8000))
+
+
+def test_pse_mixer_reserves_enrollment_anchor_when_target_needs_reuse(tmp_path: Path) -> None:
+    """With only 2 utterances, enrollment anchor must be reserved from target."""
+    speakers = {
+        "S0001": [
+            _write_constant_wav(tmp_path / "spk1" / "utt1.wav", 0.1, 0.25),
+            _write_constant_wav(tmp_path / "spk1" / "utt2.wav", 0.2, 0.25),
+        ],
+    }
+    mixer = PSEMixer(
+        speakers,
+        noises=[],
+        epoch_size=1,
+        segment_length=12000,
+        enrollment_length=8000,
+        reverb_probability=0.0,
+        gain_probability=0.0,
+        bandwidth_limit_probability=0.0,
+        seed=31,
+    )
+    mixer._sample_target_pair = lambda rng: ("S0001", speakers["S0001"][0], speakers["S0001"][1])  # type: ignore[method-assign]
+    mixer._draw_scene_components = lambda rng: (False, False)  # type: ignore[method-assign]
+
+    mixture, target, enrollment, speaker_id = mixer[0]
+    assert speaker_id == "S0001"
+    assert torch.allclose(mixture, target)
+    # Target anchored on utt1 (0.1), enrollment anchored on utt2 (0.2)
+    assert target.abs().mean().item() == pytest.approx(0.1, abs=1e-4)
     assert enrollment.abs().mean().item() == pytest.approx(0.2, abs=1e-4)

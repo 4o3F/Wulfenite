@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
+import torch.nn.functional as F
 
 
 RoomPreset = Literal["small", "medium", "large", "mixed"]
@@ -240,6 +241,73 @@ def add_gaussian_noise(
     return add_noise_at_snr(signal, noise, snr_db)
 
 
+def apply_random_gain(
+    signal: torch.Tensor,
+    gain_range_db: tuple[float, float] = (-6.0, 6.0),
+    rng: random.Random | None = None,
+) -> torch.Tensor:
+    """Apply a random gain to ``signal`` in decibels."""
+    if gain_range_db[0] > gain_range_db[1]:
+        raise ValueError(
+            f"gain_range_db must be ordered as (min, max), got {gain_range_db}"
+        )
+    sampler = rng if rng is not None else random
+    gain_db = sampler.uniform(*gain_range_db)
+    gain = 10.0 ** (gain_db / 20.0)
+    return signal * gain
+
+
+def apply_bandwidth_limit(
+    signal: torch.Tensor,
+    sample_rate: int = 16000,
+    cutoff_range_hz: tuple[float, float] = (4000.0, 7000.0),
+    rng: random.Random | None = None,
+    order: int = 101,
+) -> torch.Tensor:
+    """Apply a random low-pass FIR filter to simulate channel bandwidth limits."""
+    if signal.dim() != 1:
+        raise ValueError(f"signal must be 1-D, got {tuple(signal.shape)}")
+    if sample_rate <= 0:
+        raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+    if order <= 0 or order % 2 == 0:
+        raise ValueError(f"order must be a positive odd integer, got {order}")
+
+    min_cutoff, max_cutoff = cutoff_range_hz
+    nyquist = sample_rate / 2.0
+    if not 0.0 < min_cutoff <= max_cutoff < nyquist:
+        raise ValueError(
+            "cutoff_range_hz must satisfy 0 < min <= max < Nyquist, got "
+            f"{cutoff_range_hz} for sample_rate={sample_rate}"
+        )
+
+    sampler = rng if rng is not None else random
+    cutoff_hz = sampler.uniform(min_cutoff, max_cutoff)
+    fc_normalized = cutoff_hz / nyquist
+
+    half_order = order // 2
+    n = torch.arange(
+        -half_order,
+        half_order + 1,
+        device=signal.device,
+        dtype=signal.dtype,
+    )
+    kernel = fc_normalized * torch.sinc(fc_normalized * n)
+    kernel = kernel * torch.hamming_window(
+        order,
+        periodic=False,
+        device=signal.device,
+        dtype=signal.dtype,
+    )
+    kernel = kernel / kernel.sum().clamp_min(torch.finfo(kernel.dtype).eps)
+
+    filtered = F.conv1d(
+        signal.view(1, 1, -1),
+        kernel.view(1, 1, -1),
+        padding=half_order,
+    )
+    return filtered.view_as(signal)
+
+
 __all__ = [
     "RoomPreset",
     "ReverbConfig",
@@ -249,4 +317,6 @@ __all__ = [
     "scale_noise_to_snr",
     "add_noise_at_snr",
     "add_gaussian_noise",
+    "apply_random_gain",
+    "apply_bandwidth_limit",
 ]
