@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+import pickle
 from typing import Any
 
 import torch
@@ -87,7 +88,10 @@ class SpeakerEncoder(nn.Module):
         self.proj = nn.Identity()
 
     def _load_checkpoint_payload(self, checkpoint_path: str | Path) -> object:
-        return torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        try:
+            return torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        except (pickle.UnpicklingError, RuntimeError, ValueError):
+            return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     def _normalize_state_dict(self, payload: object) -> dict[str, torch.Tensor]:
         if not isinstance(payload, Mapping):
@@ -95,27 +99,21 @@ class SpeakerEncoder(nn.Module):
                 f"Unsupported speaker checkpoint payload type: {type(payload)!r}"
             )
 
-        raw_state = payload.get("model", payload)
-        if not isinstance(raw_state, Mapping):
-            raise ValueError("Checkpoint does not contain a valid model state_dict")
-
         state_dict: dict[str, torch.Tensor] = {}
-        for raw_key, value in raw_state.items():
+        for raw_key, value in payload.items():
             if not isinstance(raw_key, str):
                 raise ValueError(f"Checkpoint contains a non-string key: {raw_key!r}")
-            key = raw_key.removeprefix("module.")
-            if key.startswith("frontend."):
-                raise ValueError(
-                    "Unsupported WeSpeaker checkpoint: learned frontend weights were found. "
-                    "Expected a plain fbank ECAPA-TDNN checkpoint."
-                )
-            if key.startswith("projection."):
-                continue
             if not isinstance(value, torch.Tensor):
                 raise ValueError(f"Checkpoint tensor {raw_key!r} is not a torch.Tensor")
-            if key in state_dict:
-                raise ValueError(f"Duplicate checkpoint key after normalization: {key}")
-            state_dict[key] = value
+            if raw_key in state_dict:
+                raise ValueError(f"Duplicate checkpoint key after normalization: {raw_key}")
+            state_dict[raw_key] = value
+
+        if "blocks.0.conv.conv.weight" not in state_dict:
+            raise ValueError(
+                "Expected a SpeechBrain ECAPA-TDNN checkpoint with key "
+                "'blocks.0.conv.conv.weight'."
+            )
 
         return state_dict
 

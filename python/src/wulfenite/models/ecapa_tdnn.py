@@ -1,4 +1,4 @@
-"""Native WeSpeaker-compatible ECAPA-TDNN speaker encoder."""
+"""Native SpeechBrain-compatible ECAPA-TDNN speaker encoder."""
 
 from __future__ import annotations
 
@@ -9,192 +9,266 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class Res2Conv1dReluBn(nn.Module):
-    """Res2Net-style 1D convolution block used by ECAPA-TDNN."""
+def _length_to_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
+    """Build a time mask from relative or absolute lengths."""
+    if lengths.dim() != 1:
+        raise ValueError(f"lengths must be [B], got {tuple(lengths.shape)}")
 
-    def __init__(
-        self,
-        channels: int,
-        kernel_size: int = 1,
-        stride: int = 1,
-        padding: int = 0,
-        dilation: int = 1,
-        bias: bool = True,
-        scale: int = 4,
-    ) -> None:
+    if torch.is_floating_point(lengths) and float(lengths.max()) <= 1.0 + 1e-6:
+        valid = torch.round(lengths * max_len).to(dtype=torch.long)
+    else:
+        valid = lengths.to(dtype=torch.long)
+    valid = valid.clamp(min=0, max=max_len)
+    steps = torch.arange(max_len, device=lengths.device)
+    return steps.unsqueeze(0) < valid.unsqueeze(1)
+
+
+class _ConvWrap(nn.Module):
+    """Wrapper producing ``conv.conv.*`` keys."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__()
-        if channels % scale != 0:
-            raise ValueError(f"{channels} % {scale} != 0")
-        self.scale = scale
-        self.width = channels // scale
-        self.nums = scale if scale == 1 else scale - 1
-
-        self.convs = nn.ModuleList()
-        self.bns = nn.ModuleList()
-        for _ in range(self.nums):
-            self.convs.append(
-                nn.Conv1d(
-                    self.width,
-                    self.width,
-                    kernel_size,
-                    stride,
-                    padding,
-                    dilation,
-                    bias=bias,
-                )
-            )
-            self.bns.append(nn.BatchNorm1d(self.width))
+        self.conv = nn.Conv1d(*args, **kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out: list[torch.Tensor] = []
-        splits = torch.split(x, self.width, dim=1)
-        span = splits[0]
-        for index, (conv, bn) in enumerate(zip(self.convs, self.bns)):
-            if index >= 1:
-                span = span + splits[index]
-            span = conv(span)
-            span = bn(F.relu(span))
-            out.append(span)
-        if self.scale != 1:
-            out.append(splits[self.nums])
-        return torch.cat(out, dim=1)
+        return self.conv(x)
 
 
-class Conv1dReluBn(nn.Module):
-    """Conv1d -> ReLU -> BatchNorm1d block."""
+class _NormWrap(nn.Module):
+    """Wrapper producing ``norm.norm.*`` keys."""
+
+    def __init__(self, num_features: int) -> None:
+        super().__init__()
+        self.norm = nn.BatchNorm1d(num_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x)
+
+
+class TDNNBlock(nn.Module):
+    """SpeechBrain-style TDNN block."""
 
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 1,
-        stride: int = 1,
-        padding: int = 0,
+        in_ch: int,
+        out_ch: int,
+        kernel_size: int,
         dilation: int = 1,
-        bias: bool = True,
+        activation: type[nn.Module] = nn.ReLU,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        self.conv = nn.Conv1d(
-            in_channels,
-            out_channels,
+        padding = ((kernel_size - 1) * dilation) // 2
+        self.conv = _ConvWrap(
+            in_ch,
+            out_ch,
             kernel_size,
-            stride,
-            padding,
-            dilation,
-            bias=bias,
+            dilation=dilation,
+            padding=padding,
         )
-        self.bn = nn.BatchNorm1d(out_channels)
+        self.activation = activation()
+        self.norm = _NormWrap(out_ch)
+        self.dropout = nn.Dropout1d(p=dropout) if dropout > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.bn(F.relu(self.conv(x)))
+        return self.dropout(self.norm(self.activation(self.conv(x))))
 
 
-class SE_Connect(nn.Module):
-    """Squeeze-excitation over temporal channel means."""
-
-    def __init__(self, channels: int, se_bottleneck_dim: int | None = None) -> None:
-        super().__init__()
-        if se_bottleneck_dim is None:
-            se_bottleneck_dim = channels // 4
-        self.linear1 = nn.Linear(channels, se_bottleneck_dim)
-        self.linear2 = nn.Linear(se_bottleneck_dim, channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = x.mean(dim=2)
-        out = F.relu(self.linear1(out))
-        out = torch.sigmoid(self.linear2(out))
-        return x * out.unsqueeze(2)
-
-
-class SE_Res2Block(nn.Module):
-    """SE-Res2Net residual block."""
+class Res2NetBlock(nn.Module):
+    """SpeechBrain Res2Net block with ``blocks`` key layout."""
 
     def __init__(
         self,
         channels: int,
         kernel_size: int,
-        stride: int,
-        padding: int,
         dilation: int,
-        scale: int,
+        scale: int = 8,
+        activation: type[nn.Module] = nn.ReLU,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        self.se_res2block = nn.Sequential(
-            Conv1dReluBn(
-                channels,
-                channels,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-            ),
-            Res2Conv1dReluBn(
-                channels,
-                kernel_size,
-                stride,
-                padding,
-                dilation,
-                scale=scale,
-            ),
-            Conv1dReluBn(
-                channels,
-                channels,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-            ),
-            SE_Connect(channels),
+        if channels % scale != 0:
+            raise ValueError(f"{channels} % {scale} != 0")
+        width = channels // scale
+        self.blocks = nn.ModuleList(
+            [
+                TDNNBlock(
+                    width,
+                    width,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    activation=activation,
+                    dropout=dropout,
+                )
+                for _ in range(scale - 1)
+            ]
         )
+        self.scale = scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.se_res2block(x)
+        outputs: list[torch.Tensor] = []
+        residual_branch: torch.Tensor | None = None
+        for index, split in enumerate(torch.chunk(x, self.scale, dim=1)):
+            if index == 0:
+                branch = split
+            elif index == 1:
+                branch = self.blocks[index - 1](split)
+            else:
+                assert residual_branch is not None
+                branch = self.blocks[index - 1](split + residual_branch)
+            outputs.append(branch)
+            residual_branch = branch
+        return torch.cat(outputs, dim=1)
 
 
-class ASTP(nn.Module):
-    """Attentive statistics pooling used by WeSpeaker ECAPA-TDNN."""
+class SEBlock(nn.Module):
+    """SpeechBrain squeeze-excitation block using Conv1d wrappers."""
+
+    def __init__(self, channels: int, se_channels: int) -> None:
+        super().__init__()
+        self.conv1 = _ConvWrap(channels, se_channels, kernel_size=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = _ConvWrap(se_channels, channels, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if lengths is None:
+            pooled = x.mean(dim=2, keepdim=True)
+        else:
+            mask = _length_to_mask(lengths.to(x.device), x.size(-1)).unsqueeze(1)
+            weights = mask.to(dtype=x.dtype)
+            denom = weights.sum(dim=2, keepdim=True).clamp_min(1.0)
+            pooled = (x * weights).sum(dim=2, keepdim=True) / denom
+
+        pooled = self.relu(self.conv1(pooled))
+        pooled = self.sigmoid(self.conv2(pooled))
+        return pooled * x
+
+
+class SERes2NetBlock(nn.Module):
+    """SpeechBrain SE-Res2Net residual block."""
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int,
+        dilation: int,
+        scale: int = 8,
+        se_channels: int = 128,
+        activation: type[nn.Module] = nn.ReLU,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.tdnn1 = TDNNBlock(
+            channels,
+            channels,
+            kernel_size=1,
+            dilation=1,
+            activation=activation,
+            dropout=dropout,
+        )
+        self.res2net_block = Res2NetBlock(
+            channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            scale=scale,
+            activation=activation,
+            dropout=dropout,
+        )
+        self.tdnn2 = TDNNBlock(
+            channels,
+            channels,
+            kernel_size=1,
+            dilation=1,
+            activation=activation,
+            dropout=dropout,
+        )
+        self.se_block = SEBlock(channels, se_channels)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        residual = x
+        x = self.tdnn1(x)
+        x = self.res2net_block(x)
+        x = self.tdnn2(x)
+        x = self.se_block(x, lengths=lengths)
+        return x + residual
+
+
+class AttentiveStatisticsPooling(nn.Module):
+    """SpeechBrain attentive statistics pooling with optional global context."""
 
     def __init__(
         self,
         in_dim: int,
-        bottleneck_dim: int = 128,
-        global_context_att: bool = False,
-        **_: object,
+        attention_channels: int = 128,
+        global_context: bool = True,
+        activation: type[nn.Module] = nn.ReLU,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        self.eps = 1e-12
         self.in_dim = in_dim
-        self.global_context_att = global_context_att
+        self.global_context = global_context
+        tdnn_in_dim = in_dim * 3 if global_context else in_dim
+        self.tdnn = TDNNBlock(
+            tdnn_in_dim,
+            attention_channels,
+            kernel_size=1,
+            dilation=1,
+            activation=activation,
+            dropout=dropout,
+        )
+        self.tanh = nn.Tanh()
+        self.conv = _ConvWrap(attention_channels, in_dim, kernel_size=1)
 
-        linear1_in_dim = in_dim * 3 if global_context_att else in_dim
-        self.linear1 = nn.Conv1d(linear1_in_dim, bottleneck_dim, kernel_size=1)
-        self.linear2 = nn.Conv1d(bottleneck_dim, in_dim, kernel_size=1)
+    def _compute_statistics(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mean = (weights * x).sum(dim=2)
+        var = (weights * (x - mean.unsqueeze(2)).pow(2)).sum(dim=2)
+        std = torch.sqrt(var.clamp_min(self.eps))
+        return mean, std
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() == 4:
-            x = x.reshape(x.shape[0], x.shape[1] * x.shape[2], x.shape[3])
-        if x.dim() != 3:
-            raise ValueError(f"Expected [B, F, T] input, got {tuple(x.shape)}")
-
-        if self.global_context_att:
-            context_mean = torch.mean(x, dim=-1, keepdim=True).expand_as(x)
-            context_std = torch.sqrt(
-                torch.var(x, dim=-1, keepdim=True) + 1e-7
-            ).expand_as(x)
-            x_in = torch.cat((x, context_mean, context_std), dim=1)
+    def forward(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        frames = x.size(-1)
+        if lengths is None:
+            mask = x.new_ones((x.size(0), 1, frames), dtype=torch.bool)
         else:
-            x_in = x
+            mask = _length_to_mask(lengths.to(x.device), frames).unsqueeze(1)
 
-        alpha = torch.tanh(self.linear1(x_in))
-        alpha = torch.softmax(self.linear2(alpha), dim=2)
-        mean = torch.sum(alpha * x, dim=2)
-        var = torch.sum(alpha * (x**2), dim=2) - mean**2
-        std = torch.sqrt(var.clamp(min=1e-7))
-        return torch.cat([mean, std], dim=1)
+        if self.global_context:
+            mask_float = mask.to(dtype=x.dtype)
+            total = mask_float.sum(dim=2, keepdim=True).clamp_min(1.0)
+            mean, std = self._compute_statistics(x, mask_float / total)
+            mean = mean.unsqueeze(2).expand(-1, -1, frames)
+            std = std.unsqueeze(2).expand(-1, -1, frames)
+            attn_input = torch.cat([x, mean, std], dim=1)
+        else:
+            attn_input = x
 
-    def get_out_dim(self) -> int:
-        return self.in_dim * 2
+        attn = self.conv(self.tanh(self.tdnn(attn_input)))
+        attn = attn.masked_fill(~mask, float("-inf"))
+        attn = torch.softmax(attn, dim=2)
+        mean, std = self._compute_statistics(x, attn)
+        return torch.cat([mean, std], dim=1).unsqueeze(2)
 
 
 class ECAPA_TDNN(nn.Module):
-    """Native ECAPA-TDNN with upstream-compatible parameter names."""
+    """SpeechBrain-compatible ECAPA-TDNN."""
 
     def __init__(
         self,
@@ -202,8 +276,12 @@ class ECAPA_TDNN(nn.Module):
         feat_dim: int = 80,
         embed_dim: int = 192,
         pooling_func: str = "ASTP",
-        global_context_att: bool = False,
+        global_context_att: bool = True,
         emb_bn: bool = False,
+        attention_channels: int = 128,
+        scale: int = 8,
+        se_channels: int = 128,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if pooling_func != "ASTP":
@@ -211,68 +289,90 @@ class ECAPA_TDNN(nn.Module):
                 f"Unsupported pooling_func={pooling_func!r}; only 'ASTP' is supported."
             )
 
-        self.layer1 = Conv1dReluBn(feat_dim, channels, kernel_size=5, padding=2)
-        self.layer2 = SE_Res2Block(
-            channels,
-            kernel_size=3,
-            stride=1,
-            padding=2,
-            dilation=2,
-            scale=8,
+        self.channels = channels
+        self.blocks = nn.ModuleList(
+            [
+                TDNNBlock(feat_dim, channels, kernel_size=5, dilation=1, dropout=dropout),
+                SERes2NetBlock(
+                    channels,
+                    kernel_size=3,
+                    dilation=2,
+                    scale=scale,
+                    se_channels=se_channels,
+                    dropout=dropout,
+                ),
+                SERes2NetBlock(
+                    channels,
+                    kernel_size=3,
+                    dilation=3,
+                    scale=scale,
+                    se_channels=se_channels,
+                    dropout=dropout,
+                ),
+                SERes2NetBlock(
+                    channels,
+                    kernel_size=3,
+                    dilation=4,
+                    scale=scale,
+                    se_channels=se_channels,
+                    dropout=dropout,
+                ),
+            ]
         )
-        self.layer3 = SE_Res2Block(
-            channels,
-            kernel_size=3,
-            stride=1,
-            padding=3,
-            dilation=3,
-            scale=8,
+        self.mfa = TDNNBlock(
+            channels * 3,
+            channels * 3,
+            kernel_size=1,
+            dilation=1,
+            dropout=dropout,
         )
-        self.layer4 = SE_Res2Block(
-            channels,
-            kernel_size=3,
-            stride=1,
-            padding=4,
-            dilation=4,
-            scale=8,
+        self.asp = AttentiveStatisticsPooling(
+            channels * 3,
+            attention_channels=attention_channels,
+            global_context=global_context_att,
+            dropout=dropout,
         )
-
-        cat_channels = channels * 3
-        out_channels = 512 * 3
-        self.conv = nn.Conv1d(cat_channels, out_channels, kernel_size=1)
-        self.pool = ASTP(
-            in_dim=out_channels,
-            global_context_att=global_context_att,
-        )
-        self.pool_out_dim = self.pool.get_out_dim()
-        self.bn = nn.BatchNorm1d(self.pool_out_dim)
-        self.linear = nn.Linear(self.pool_out_dim, embed_dim)
+        self.asp_bn = _NormWrap(channels * 6)
+        self.fc = _ConvWrap(channels * 6, embed_dim, kernel_size=1)
         self.emb_bn = emb_bn
-        self.bn2 = nn.BatchNorm1d(embed_dim) if emb_bn else nn.Identity()
+        self.bn2 = _NormWrap(embed_dim) if emb_bn else nn.Identity()
 
-    def _get_frame_level_feat(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        x = x.permute(0, 2, 1)
+    def _compute_frame_features(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = x.transpose(1, 2)
+        outputs: list[torch.Tensor] = []
+        for index, block in enumerate(self.blocks):
+            if index == 0:
+                x = block(x)
+            else:
+                x = block(x, lengths=lengths)
+            outputs.append(x)
+        x = torch.cat(outputs[1:], dim=1)
+        return self.mfa(x)
 
-        out1 = self.layer1(x)
-        out2 = self.layer2(out1)
-        out3 = self.layer3(out2)
-        out4 = self.layer4(out3)
+    def get_frame_level_feat(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self._compute_frame_features(x, lengths=lengths).transpose(1, 2)
 
-        out = torch.cat([out2, out3, out4], dim=1)
-        out = self.conv(out)
-        return out, out4
-
-    def get_frame_level_feat(self, x: torch.Tensor) -> torch.Tensor:
-        out = self._get_frame_level_feat(x)[0].permute(0, 2, 1)
-        return out
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        out, out4 = self._get_frame_level_feat(x)
-        out = F.relu(out)
-        out = self.bn(self.pool(out))
-        out = self.linear(out)
-        out = self.bn2(out)
-        return out4, out
+    def forward(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if x.dim() != 3:
+            raise ValueError(f"Expected [B, T, F] features, got {tuple(x.shape)}")
+        frame_features = self._compute_frame_features(x, lengths=lengths)
+        pooled = self.asp(frame_features, lengths=lengths)
+        pooled = self.asp_bn(pooled)
+        embedding = self.fc(pooled)
+        embedding = self.bn2(embedding)
+        return frame_features, embedding.squeeze(-1)
 
 
 def ECAPA_TDNN_c1024(
@@ -286,6 +386,7 @@ def ECAPA_TDNN_c1024(
         feat_dim=feat_dim,
         embed_dim=embed_dim,
         pooling_func=pooling_func,
+        global_context_att=False,
         emb_bn=emb_bn,
     )
 
@@ -317,6 +418,7 @@ def ECAPA_TDNN_c512(
         feat_dim=feat_dim,
         embed_dim=embed_dim,
         pooling_func=pooling_func,
+        global_context_att=False,
         emb_bn=emb_bn,
     )
 
@@ -340,78 +442,78 @@ def ECAPA_TDNN_GLOB_c512(
 def detect_ecapa_variant(
     state_dict: Mapping[str, torch.Tensor],
 ) -> dict[str, int | bool]:
-    """Infer ECAPA checkpoint configuration from tensor shapes."""
+    """Infer SpeechBrain ECAPA checkpoint configuration from tensor shapes."""
 
     required_keys = (
-        "layer1.conv.weight",
-        "conv.weight",
-        "pool.linear1.weight",
-        "pool.linear2.weight",
-        "linear.weight",
+        "blocks.0.conv.conv.weight",
+        "mfa.conv.conv.weight",
+        "asp.tdnn.conv.conv.weight",
+        "asp_bn.norm.weight",
+        "fc.conv.weight",
     )
     missing = [key for key in required_keys if key not in state_dict]
     if missing:
         joined = ", ".join(missing)
-        raise ValueError(f"Checkpoint does not look like ECAPA-TDNN; missing: {joined}")
+        raise ValueError(
+            "Checkpoint does not look like a SpeechBrain ECAPA-TDNN checkpoint; "
+            f"missing: {joined}"
+        )
 
-    layer1_weight = state_dict["layer1.conv.weight"]
-    conv_weight = state_dict["conv.weight"]
-    pool_linear1_weight = state_dict["pool.linear1.weight"]
-    pool_linear2_weight = state_dict["pool.linear2.weight"]
-    linear_weight = state_dict["linear.weight"]
+    stem_weight = state_dict["blocks.0.conv.conv.weight"]
+    mfa_weight = state_dict["mfa.conv.conv.weight"]
+    asp_tdnn_weight = state_dict["asp.tdnn.conv.conv.weight"]
+    asp_bn_weight = state_dict["asp_bn.norm.weight"]
+    fc_weight = state_dict["fc.conv.weight"]
 
-    if layer1_weight.ndim != 3:
-        raise ValueError("layer1.conv.weight must be a 3D Conv1d tensor")
-    if conv_weight.ndim != 3:
-        raise ValueError("conv.weight must be a 3D Conv1d tensor")
-    if pool_linear1_weight.ndim != 3:
-        raise ValueError("pool.linear1.weight must be a 3D Conv1d tensor")
-    if pool_linear2_weight.ndim != 3:
-        raise ValueError("pool.linear2.weight must be a 3D Conv1d tensor")
-    if linear_weight.ndim != 2:
-        raise ValueError("linear.weight must be a 2D Linear tensor")
+    if stem_weight.ndim != 3:
+        raise ValueError("blocks.0.conv.conv.weight must be a 3D Conv1d tensor")
+    if mfa_weight.ndim != 3:
+        raise ValueError("mfa.conv.conv.weight must be a 3D Conv1d tensor")
+    if asp_tdnn_weight.ndim != 3:
+        raise ValueError("asp.tdnn.conv.conv.weight must be a 3D Conv1d tensor")
+    if asp_bn_weight.ndim != 1:
+        raise ValueError("asp_bn.norm.weight must be a 1D BatchNorm tensor")
+    if fc_weight.ndim != 3:
+        raise ValueError("fc.conv.weight must be a 3D Conv1d tensor")
 
-    channels = int(layer1_weight.shape[0])
-    feat_dim = int(layer1_weight.shape[1])
-    embed_dim = int(linear_weight.shape[0])
-    fusion_in_channels = int(conv_weight.shape[1])
-    fusion_out_channels = int(conv_weight.shape[0])
-    pool_in_channels = int(pool_linear2_weight.shape[0])
-    pool_linear1_in_channels = int(pool_linear1_weight.shape[1])
-    pool_out_dim = int(linear_weight.shape[1])
+    channels = int(stem_weight.shape[0])
+    feat_dim = int(stem_weight.shape[1])
+    embed_dim = int(fc_weight.shape[0])
+    mfa_out_channels = int(mfa_weight.shape[0])
+    mfa_in_channels = int(mfa_weight.shape[1])
+    pooled_channels = int(asp_bn_weight.shape[0])
+    asp_tdnn_in_channels = int(asp_tdnn_weight.shape[1])
 
     if channels not in (512, 1024):
         raise ValueError(f"Unsupported ECAPA channel size: {channels}")
     if feat_dim <= 0:
         raise ValueError(f"Invalid feature dimension: {feat_dim}")
-    if fusion_in_channels != channels * 3:
+    if mfa_in_channels != channels * 3 or mfa_out_channels != channels * 3:
         raise ValueError(
-            f"Unexpected fusion input channels: expected {channels * 3}, got {fusion_in_channels}"
+            "Unexpected MFA dimensions: expected "
+            f"{channels * 3}->{channels * 3}, got {mfa_in_channels}->{mfa_out_channels}"
         )
-    if fusion_out_channels != 1536:
+    if pooled_channels != channels * 6:
         raise ValueError(
-            f"Unexpected fusion output channels: expected 1536, got {fusion_out_channels}"
+            f"Unexpected pooled feature size: expected {channels * 6}, got {pooled_channels}"
         )
-    if pool_in_channels != 1536:
+    if int(fc_weight.shape[1]) != channels * 6:
         raise ValueError(
-            f"Unexpected pooling input channels: expected 1536, got {pool_in_channels}"
-        )
-    if pool_out_dim != 3072:
-        raise ValueError(
-            f"Unexpected embedding head input dim: expected 3072, got {pool_out_dim}"
+            "Unexpected FC input channels: expected "
+            f"{channels * 6}, got {int(fc_weight.shape[1])}"
         )
 
-    if pool_linear1_in_channels == pool_in_channels:
-        global_context_att = False
-    elif pool_linear1_in_channels == pool_in_channels * 3:
+    if asp_tdnn_in_channels == mfa_out_channels * 3:
         global_context_att = True
+    elif asp_tdnn_in_channels == mfa_out_channels:
+        global_context_att = False
     else:
         raise ValueError(
-            "Unable to infer global_context_att from pool.linear1.weight shape "
-            f"{tuple(pool_linear1_weight.shape)}"
+            "Unable to infer global_context_att from asp.tdnn.conv.conv.weight "
+            f"shape {tuple(asp_tdnn_weight.shape)}"
         )
 
-    emb_bn = any(key.startswith("bn2.") for key in state_dict)
+    emb_bn = "bn2.norm.weight" in state_dict
     return {
         "channels": channels,
         "feat_dim": feat_dim,
@@ -422,15 +524,15 @@ def detect_ecapa_variant(
 
 
 __all__ = [
-    "ASTP",
-    "Conv1dReluBn",
+    "AttentiveStatisticsPooling",
     "ECAPA_TDNN",
     "ECAPA_TDNN_GLOB_c1024",
     "ECAPA_TDNN_GLOB_c512",
     "ECAPA_TDNN_c1024",
     "ECAPA_TDNN_c512",
-    "Res2Conv1dReluBn",
-    "SE_Connect",
-    "SE_Res2Block",
+    "Res2NetBlock",
+    "SEBlock",
+    "SERes2NetBlock",
+    "TDNNBlock",
     "detect_ecapa_variant",
 ]
