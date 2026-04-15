@@ -1,0 +1,42 @@
+# pDFNet2 training configuration
+# Copy and modify for each experiment, commit to git
+
+[data]
+aishell1_root = "../assets/aishell1"
+# aishell3_root = "../assets/aishell3"
+# magicdata_root = "../assets/magicdata"
+noise_root = "../assets/musan/noise"
+sample_rate = 16000
+segment_seconds = 4.0
+enrollment_seconds = 6.0
+epoch_size = 5000
+val_size = 500
+seed = 42
+
+[data.reverb]
+preset = "mixed"
+probability = 0.3
+
+[model]
+type = "pdfnet2"   # "dfnet" or "pdfnet2"
+# wespeaker_checkpoint = "path/to/model"
+
+[training]
+max_epochs = 200
+batch_size = 8
+num_workers = 4
+learning_rate = 1e-3
+weight_decay = 0.0
+grad_clip_norm = 5.0
+patience = 20
+lr_scheduler = "cosine"
+lr_warmup_epochs = 5
+lr_min_ratio = 0.01
+checkpoint_dir = "checkpoints/pdfnet2_aishell"
+device = "auto"
+# resume = "checkpoints/pdfnet2_aishell/last.pt"
+
+[training.loss]
+lambda_spec = 1000.0
+lambda_mr = 500.0
+lambda_os = 500.0

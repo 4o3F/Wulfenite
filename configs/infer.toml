@@ -1,0 +1,23 @@
+# Inference configuration
+
+[model]
+checkpoint = "checkpoints/pdfnet2_aishell/best.pt"
+# wespeaker_checkpoint = "path/to/model"
+
+[input]
+path = "test_wavs/"
+# enrollment = "enroll.wav"
+
+[output]
+path = "enhanced/"
+
+[streaming]
+enabled = false
+chunk_ms = 20
+
+[eval]
+enabled = false
+# reference = "clean_wavs/"
+
+[runtime]
+device = "auto"
