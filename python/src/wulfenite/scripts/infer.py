@@ -10,6 +10,7 @@ from typing import Any
 
 import soundfile as sf
 import torch
+from tqdm import tqdm
 
 from wulfenite.evaluation import si_sdr
 from wulfenite.inference import Enhancer
@@ -142,7 +143,7 @@ def _resolve_reference_path(
 def _run_streaming(enhancer: Enhancer, waveform: torch.Tensor, chunk_samples: int) -> torch.Tensor:
     chunks: list[torch.Tensor] = []
     total = waveform.size(-1)
-    for start in range(0, total, chunk_samples):
+    for start in tqdm(range(0, total, chunk_samples), desc="streaming", leave=False, dynamic_ncols=True):
         end = min(total, start + chunk_samples)
         chunks.append(
             enhancer.enhance_streaming(
@@ -224,7 +225,7 @@ def main() -> None:
         raise SystemExit("[eval].enabled=true requires [eval].reference.")
 
     scores: list[float] = []
-    for input_file in input_files:
+    for input_file in tqdm(input_files, desc="enhancing", dynamic_ncols=True):
         waveform, sample_rate = _read_wav(input_file)
         if sample_rate != enhancer._core_model.sample_rate:
             raise RuntimeError(

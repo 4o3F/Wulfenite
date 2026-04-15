@@ -10,6 +10,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+from tqdm import tqdm
 
 from wulfenite.data import ReverbConfig, add_noise_at_snr, apply_rir, synth_room_rir
 from wulfenite.models import TinyECAPA
@@ -171,7 +172,9 @@ def run_tiny_ecapa_epoch(
 
     total_loss = 0.0
     steps = 0
-    for batch in dataloader:
+    phase = "train" if training else "val"
+    pbar = tqdm(dataloader, desc=phase, leave=False, dynamic_ncols=True)
+    for batch in pbar:
         student_waveform, teacher_waveform = _unpack_batch(batch)
         student_waveform = student_waveform.to(device)
         teacher_waveform = teacher_waveform.to(device)
@@ -204,10 +207,13 @@ def run_tiny_ecapa_epoch(
                 loss.backward()
                 optimizer.step()
 
-        total_loss += float(loss.detach().cpu())
+        loss_val = float(loss.detach().cpu())
+        total_loss += loss_val
         steps += 1
+        pbar.set_postfix(loss=f"{loss_val:.4f}")
         if max_steps is not None and steps >= max_steps:
             break
+    pbar.close()
 
     if steps == 0:
         raise RuntimeError("run_tiny_ecapa_epoch received an empty dataloader")
@@ -242,7 +248,8 @@ def train_tiny_ecapa(
     best_val = float("inf")
     stale_epochs = 0
 
-    for epoch in range(config.max_epochs):
+    epoch_pbar = tqdm(range(config.max_epochs), desc="epochs", dynamic_ncols=True)
+    for epoch in epoch_pbar:
         set_epoch = getattr(train_loader.dataset, "set_epoch", None)
         if callable(set_epoch):
             set_epoch(epoch)
@@ -288,6 +295,11 @@ def train_tiny_ecapa(
             "temperature": float(loss_fn.temperature.detach().cpu()),
         }
         history.append(record)
+        epoch_pbar.set_postfix(
+            train=f"{train_metrics['loss']:.4f}",
+            val=f"{val_metrics['loss']:.4f}",
+            temp=f"{float(loss_fn.temperature.detach().cpu()):.2f}",
+        )
 
         checkpoint = {
             "checkpoint_type": "tiny_ecapa_kd",

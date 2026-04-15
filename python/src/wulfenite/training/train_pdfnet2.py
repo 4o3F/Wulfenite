@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from wulfenite.losses import PDfNet2Loss
 from wulfenite.models import DfNet, PDfNet2, PDfNet2Plus, SpeakerEncoder
@@ -122,7 +123,9 @@ def run_pdfnet2_epoch(
         "over_suppression": 0.0,
     }
     steps = 0
-    for batch in dataloader:
+    phase = "train" if training else "val"
+    pbar = tqdm(dataloader, desc=phase, leave=False, dynamic_ncols=True)
+    for batch in pbar:
         mixture, target, enrollment = _unpack_batch(batch)
         mixture = mixture.to(device)
         target = target.to(device)
@@ -154,13 +157,16 @@ def run_pdfnet2_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
 
-        totals["loss"] += float(total_loss.detach().cpu())
+        loss_val = float(total_loss.detach().cpu())
+        totals["loss"] += loss_val
         totals["spectral"] += float(terms["spectral"].detach().cpu())
         totals["multi_res"] += float(terms["multi_res"].detach().cpu())
         totals["over_suppression"] += float(terms["over_suppression"].detach().cpu())
         steps += 1
+        pbar.set_postfix(loss=f"{loss_val:.4f}")
         if max_steps is not None and steps >= max_steps:
             break
+    pbar.close()
 
     if steps == 0:
         raise RuntimeError("run_pdfnet2_epoch received an empty dataloader")
@@ -198,7 +204,8 @@ def train_pdfnet2(
     stale_epochs = 0
     history: list[dict[str, float]] = []
 
-    for epoch in range(config.max_epochs):
+    epoch_pbar = tqdm(range(config.max_epochs), desc="epochs", dynamic_ncols=True)
+    for epoch in epoch_pbar:
         set_epoch = getattr(train_dataset, "set_epoch", None)
         if callable(set_epoch):
             set_epoch(epoch)
@@ -251,6 +258,11 @@ def train_pdfnet2(
             "val_over_suppression": val_metrics["over_suppression"],
         }
         history.append(record)
+        epoch_pbar.set_postfix(
+            train=f"{train_metrics['loss']:.4f}",
+            val=f"{val_metrics['loss']:.4f}",
+            lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+        )
 
         checkpoint = {
             "epoch": epoch,
