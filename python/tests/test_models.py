@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 from torch import nn
+from typing import Callable
 
 from wulfenite.inference import Enhancer
 from wulfenite.models import (
@@ -12,6 +13,8 @@ from wulfenite.models import (
     ConvTranspose2dNormAct,
     DfNet,
     DfOp,
+    ECAPA_TDNN_GLOB_c512,
+    ECAPA_TDNN_GLOB_c1024,
     GroupedGRU,
     GroupedLinear,
     PDfNet2,
@@ -25,6 +28,30 @@ from wulfenite.models import (
 
 def _num_params(module: nn.Module) -> int:
     return sum(param.numel() for param in module.parameters())
+
+
+def _save_checkpoint(
+    tmp_path,
+    model_factory: Callable[[], nn.Module],
+    *,
+    wrapped: bool = False,
+    add_projection: bool = False,
+    add_module_prefix: bool = False,
+    add_frontend: bool = False,
+):
+    model = model_factory()
+    state_dict = model.state_dict()
+    if add_projection:
+        state_dict["projection.weight"] = torch.randn(4, 192)
+        state_dict["projection.bias"] = torch.randn(4)
+    if add_module_prefix:
+        state_dict = {f"module.{key}": value for key, value in state_dict.items()}
+    if add_frontend:
+        state_dict["frontend.conv.weight"] = torch.randn(8, 1, 3)
+    payload = {"model": state_dict} if wrapped else state_dict
+    checkpoint_path = tmp_path / "speaker.pt"
+    torch.save(payload, checkpoint_path)
+    return checkpoint_path
 
 
 def test_erb_filterbank_shapes_and_inverse() -> None:
@@ -96,6 +123,20 @@ def test_pdfnet2_forward_shapes() -> None:
     assert alpha.shape == (2, spec.size(2), 1)
 
 
+def test_ecapa_tdnn_c512_forward_shapes() -> None:
+    model = ECAPA_TDNN_GLOB_c512(feat_dim=80, embed_dim=192, pooling_func="ASTP").eval()
+    out4, emb = model(torch.randn(2, 100, 80))
+    assert out4.shape == (2, 512, 100)
+    assert emb.shape == (2, 192)
+
+
+def test_ecapa_tdnn_c1024_forward_shapes() -> None:
+    model = ECAPA_TDNN_GLOB_c1024(feat_dim=80, embed_dim=192, pooling_func="ASTP").eval()
+    out4, emb = model(torch.randn(2, 100, 80))
+    assert out4.shape == (2, 1024, 100)
+    assert emb.shape == (2, 192)
+
+
 def test_tiny_ecapa_embeddings_chunks_and_param_count() -> None:
     model = TinyECAPA().eval()
     waveform = torch.randn(2, 16000)
@@ -115,6 +156,72 @@ def test_speaker_encoder_rejects_dim_mismatch() -> None:
 
     with pytest.raises(ValueError, match="embedding_dim"):
         SpeakerEncoder(backend=DummyBackbone(), embedding_dim=128, output_dim=192)
+
+
+def test_speaker_encoder_loads_raw_checkpoint(tmp_path) -> None:
+    checkpoint_path = _save_checkpoint(
+        tmp_path,
+        lambda: ECAPA_TDNN_GLOB_c512(feat_dim=80, embed_dim=192, pooling_func="ASTP"),
+    )
+    model = SpeakerEncoder(checkpoint_path=checkpoint_path).eval()
+    emb = model(torch.randn(2, 16000))
+    assert emb.shape == (2, 192)
+
+
+def test_speaker_encoder_loads_wrapped_checkpoint(tmp_path) -> None:
+    checkpoint_path = _save_checkpoint(
+        tmp_path,
+        lambda: ECAPA_TDNN_GLOB_c512(feat_dim=80, embed_dim=192, pooling_func="ASTP"),
+        wrapped=True,
+    )
+    model = SpeakerEncoder(checkpoint_path=checkpoint_path).eval()
+    emb = model(torch.randn(2, 16000))
+    assert emb.shape == (2, 192)
+
+
+def test_speaker_encoder_strips_projection_keys(tmp_path) -> None:
+    checkpoint_path = _save_checkpoint(
+        tmp_path,
+        lambda: ECAPA_TDNN_GLOB_c512(feat_dim=80, embed_dim=192, pooling_func="ASTP"),
+        wrapped=True,
+        add_projection=True,
+    )
+    model = SpeakerEncoder(checkpoint_path=checkpoint_path).eval()
+    emb = model(torch.randn(2, 16000))
+    assert emb.shape == (2, 192)
+
+
+def test_speaker_encoder_auto_detects_variant(tmp_path) -> None:
+    checkpoint_path = _save_checkpoint(
+        tmp_path,
+        lambda: ECAPA_TDNN_GLOB_c1024(feat_dim=80, embed_dim=192, pooling_func="ASTP"),
+    )
+    model = SpeakerEncoder(checkpoint_path=checkpoint_path).eval()
+    emb = model(torch.randn(2, 16000))
+    assert emb.shape == (2, 192)
+    assert model.backend.layer1.conv.weight.shape[0] == 1024
+
+
+def test_speaker_encoder_strips_module_prefix(tmp_path) -> None:
+    checkpoint_path = _save_checkpoint(
+        tmp_path,
+        lambda: ECAPA_TDNN_GLOB_c512(feat_dim=80, embed_dim=192, pooling_func="ASTP"),
+        wrapped=True,
+        add_module_prefix=True,
+    )
+    model = SpeakerEncoder(checkpoint_path=checkpoint_path).eval()
+    emb = model(torch.randn(2, 16000))
+    assert emb.shape == (2, 192)
+
+
+def test_speaker_encoder_rejects_frontend_checkpoint(tmp_path) -> None:
+    checkpoint_path = _save_checkpoint(
+        tmp_path,
+        lambda: ECAPA_TDNN_GLOB_c512(feat_dim=80, embed_dim=192, pooling_func="ASTP"),
+        add_frontend=True,
+    )
+    with pytest.raises(ValueError, match="frontend"):
+        SpeakerEncoder(checkpoint_path=checkpoint_path)
 
 
 def test_pdfnet2_plus_forward_shapes() -> None:

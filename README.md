@@ -81,7 +81,7 @@ Set `[model].type` in the config:
 | Type | Description | Speaker encoder needed |
 |------|-------------|----------------------|
 | `dfnet` | Plain DfNet2 speech enhancement (no speaker conditioning) | No |
-| `pdfnet2` | Personalized DfNet2 with 192-D speaker embedding | Yes (WeSpeaker) |
+| `pdfnet2` | Personalized DfNet2 with 192-D speaker embedding | Yes (WeSpeaker-compatible `.pt` checkpoint) |
 
 #### Config reference
 
@@ -127,12 +127,12 @@ cd python
 uv run python -m pytest tests/ -v
 ```
 
-78 tests covering models, data pipeline, training utilities, losses, and evaluation.
+86 tests covering models, data pipeline, training utilities, losses, and evaluation.
 
 ## Architecture
 
 - **DfNet2**: Dual ERB + DF branch encoder, GroupedGRU fusion, iterative deep filtering
-- **PDfNet2**: DfNet2 + frozen WeSpeaker speaker embedding conditioning
+- **PDfNet2**: DfNet2 + frozen native ECAPA-TDNN speaker embedding conditioning
 - **PDfNet2+**: PDfNet2 + TinyECAPA on-the-fly similarity refinement (future phase)
 
 Details in [`docs/architecture.md`](docs/architecture.md).

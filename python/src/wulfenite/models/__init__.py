@@ -2,6 +2,14 @@
 
 from .deep_filtering import DfOp
 from .dfnet2 import DfDecoder, DfNet, DfNetStreamState, Encoder, ErbDecoder
+from .ecapa_tdnn import (
+    ECAPA_TDNN,
+    ECAPA_TDNN_GLOB_c1024,
+    ECAPA_TDNN_GLOB_c512,
+    ECAPA_TDNN_c1024,
+    ECAPA_TDNN_c512,
+    detect_ecapa_variant,
+)
 from .erb import erb2freq, erb_fb, erb_fb_inverse, freq2erb
 from .modules import (
     Conv2dNormAct,
@@ -25,6 +33,11 @@ __all__ = [
     "DfOp",
     "GroupedLinear",
     "GroupedGRU",
+    "ECAPA_TDNN",
+    "ECAPA_TDNN_GLOB_c1024",
+    "ECAPA_TDNN_GLOB_c512",
+    "ECAPA_TDNN_c1024",
+    "ECAPA_TDNN_c512",
     "Conv2dNormAct",
     "ConvTranspose2dNormAct",
     "ConvTranspose",
@@ -41,4 +54,5 @@ __all__ = [
     "TinyECAPA",
     "PDfNet2Plus",
     "SpeakerEncoder",
+    "detect_ecapa_variant",
 ]
