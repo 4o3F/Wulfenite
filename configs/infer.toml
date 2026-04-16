@@ -1,15 +1,15 @@
 # Inference configuration
 
 [model]
-checkpoint = "checkpoints/pdfnet2_aishell/best.pt"
-# wespeaker_checkpoint = "path/to/model"
+checkpoint = "../assets/best.pt"
+wespeaker_checkpoint = "../assets/ecapa-tdnn.ckpt"
 
 [input]
-path = "test_wavs/"
-# enrollment = "enroll.wav"
+path = "../assets/samples/real_mixture_mono.wav"
+enrollment = "../assets/samples/real_enrollment_02_mono.wav"
 
 [output]
-path = "enhanced/"
+path = "../assets/samples/enhanced/"
 
 [streaming]
 enabled = false

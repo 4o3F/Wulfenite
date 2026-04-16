@@ -28,8 +28,8 @@ class SpectralLoss(nn.Module):
 
     def __init__(
         self,
-        gamma: float = 0.6,
-        under_suppression_weight: float = 2.0,
+        gamma: float = 1.0,
+        under_suppression_weight: float = 1.0,
         complex_weight: float = 1.0,
     ) -> None:
         super().__init__()
@@ -64,7 +64,7 @@ class PDfNet2Loss(nn.Module):
         lambda_spec: float = 1e3,
         lambda_mr: float = 5e2,
         lambda_os: float = 5e2,
-        gamma: float = 0.6,
+        gamma: float = 1.0,
         fft_size: int = 320,
         hop_size: int = 160,
         win_size: int = 320,
