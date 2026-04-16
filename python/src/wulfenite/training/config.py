@@ -11,21 +11,22 @@ from typing import Literal
 class TrainConfig:
     """Training hyper-parameters shared by pDFNet2 and TinyECAPA."""
 
-    learning_rate: float = 1e-3
-    weight_decay: float = 0.0
-    max_epochs: int = 200
+    learning_rate: float = 5e-4
+    weight_decay: float = 0.05
+    max_epochs: int = 100
     batch_size_start: int = 8
     batch_size_end: int = 128
     batch_size_ramp_epochs: int = 20
-    grad_clip_norm: float = 5.0
-    patience: int = 20
+    grad_clip_norm: float = 1.0
+    patience: int = 15
     num_workers: int = 0
     checkpoint_dir: Path = field(default_factory=lambda: Path("checkpoints"))
     device: str | None = None
     log_interval: int = 10
     max_steps_per_epoch: int | None = None
     lr_scheduler: Literal["none", "cosine"] = "cosine"
-    lr_warmup_epochs: int = 5
+    lr_warmup_epochs: int = 3
+    lr_warmup_start: float = 1e-4
     lr_min_ratio: float = 0.01
     lambda_spec: float = 1e3
     lambda_mr: float = 5e2

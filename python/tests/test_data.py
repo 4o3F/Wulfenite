@@ -33,6 +33,7 @@ from wulfenite.data.augmentation import (
     apply_random_gain,
 )
 from wulfenite.scripts.train_pdfnet2 import (
+    _build_train_config,
     _build_mixer_kwargs,
     _parse_bucket_table,
     _scan_dataset_splits,
@@ -561,3 +562,35 @@ def test_build_mixer_kwargs_reads_new_sections() -> None:
     assert kwargs["bandwidth_cutoff_range_hz"] == (4500.0, 6500.0)
     assert kwargs["mixing_rms_mode"] == "active"
     assert kwargs["noise_category_weights"] == {"room": 0.7, "keyboard": 0.3}
+
+
+def test_build_train_config_supports_batch_ramp_fields() -> None:
+    config = _build_train_config({
+        "batch_size_start": 8,
+        "batch_size_end": 128,
+        "batch_size_ramp_epochs": 20,
+        "learning_rate": 5e-4,
+        "weight_decay": 0.05,
+        "grad_clip_norm": 1.0,
+        "max_epochs": 100,
+        "patience": 15,
+        "lr_warmup_epochs": 3,
+        "lr_warmup_start": 1e-4,
+    })
+    assert config.batch_size_start == 8
+    assert config.batch_size_end == 128
+    assert config.batch_size_ramp_epochs == 20
+    assert config.learning_rate == pytest.approx(5e-4)
+    assert config.weight_decay == pytest.approx(0.05)
+    assert config.grad_clip_norm == pytest.approx(1.0)
+    assert config.max_epochs == 100
+    assert config.patience == 15
+    assert config.lr_warmup_epochs == 3
+    assert config.lr_warmup_start == pytest.approx(1e-4)
+
+
+def test_build_train_config_keeps_legacy_single_batch_size_behavior() -> None:
+    config = _build_train_config({"batch_size": 8})
+    assert config.batch_size_start == 8
+    assert config.batch_size_end == 8
+    assert config.batch_size_ramp_epochs == 1

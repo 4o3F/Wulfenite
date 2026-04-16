@@ -311,34 +311,54 @@ def _build_mixer_kwargs(
 
 
 def _build_train_config(training_cfg: ConfigDict) -> TrainConfig:
+    defaults = TrainConfig()
     loss_cfg = training_cfg.get("loss", {})
     if not isinstance(loss_cfg, dict):
         raise ValueError("[training.loss] must be a table.")
-    batch_size = int(training_cfg.get("batch_size", 8))
     device = training_cfg.get("device", "auto")
     if not isinstance(device, str):
         raise ValueError("[training].device must be a string.")
     scheduler = training_cfg.get("lr_scheduler", "cosine")
     if scheduler not in ("none", "cosine"):
         raise ValueError("[training].lr_scheduler must be 'none' or 'cosine'.")
+    has_batch_schedule = any(
+        key in training_cfg
+        for key in ("batch_size_start", "batch_size_end", "batch_size_ramp_epochs")
+    )
+    if has_batch_schedule:
+        batch_size_start = int(
+            training_cfg.get("batch_size_start", training_cfg.get("batch_size", defaults.batch_size_start))
+        )
+        batch_size_end = int(
+            training_cfg.get("batch_size_end", training_cfg.get("batch_size", defaults.batch_size_end))
+        )
+        batch_size_ramp_epochs = int(
+            training_cfg.get("batch_size_ramp_epochs", defaults.batch_size_ramp_epochs)
+        )
+    else:
+        batch_size = int(training_cfg.get("batch_size", defaults.batch_size_start))
+        batch_size_start = batch_size
+        batch_size_end = batch_size
+        batch_size_ramp_epochs = 1
     return TrainConfig(
-        learning_rate=float(training_cfg.get("learning_rate", 1e-3)),
-        weight_decay=float(training_cfg.get("weight_decay", 0.0)),
-        max_epochs=int(training_cfg.get("max_epochs", 200)),
-        batch_size_start=batch_size,
-        batch_size_end=batch_size,
-        batch_size_ramp_epochs=1,
-        grad_clip_norm=float(training_cfg.get("grad_clip_norm", 5.0)),
-        patience=int(training_cfg.get("patience", 20)),
+        learning_rate=float(training_cfg.get("learning_rate", defaults.learning_rate)),
+        weight_decay=float(training_cfg.get("weight_decay", defaults.weight_decay)),
+        max_epochs=int(training_cfg.get("max_epochs", defaults.max_epochs)),
+        batch_size_start=batch_size_start,
+        batch_size_end=batch_size_end,
+        batch_size_ramp_epochs=batch_size_ramp_epochs,
+        grad_clip_norm=float(training_cfg.get("grad_clip_norm", defaults.grad_clip_norm)),
+        patience=int(training_cfg.get("patience", defaults.patience)),
         num_workers=int(training_cfg.get("num_workers", 0)),
         checkpoint_dir=Path(str(training_cfg.get("checkpoint_dir", "checkpoints"))),
         device=None if device == "auto" else device,
         lr_scheduler=scheduler,
-        lr_warmup_epochs=int(training_cfg.get("lr_warmup_epochs", 5)),
-        lr_min_ratio=float(training_cfg.get("lr_min_ratio", 0.01)),
-        lambda_spec=float(loss_cfg.get("lambda_spec", 1000.0)),
-        lambda_mr=float(loss_cfg.get("lambda_mr", 500.0)),
-        lambda_os=float(loss_cfg.get("lambda_os", 500.0)),
+        lr_warmup_epochs=int(training_cfg.get("lr_warmup_epochs", defaults.lr_warmup_epochs)),
+        lr_warmup_start=float(training_cfg.get("lr_warmup_start", defaults.lr_warmup_start)),
+        lr_min_ratio=float(training_cfg.get("lr_min_ratio", defaults.lr_min_ratio)),
+        lambda_spec=float(loss_cfg.get("lambda_spec", defaults.lambda_spec)),
+        lambda_mr=float(loss_cfg.get("lambda_mr", defaults.lambda_mr)),
+        lambda_os=float(loss_cfg.get("lambda_os", defaults.lambda_os)),
     )
 
 

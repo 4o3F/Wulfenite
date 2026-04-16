@@ -32,20 +32,64 @@ def scheduled_batch_size(config: TrainConfig, epoch: int) -> int:
     return int(round(size))
 
 
+def _steps_in_epoch(
+    dataset_size: int,
+    batch_size: int,
+    *,
+    max_steps: int | None = None,
+) -> int:
+    if dataset_size <= 0:
+        raise ValueError(f"dataset_size must be positive, got {dataset_size}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    steps = math.ceil(dataset_size / batch_size)
+    if max_steps is not None:
+        steps = min(steps, max_steps)
+    return max(1, steps)
+
+
+def _training_step_horizon(
+    dataset_size: int,
+    config: TrainConfig,
+) -> tuple[int, int]:
+    total_steps = 0
+    warmup_steps = 0
+    warmup_epochs = min(max(0, config.lr_warmup_epochs), config.max_epochs)
+    for epoch in range(config.max_epochs):
+        steps = _steps_in_epoch(
+            dataset_size,
+            scheduled_batch_size(config, epoch),
+            max_steps=config.max_steps_per_epoch,
+        )
+        total_steps += steps
+        if epoch < warmup_epochs:
+            warmup_steps += steps
+    if total_steps <= 1:
+        return total_steps, 0
+    return total_steps, min(warmup_steps, total_steps - 1)
+
+
 def _build_lr_scheduler(
     optimizer: torch.optim.Optimizer,
     config: TrainConfig,
+    *,
+    total_steps: int,
+    warmup_steps: int,
 ) -> torch.optim.lr_scheduler.LambdaLR | None:
     if config.lr_scheduler == "none":
         return None
-    warmup_epochs = min(max(0, config.lr_warmup_epochs), max(config.max_epochs - 1, 0))
+    if total_steps <= 0:
+        raise ValueError(f"total_steps must be positive, got {total_steps}")
     min_ratio = min(max(config.lr_min_ratio, 0.0), 1.0)
+    if config.learning_rate <= 0.0:
+        raise ValueError(f"learning_rate must be positive, got {config.learning_rate}")
+    start_factor = max(config.lr_warmup_start, 0.0) / config.learning_rate
 
-    def lr_lambda(epoch: int) -> float:
-        if warmup_epochs > 0 and epoch < warmup_epochs:
-            return float(epoch + 1) / float(warmup_epochs)
-        decay_epochs = max(1, config.max_epochs - warmup_epochs - 1)
-        progress = min(max(epoch - warmup_epochs, 0), decay_epochs) / decay_epochs
+    def lr_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return start_factor + (1.0 - start_factor) * (step / warmup_steps)
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = min(max(step - warmup_steps, 0), decay_steps) / decay_steps
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return min_ratio + (1.0 - min_ratio) * cosine
 
@@ -108,6 +152,7 @@ def run_pdfnet2_epoch(
     device: torch.device,
     speaker_encoder: SpeakerEncoder | None = None,
     optimizer: torch.optim.Optimizer | None = None,
+    scheduler: torch.optim.lr_scheduler.LambdaLR | None = None,
     grad_clip_norm: float = 5.0,
     max_steps: int | None = None,
 ) -> dict[str, float]:
@@ -156,6 +201,8 @@ def run_pdfnet2_epoch(
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
 
         loss_val = float(total_loss.detach().cpu())
         totals["loss"] += loss_val
@@ -192,12 +239,18 @@ def train_pdfnet2(
         lambda_mr=config.lambda_mr,
         lambda_os=config.lambda_os,
     ).to(device)
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
-    scheduler = _build_lr_scheduler(optimizer, config)
+    total_steps, warmup_steps = _training_step_horizon(len(train_dataset), config)
+    scheduler = _build_lr_scheduler(
+        optimizer,
+        config,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+    )
 
     config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
@@ -230,6 +283,7 @@ def train_pdfnet2(
             device=device,
             speaker_encoder=speaker_encoder,
             optimizer=optimizer,
+            scheduler=scheduler,
             grad_clip_norm=config.grad_clip_norm,
             max_steps=config.max_steps_per_epoch,
         )
@@ -280,11 +334,15 @@ def train_pdfnet2(
         else:
             stale_epochs += 1
 
-        if scheduler is not None:
-            scheduler.step()
         if stale_epochs >= config.patience:
             break
     return history
 
 
-__all__ = ["scheduled_batch_size", "run_pdfnet2_epoch", "train_pdfnet2"]
+__all__ = [
+    "scheduled_batch_size",
+    "run_pdfnet2_epoch",
+    "train_pdfnet2",
+    "_build_lr_scheduler",
+    "_training_step_horizon",
+]

@@ -17,7 +17,7 @@ from wulfenite.training import (
     load_tiny_ecapa_checkpoint,
     split_speakers_for_kd,
 )
-from wulfenite.training.train_pdfnet2 import _build_lr_scheduler
+from wulfenite.training.train_pdfnet2 import _build_lr_scheduler, _training_step_horizon
 
 
 SR = 16000
@@ -50,51 +50,76 @@ def _build_speakers(tmp_path: Path) -> dict[str, list[AudioEntry]]:
 
 def test_build_lr_scheduler_cosine_warmup() -> None:
     module = torch.nn.Linear(2, 2)
-    optimizer = torch.optim.Adam(module.parameters(), lr=1e-3)
+    optimizer = torch.optim.AdamW(module.parameters(), lr=1e-3)
     config = TrainConfig(
+        learning_rate=1e-3,
         max_epochs=6,
+        batch_size_start=4,
+        batch_size_end=4,
+        batch_size_ramp_epochs=1,
         lr_scheduler="cosine",
         lr_warmup_epochs=2,
+        lr_warmup_start=1e-4,
         lr_min_ratio=0.1,
     )
-    scheduler = _build_lr_scheduler(optimizer, config)
+    total_steps, warmup_steps = _training_step_horizon(dataset_size=24, config=config)
+    scheduler = _build_lr_scheduler(
+        optimizer,
+        config,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+    )
     assert scheduler is not None
     learning_rates = [optimizer.param_groups[0]["lr"]]
-    for _ in range(4):
+    for _ in range(total_steps):
         optimizer.step()
         scheduler.step()
         learning_rates.append(optimizer.param_groups[0]["lr"])
-    assert learning_rates[0] < config.learning_rate
-    assert learning_rates[1] == config.learning_rate
-    assert learning_rates[-1] <= learning_rates[1]
+    assert learning_rates[0] == pytest.approx(config.lr_warmup_start)
+    assert learning_rates[warmup_steps] == pytest.approx(config.learning_rate)
+    assert learning_rates[-1] <= config.learning_rate
     assert learning_rates[-1] >= config.learning_rate * config.lr_min_ratio
 
 
 def test_build_lr_scheduler_none_returns_none() -> None:
     module = torch.nn.Linear(2, 2)
-    optimizer = torch.optim.Adam(module.parameters(), lr=1e-3)
+    optimizer = torch.optim.AdamW(module.parameters(), lr=1e-3)
     config = TrainConfig(lr_scheduler="none")
-    assert _build_lr_scheduler(optimizer, config) is None
+    assert _build_lr_scheduler(optimizer, config, total_steps=10, warmup_steps=2) is None
 
 
 def test_build_lr_scheduler_clamps_warmup_to_horizon() -> None:
     module = torch.nn.Linear(2, 2)
-    optimizer = torch.optim.Adam(module.parameters(), lr=1e-3)
+    optimizer = torch.optim.AdamW(module.parameters(), lr=1e-3)
     config = TrainConfig(
+        learning_rate=1e-3,
         max_epochs=3,
+        batch_size_start=4,
+        batch_size_end=4,
+        batch_size_ramp_epochs=1,
         lr_scheduler="cosine",
         lr_warmup_epochs=5,
+        lr_warmup_start=1e-4,
         lr_min_ratio=0.1,
     )
-    scheduler = _build_lr_scheduler(optimizer, config)
+    total_steps, warmup_steps = _training_step_horizon(dataset_size=4, config=config)
+    scheduler = _build_lr_scheduler(
+        optimizer,
+        config,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
+    )
     assert scheduler is not None
+    assert total_steps == 3
+    assert warmup_steps == 2
     learning_rates = [optimizer.param_groups[0]["lr"]]
-    for _ in range(2):
+    for _ in range(total_steps):
         optimizer.step()
         scheduler.step()
         learning_rates.append(optimizer.param_groups[0]["lr"])
-    # Warmup clamped to max_epochs-1=2, so epoch 1 should reach base LR
-    assert learning_rates[1] >= config.learning_rate * 0.99
+    assert learning_rates[0] == pytest.approx(config.lr_warmup_start)
+    assert learning_rates[warmup_steps] == pytest.approx(config.learning_rate)
+    assert learning_rates[-1] <= config.learning_rate
 
 
 def test_kd_dataset_returns_same_speaker_pairs(tmp_path: Path) -> None:
